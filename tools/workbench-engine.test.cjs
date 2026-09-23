@@ -19,6 +19,7 @@ const task = require(path.join(SRC, "workbench-task-store.js"));
 const platform = require(path.join(SRC, "workbench-platform.js"));
 const { createRunner, classifyBlock } = require(path.join(SRC, "workbench-runner.js"));
 const download = require(path.join(SRC, "workbench-download.js"));
+const { createAssets } = require(path.join(SRC, "workbench-assets.js"));
 const { VIDEO_CAPABILITIES } = require(path.join(SRC, "video-capabilities.js"));
 
 let passed = 0;
@@ -662,6 +663,59 @@ async function main() {
   const secondDownload = await okDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1 });
   check("重复下载不覆盖历史文件", secondDownload.filePath !== firstDownload.filePath, secondDownload.filePath);
   check("重复下载结果仍在", fs.existsSync(firstDownload.filePath) && fs.existsSync(secondDownload.filePath));
+
+  // ══ 11. 素材删除（离线可测：remove 路径不依赖 Electron） ══
+  // 这一段是为了锁住一个真实缺陷：createAssets 内部把缩略图缓存命名为 thumbs，
+  // 与 dirs() 返回的 thumbs 目录同名，remove() 里解构后被遮蔽成字符串，
+  // thumbs.delete 直接抛 TypeError，导致线上删除素材必然失败。
+  console.log("── 素材删除 ──");
+  const assetRoot = path.join(root, "assetproj");
+  const assetsDir = path.join(assetRoot, "assets");
+  const thumbsDir = path.join(assetRoot, "thumbs");
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.mkdirSync(thumbsDir, { recursive: true });
+  const catalogFile = path.join(assetRoot, "assets.json");
+  const fakeId = "asset_aaaaaaaaaaaa";
+  fs.writeFileSync(path.join(assetsDir, `${fakeId}.png`), "png-bytes");
+  fs.writeFileSync(path.join(thumbsDir, `${fakeId}.png`), "thumb-bytes");
+  fs.writeFileSync(
+    catalogFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      assets: [
+        {
+          id: fakeId,
+          name: "测试素材",
+          fileName: `${fakeId}.png`,
+          ext: ".png",
+          bytes: 9,
+          sha256: "a".repeat(64),
+          width: 10,
+          height: 10,
+          importedAt: new Date().toISOString(),
+          hasThumb: true,
+        },
+      ],
+    })
+  );
+  const assetsApi = createAssets({
+    assetsDir: () => assetsDir,
+    thumbsDir: () => thumbsDir,
+    assetCatalogFile: () => catalogFile,
+  });
+  eq("素材列表可读", (await assetsApi.list("prj_x")).length, 1);
+  let removeError = null;
+  let removedList = [];
+  try {
+    removedList = await assetsApi.remove("prj_x", [fakeId]);
+  } catch (error) {
+    removeError = error.message;
+  }
+  check("删除素材不抛异常", removeError === null, removeError);
+  eq("删除返回被删项", removedList.length, 1);
+  check("素材文件已删除", !fs.existsSync(path.join(assetsDir, `${fakeId}.png`)));
+  check("缩略图已删除", !fs.existsSync(path.join(thumbsDir, `${fakeId}.png`)));
+  eq("目录记录已更新", JSON.parse(fs.readFileSync(catalogFile, "utf8")).assets.length, 0);
 
   fs.rmSync(root, { recursive: true, force: true });
 

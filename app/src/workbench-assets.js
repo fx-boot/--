@@ -54,7 +54,9 @@ async function writeCatalog(file, catalog) {
 }
 
 function createAssets(store) {
-  const thumbs = new Map(); // `${assetId}` -> data URL，进程内缓存，避免每次列表都重算
+  // 注意：这里的缓存变量名不能叫 thumbs —— dirs() 返回的 thumbs 是缩略图目录，
+  // 一旦同名，remove() 里的解构会把它遮蔽成字符串，thumbs.delete 就会报 TypeError。
+  const thumbCache = new Map(); // assetId -> data URL，进程内缓存，避免每次列表都重算
 
   function dirs(projectId) {
     return {
@@ -199,7 +201,7 @@ function createAssets(store) {
   }
 
   async function thumbDataUrl(projectId, assetId) {
-    if (thumbs.has(assetId)) return thumbs.get(assetId);
+    if (thumbCache.has(assetId)) return thumbCache.get(assetId);
     const asset = await findAsset(projectId, assetId);
     if (!asset) return "";
     const { thumbs: thumbDir } = dirs(projectId);
@@ -207,7 +209,7 @@ function createAssets(store) {
     try {
       const buffer = await fsp.readFile(safePath(thumbDir, `${asset.id}.png`));
       const url = `data:image/png;base64,${buffer.toString("base64")}`;
-      thumbs.set(assetId, url);
+      thumbCache.set(assetId, url);
       return url;
     } catch {
       return "";
@@ -229,7 +231,7 @@ function createAssets(store) {
   /** 删除素材文件与目录记录（引用检查由 service 负责，此处只做删除） */
   async function remove(projectId, assetIds) {
     const ids = new Set((assetIds || []).map(String));
-    const { assets, thumbs, catalog } = dirs(projectId);
+    const { assets: assetsDir, thumbs: thumbsDir, catalog } = dirs(projectId);
     const current = readCatalog(catalog);
     const removed = [];
     const kept = [];
@@ -240,14 +242,14 @@ function createAssets(store) {
       }
       removed.push(publicView(asset));
       for (const [dir, fileName] of [
-        [assets, asset.fileName],
-        [thumbs, `${asset.id}.png`],
+        [assetsDir, asset.fileName],
+        [thumbsDir, `${asset.id}.png`],
       ]) {
         try {
           await fsp.unlink(safePath(dir, fileName));
         } catch {}
       }
-      thumbs.delete(asset.id);
+      thumbCache.delete(asset.id);
     }
     current.assets = kept;
     await writeCatalog(catalog, current);

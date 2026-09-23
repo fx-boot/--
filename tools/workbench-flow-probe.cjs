@@ -1,0 +1,345 @@
+/**
+ * 工作台端到端流程探针（隔离环境内运行真实应用）
+ *
+ * 目的：验证静态检查覆盖不到的部分 —— 渲染层代码在真实 Electron 里能否跑通、
+ * IPC 往返是否正常、素材/分镜/@图片引用/任务入队的完整闭环是否成立。
+ *
+ * 明确不做的事：
+ *   - 不执行任何真实生成（不调用 task.execute），因此不消耗任何账号额度；
+ *   - 不使用真实账号，入队用的是占位账号标识；
+ *   - 不触碰正式版目录（沿用 supervisor 的两层隔离）。
+ *
+ * 由 tools/pack-app.cjs --entry-file 注入，报告写到 exe 同目录。
+ */
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { app, BrowserWindow, nativeImage } = require("electron");
+
+const exeDir = path.dirname(process.execPath);
+const isolatedRoot = path.resolve(
+  process.env.DBM_ISOLATED_ROOT || path.join(exeDir, "flow-probe-data")
+);
+const appDataDir = path.join(isolatedRoot, "DoubaoAccountManager");
+const reportPath = path.join(exeDir, "flow-probe-report.json");
+
+const report = {
+  startedAt: new Date().toISOString(),
+  isolatedRoot,
+  checks: [],
+  steps: {},
+  consoleErrors: [],
+  pageErrors: [],
+  diagnostics: [],
+  error: null,
+  ok: false,
+};
+
+function writeAndExit(code) {
+  report.finishedAt = new Date().toISOString();
+  try {
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  } catch {}
+  app.exit(code);
+}
+
+process.on("uncaughtException", (err) => {
+  report.error = err?.stack || String(err);
+  writeAndExit(1);
+});
+process.on("unhandledRejection", (err) => {
+  report.error = err?.stack || String(err);
+  writeAndExit(1);
+});
+
+// 两层隔离（与 supervised-entry 一致）
+fs.mkdirSync(appDataDir, { recursive: true });
+const nativeSetPath = app.setPath.bind(app);
+nativeSetPath("appData", isolatedRoot);
+app.setPath = (name, value) =>
+  ["userData", "sessionData", "appData"].includes(name)
+    ? nativeSetPath(name, name === "appData" ? isolatedRoot : appDataDir)
+    : nativeSetPath(name, value);
+app.setPath("userData", appDataDir);
+
+app.on("web-contents-created", (_event, contents) => {
+  contents.on("console-message", (_e, level, message) => {
+    // level 3 = error
+    if (Number(level) >= 3) report.consoleErrors.push(String(message).slice(0, 400));
+  });
+  contents.on("render-process-gone", (_e, details) =>
+    report.pageErrors.push({ kind: "render-process-gone", reason: details?.reason })
+  );
+  contents.on("preload-error", (_e, preloadPath, error) =>
+    report.pageErrors.push({ kind: "preload-error", preloadPath, error: error.message })
+  );
+});
+app.on("browser-window-created", (_event, win) => {
+  win.show = () => {};
+  win.webContents.on("did-fail-load", (_e, code, desc, url) =>
+    report.pageErrors.push({ kind: "did-fail-load", code, desc, url })
+  );
+});
+
+report.mainLoaded = false;
+try {
+  require("./src/main");
+  report.mainLoaded = true;
+} catch (error) {
+  report.requireError = error?.stack || String(error);
+}
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(fn, label, tries = 200, step = 100) {
+  for (let i = 0; i < tries; i++) {
+    let value;
+    try {
+      value = await fn();
+    } catch (error) {
+      report.diagnostics.push({ label, error: error.message });
+      value = null;
+    }
+    if (value) return value;
+    await delay(step);
+  }
+  throw new Error(`等待超时：${label}`);
+}
+
+function check(name, condition, detail) {
+  report.checks.push({ name, pass: Boolean(condition), detail: detail === undefined ? null : detail });
+  return Boolean(condition);
+}
+
+/** 生成一张真实的 400x400 PNG（用原始位图构造，确保缩略图分支被覆盖） */
+function makeFixture(file) {
+  const width = 400;
+  const height = 400;
+  const bitmap = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      bitmap[i] = Math.round((x / width) * 255); // B
+      bitmap[i + 1] = Math.round((y / height) * 255); // G
+      bitmap[i + 2] = 200; // R
+      bitmap[i + 3] = 255; // A
+    }
+  }
+  const image = nativeImage.createFromBitmap(bitmap, { width, height });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, image.toPNG());
+  return { file, size: fs.statSync(file).size, dims: image.getSize() };
+}
+
+(async () => {
+  await app.whenReady();
+  report.electron = process.versions.electron;
+  report.chrome = process.versions.chrome;
+  const win = await waitFor(
+    () =>
+      BrowserWindow.getAllWindows().find(
+        (w) => !w.isDestroyed() && w.webContents.getURL().endsWith("/renderer/index.html")
+      ),
+    "主窗口"
+  );
+  const js = (code) => win.webContents.executeJavaScript(code, true);
+  await waitFor(() => js("Boolean(window.managerWorkbenchAPI)"), "工作台 preload");
+  check("主进程加载成功", report.mainLoaded);
+
+  // ── 1. 素材：真实 PNG 导入 ──
+  const fixture = makeFixture(path.join(isolatedRoot, "fixtures", "flow-test.png"));
+  report.steps.fixture = fixture;
+  check("测试图片已生成且可被 Electron 解析", fixture.dims.width === 400 && fixture.dims.height === 400, fixture);
+
+  const created = await js(`window.managerWorkbenchAPI.project.create(${JSON.stringify("端到端流程验证")})`);
+  const projectId = created.projectId;
+  check("项目已创建", Boolean(projectId), projectId);
+
+  const imported = await js(
+    `window.managerWorkbenchAPI.asset.importPaths(${JSON.stringify(projectId)}, [${JSON.stringify(fixture.file)}])`
+  );
+  report.steps.import = imported;
+  check("图片导入成功", imported.imported.length === 1, imported);
+  const assetId = imported.imported[0]?.id;
+  check("素材获得稳定 assetId", /^asset_[0-9a-f]{12}$/.test(String(assetId)), assetId);
+  check("素材记录了尺寸", imported.imported[0]?.width === 400 && imported.imported[0]?.height === 400, imported.imported[0]);
+  check("生成了缩略图", imported.imported[0]?.hasThumb === true);
+
+  const thumb = await js(`window.managerWorkbenchAPI.asset.thumb(${JSON.stringify(projectId)}, ${JSON.stringify(assetId)})`);
+  check("缩略图返回 data URL（绕开 CSP 对 file:// 的限制）", String(thumb).startsWith("data:image/png;base64,"), String(thumb).slice(0, 32));
+  const preview = await js(`window.managerWorkbenchAPI.asset.preview(${JSON.stringify(projectId)}, ${JSON.stringify(assetId)})`);
+  check("预览返回 data URL", String(preview).startsWith("data:image/png;base64,"));
+
+  const again = await js(
+    `window.managerWorkbenchAPI.asset.importPaths(${JSON.stringify(projectId)}, [${JSON.stringify(fixture.file)}])`
+  );
+  check("同一张图重复导入复用同一 assetId", again.reused.length === 1 && again.reused[0].id === assetId, again.reused);
+
+  // ── 2. 分镜 + @图片绑定（走与界面一致的插入光标路径） ──
+  const added = await js(`window.managerWorkbenchAPI.storyboard.add(${JSON.stringify(projectId)}, {})`);
+  const storyboardId = added.storyboard.id;
+  check("分镜已创建", Boolean(storyboardId));
+
+  const prefix = "镜头推进，";
+  await js(
+    `window.managerWorkbenchAPI.storyboard.update(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, {name: ${JSON.stringify("开场")}, prompt: ${JSON.stringify(prefix)}})`
+  );
+  const bound = await js(
+    `window.managerWorkbenchAPI.storyboard.bind(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, ${JSON.stringify(assetId)}, {prompt: ${JSON.stringify(prefix)}, caret: ${prefix.length}})`
+  );
+  report.steps.bind = { token: bound.token, caret: bound.caret, prompt: bound.storyboard?.prompt };
+  check("@图片绑定成功并分配 token", bound.added === true && bound.token === "@图1", report.steps.bind);
+  check("token 插入在光标位置而不是一律追加末尾", String(bound.storyboard?.prompt).startsWith(prefix), bound.storyboard?.prompt);
+  check("引用表记录了 assetId", bound.storyboard?.refs?.[0]?.assetId === assetId, bound.storyboard?.refs);
+
+  // ── 3. 改名不影响引用 ──
+  await js(
+    `window.managerWorkbenchAPI.asset.rename(${JSON.stringify(projectId)}, ${JSON.stringify(assetId)}, ${JSON.stringify("改名后的素材")})`
+  );
+  let snap = await js("window.managerWorkbenchAPI.snapshot()");
+  const sbAfterRename = snap.project.storyboards.find((s) => s.id === storyboardId);
+  check("改名后引用仍是同一 assetId", sbAfterRename?.refs?.[0]?.assetId === assetId, sbAfterRename?.refs);
+  check("改名后素材展示名已更新", snap.assets.find((a) => a.id === assetId)?.name === "改名后的素材");
+  check("提示词内容未被改名影响", sbAfterRename?.prompt === bound.storyboard?.prompt);
+
+  // ── 4. 界面状态（重启恢复用） ──
+  await js(
+    `window.managerWorkbenchAPI.ui.set(${JSON.stringify(projectId)}, {selectedStoryboardId: ${JSON.stringify(storyboardId)}})`
+  );
+  snap = await js("window.managerWorkbenchAPI.snapshot()");
+  check("界面选中态已持久化", snap.project?.ui?.selectedStoryboardId === storyboardId);
+
+  // ── 5. 提交前校验预览（真实能力表） ──
+  const previewPlan = await js(
+    `window.managerWorkbenchAPI.task.preview(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, ${JSON.stringify("placeholder-account")})`
+  );
+  report.steps.preview = {
+    valid: previewPlan.valid,
+    errors: previewPlan.errors,
+    warnings: previewPlan.warnings,
+    limitations: previewPlan.limitations,
+    uploads: previewPlan.uploads,
+    params: previewPlan.params,
+  };
+  check("预览通过了参数校验", previewPlan.valid === true, previewPlan.errors);
+  check("预览带上了真实上传文件路径", previewPlan.uploads.length === 1 && fs.existsSync(previewPlan.uploads[0]), previewPlan.uploads);
+  check("比例与参考图上限被明确标注为平台未提供", previewPlan.warnings.length >= 1, previewPlan.warnings);
+  check("提示词预览里引用位置以原子占位符呈现", String(previewPlan.promptPreview).includes("\uFFFC"), previewPlan.promptPreview);
+
+  // ── 6. 任务入队（占位账号，不执行、不消耗额度） ──
+  const enqueued = await js(
+    `window.managerWorkbenchAPI.task.enqueue(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, ${JSON.stringify("placeholder-account")})`
+  );
+  const attempt = enqueued.attempt;
+  report.steps.attempt = { id: attempt.id, status: attempt.status, attempt: attempt.attempt, refs: attempt.refs, params: attempt.params };
+  check("任务入队为待执行", attempt.status === "pending");
+  check("尝试编号从 1 开始", attempt.attempt === 1);
+  check("参数快照已落库", attempt.params.model && attempt.params.duration, attempt.params);
+  check(
+    "引用快照含名称与内容哈希（不是仅靠文件名匹配）",
+    Boolean(attempt.refs?.[0]?.assetId) && Boolean(attempt.refs?.[0]?.sha256),
+    attempt.refs
+  );
+
+  // 分镜随后被编辑，已入队任务的快照不得改变
+  await js(
+    `window.managerWorkbenchAPI.storyboard.update(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, {prompt: "完全改写的提示词"})`
+  );
+  snap = await js("window.managerWorkbenchAPI.snapshot()");
+  const attemptAfterEdit = snap.tasks.find((t) => t.id === attempt.id);
+  check("分镜改写后任务参数快照不变", attemptAfterEdit?.params?.prompt === attempt.params.prompt, attemptAfterEdit?.params?.prompt);
+
+  // ── 7. 素材删除影响范围 ──
+  // 注意顺序：引用查询必须在「改写提示词」之外的另一条分镜上做。
+  // sbA 的提示词已被改写，其引用按设计已被裁掉，因此这里新建 sbB 重新建立引用。
+  const addedB = await js(`window.managerWorkbenchAPI.storyboard.add(${JSON.stringify(projectId)}, {})`);
+  const storyboardBId = addedB.storyboard.id;
+  const prefixB = "第二个镜头，";
+  await js(
+    `window.managerWorkbenchAPI.storyboard.update(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardBId)}, {prompt: ${JSON.stringify(prefixB)}})`
+  );
+  await js(
+    `window.managerWorkbenchAPI.storyboard.bind(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardBId)}, ${JSON.stringify(assetId)}, {prompt: ${JSON.stringify(prefixB)}, caret: ${prefixB.length}})`
+  );
+
+  const usages = await js(
+    `window.managerWorkbenchAPI.asset.usages(${JSON.stringify(projectId)}, [${JSON.stringify(assetId)}])`
+  );
+  check("能查出被哪条分镜以哪个 token 引用", usages[assetId]?.length === 1, usages);
+  check("影响范围指向正确的分镜", usages[assetId]?.[0]?.storyboardId === storyboardBId, usages[assetId]);
+
+  const blocked = await js(
+    `window.managerWorkbenchAPI.asset.remove(${JSON.stringify(projectId)}, [${JSON.stringify(assetId)}], "abort")`
+  );
+  check("直接删除被引用的素材会被拦下并返回影响范围", blocked.blocked === true && Object.keys(blocked.usages).length === 1, blocked);
+  check("被拦下时素材仍在列表中", (await js("window.managerWorkbenchAPI.snapshot()")).assets.length === 1);
+
+  const unbound = await js(
+    `window.managerWorkbenchAPI.asset.remove(${JSON.stringify(projectId)}, [${JSON.stringify(assetId)}], "unbind")`
+  );
+  check("确认后才真正删除并解除引用", unbound.blocked === false && unbound.removed.length === 1 && unbound.unbound === 1, unbound);
+
+  snap = await js("window.managerWorkbenchAPI.snapshot()");
+  const sbAfterDelete = snap.project.storyboards.find((s) => s.id === storyboardBId);
+  check("解除引用后提示词里不再残留 token", !String(sbAfterDelete?.prompt).includes("@图"), sbAfterDelete?.prompt);
+  check("引用表已清空", (sbAfterDelete?.refs || []).length === 0);
+  check("素材已从列表移除", snap.assets.length === 0);
+
+  // ── 8. 落盘检查（重启恢复的前提） ──
+  const projectDir = path.join(appDataDir, "workbench", "projects", projectId);
+  const projectFile = path.join(projectDir, "project.json");
+  const tasksFile = path.join(projectDir, "tasks.json");
+  check("project.json 已写入隔离目录", fs.existsSync(projectFile), projectFile.replace(isolatedRoot, "<隔离根>"));
+  check("tasks.json 已写入隔离目录", fs.existsSync(tasksFile));
+  const persisted = JSON.parse(fs.readFileSync(tasksFile, "utf8"));
+  check("任务记录可反序列化且含状态历史", Array.isArray(persisted.tasks) && persisted.tasks[0]?.history?.length >= 1, persisted.tasks?.[0]?.history);
+  report.steps.persistedAttempt = persisted.tasks?.[0];
+  check("素材目录已清理干净", !fs.existsSync(path.join(projectDir, "assets", `${assetId}.png`)));
+
+  // ── 9. 渲染层真实可用性（点开工作台面板，看是否真的渲染出来） ──
+  report.steps.renderer = {};
+  const opened = await js(`(() => {
+    const btn = document.getElementById('showWorkbench');
+    if (!btn) return { clicked: false, reason: '找不到工具栏按钮' };
+    btn.click();
+    return { clicked: true };
+  })()`);
+  check("工具栏「分镜工作台」按钮存在并可点击", opened.clicked === true, opened);
+  await delay(1200);
+  report.steps.renderer.panelVisible = await js(
+    `!document.getElementById('workbenchModal').classList.contains('hidden')`
+  );
+  check("工作台面板已打开", report.steps.renderer.panelVisible === true);
+
+  report.steps.renderer.storyboardCards = await js(`document.querySelectorAll('.workbench-sb').length`);
+  report.steps.renderer.assetCards = await js(`document.querySelectorAll('.workbench-asset').length`);
+  report.steps.renderer.defaultsRendered = await js(
+    `document.querySelectorAll('#workbenchDefaults select').length`
+  );
+  report.steps.renderer.modelOptions = await js(
+    `[...document.querySelectorAll('#workbenchDefaults select')][0] ? [...[...document.querySelectorAll('#workbenchDefaults select')][0].options].map(o=>o.textContent) : []`
+  );
+  report.steps.renderer.durationOptions = await js(
+    `[...document.querySelectorAll('#workbenchDefaults select')][1] ? [...[...document.querySelectorAll('#workbenchDefaults select')][1].options].map(o=>o.textContent) : []`
+  );
+  report.steps.renderer.statusText = await js(`document.getElementById('workbenchHint')?.textContent || ''`);
+  report.steps.renderer.storageText = await js(`document.getElementById('workbenchStorage')?.textContent || ''`);
+  check("分镜卡片已渲染", report.steps.renderer.storyboardCards >= 1, report.steps.renderer.storyboardCards);
+  check("默认参数下拉已渲染", report.steps.renderer.defaultsRendered >= 2, report.steps.renderer.defaultsRendered);
+  check(
+    "模型下拉来自真实能力表",
+    (report.steps.renderer.modelOptions || []).some((t) => t.includes("seedance2.5")),
+    report.steps.renderer.modelOptions
+  );
+  check("渲染层未产生控制台错误", report.consoleErrors.length === 0, report.consoleErrors.slice(0, 3));
+  check("渲染层未出现 preload / 加载失败", report.pageErrors.length === 0, report.pageErrors.slice(0, 3));
+
+  await delay(800);
+  check("隔离内未出现越界写入（报告目录仍在隔离根内）", reportPath.startsWith(exeDir));
+
+  report.ok = report.checks.every((c) => c.pass);
+  writeAndExit(report.ok ? 0 : 1);
+})().catch((error) => {
+  report.error = error?.stack ? error.stack : String(error);
+  writeAndExit(1);
+});
