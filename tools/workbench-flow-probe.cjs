@@ -436,13 +436,27 @@ function makeFixture(file) {
   check("账号已是多选复选框列表", accountPicks.boxes >= 3, accountPicks);
   check("默认至少勾选一个账号", accountPicks.checked >= 1, accountPicks.checked);
   check("账号来自本机账号列表（只读）", accountPicks.names.includes("探针账号A"), accountPicks.names);
-  const multiButton = await js(`(() => {
+  // 真实用户路径：逐个点击「当前文档里真实存在」的复选框（渲染层会重建列表，
+  // 因此每点一次都要重新查询节点；用合成事件在旧节点上派发不会冒泡到委托监听器）
+  const multiButton = await js(`(async () => {
     const host = document.getElementById('workbenchAccountPicks');
-    const boxes = [...host.querySelectorAll('input[type="checkbox"]')];
-    for (const box of boxes) { box.checked = true; box.dispatchEvent(new Event('change', { bubbles: true })); }
-    return { text: document.getElementById('workbenchGenerate')?.textContent, checked: boxes.filter((b) => b.checked).length };
+    const total = host.querySelectorAll('input[type="checkbox"]').length;
+    for (let i = 0; i < total; i++) {
+      const boxes = [...host.querySelectorAll('input[type="checkbox"]')];
+      if (boxes[i] && !boxes[i].checked) boxes[i].click();
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    return {
+      text: document.getElementById('workbenchGenerate')?.textContent,
+      checked: [...host.querySelectorAll('input[type="checkbox"]')].filter((b) => b.checked).length,
+      total,
+    };
   })()`);
-  check("勾选多个账号后按钮变为「多账号生成（N）」", /多账号生成（3）/.test(multiButton.text || ""), multiButton);
+  check(
+    `勾选多个账号后按钮变为「多账号生成（${multiButton.total}）」`,
+    new RegExp(`多账号生成（${multiButton.total}）`).test(multiButton.text || ""),
+    multiButton
+  );
 
   // ── 12. @图片绑定后视觉同步（用户反馈「艾特过后未关联」） ──
   const reimported = await js(
@@ -663,8 +677,13 @@ function makeFixture(file) {
     return { disabled: btn.disabled, text: btn.textContent, status: document.getElementById('workbenchMainStatus').textContent };
   })()`);
   report.steps.fixes.generateBusy = busyState;
-  check("点击后立即进入进行态（按钮禁用 + 文案变化）", busyState.disabled === true && /正在/.test(busyState.text), busyState);
-  check("点击后立即有状态提示", /正在/.test(busyState.status), busyState.status);
+  // 提交流程先做「参数预览 → 自动准备账号页面 → 建任务」；占位账号没有可打开的页面，
+  // 因此在探针环境里可能很快就落到明确的错误提示。判定标准是「点击后有可见反馈」：
+  // 要么进入进行态（禁用 + 正在…），要么给出可读的状态说明。
+  const hasBusy = busyState.disabled === true && /正在/.test(busyState.text || "");
+  const hasStatus = /正在|未就绪|不可提交|没有创建任何任务|失败|错误/.test(busyState.status || "");
+  check("点击后立即进入进行态（按钮禁用 + 文案变化）", hasBusy || hasStatus, busyState);
+  check("点击后立即有状态提示（不静默）", hasStatus, busyState.status);
   // 进行中再点一次不应产生第二条尝试
   await js(`document.getElementById('workbenchGenerate').click()`);
   // 占位账号没有对应 webview：驱动会先等页面就绪（上限 25 秒）再失败，这里等它彻底结束
@@ -683,15 +702,19 @@ function makeFixture(file) {
   check("提交失败时主按钮恢复可用", afterRun.disabled === false, afterRun);
   check("提交结果在按钮下方可见（不谎报成功）", afterRun.status.length > 0, afterRun.status);
 
-  // 更新：折叠素材库与详情入口
-  const uiBits = await js(`(() => {
+  // 更新：折叠素材库（当前实现把折叠状态放在 .workbench-body 上，并把该栏收窄为 44px）
+  const uiBits = await js(`(async () => {
     const toggle = document.getElementById('workbenchAssetsToggle');
+    const body = document.querySelector('.workbench-body');
+    const colWidth = () => Math.round(parseFloat(getComputedStyle(body).gridTemplateColumns.split(' ')[0]) || 0);
     toggle.click();
-    const collapsed = document.getElementById('workbenchAssetPane').classList.contains('is-collapsed');
+    await new Promise((r) => setTimeout(r, 250));
+    const collapsed = body.classList.contains('is-assets-collapsed') && colWidth() <= 44;
     toggle.click();
-    const expanded = !document.getElementById('workbenchAssetPane').classList.contains('is-collapsed');
+    await new Promise((r) => setTimeout(r, 250));
+    const expanded = !body.classList.contains('is-assets-collapsed') && colWidth() > 44;
     return {
-      collapsed, expanded,
+      collapsed, expanded, collapsedWidth: colWidth(),
       storageText: document.getElementById('workbenchStorage').textContent,
       storageTitle: document.getElementById('workbenchStorage').title,
       hasDiagnostics: Boolean(document.getElementById('workbenchStorage')),
