@@ -805,6 +805,59 @@ async function main() {
   eq("不支持的扩展名与空内容都被拒绝", pastedBad.failed.length, 2);
   eq("失败项不会被记为导入", pastedBad.imported.length, 0);
 
+  // 12.5 提交期间必须有可见反馈：driver 尚未返回时，任务记录就该是「进行中」并带已完成步骤。
+  // 这一段锁住「点了提交看起来毫无反应」：旧实现只在 submit 返回后才写一次性结果。
+  console.log("── 修改项：提交期间的可见反馈 ──");
+  let releaseSubmit = () => {};
+  const submitGate = new Promise((resolve) => {
+    releaseSubmit = resolve;
+  });
+  const liveRunner = createRunner({
+    taskStore,
+    driver: {
+      async submit({ onStep }) {
+        onStep({ step: "setPrompt", ok: true, readback: "推门" });
+        onStep({ step: "chooseModel", ok: true, picked: "2.5" });
+        await submitGate;
+        return {
+          outcome: "failed",
+          message: "页面上找不到发送按钮，无法提交生成",
+          steps: [
+            { step: "setPrompt", ok: true, readback: "推门" },
+            { step: "chooseModel", ok: true, picked: "2.5" },
+            { step: "send", ok: false, reason: "页面上找不到发送按钮，无法提交生成", candidates: ["label:发送"] },
+          ],
+        };
+      },
+    },
+    capabilities: CAPS,
+    schedule: sched.schedule,
+    cancelSchedule: sched.cancel,
+    resolveAssets: async () => assetsById,
+    listProjectIds: async () => [projectId],
+  });
+  const liveAttempt = await liveRunner.enqueue({
+    projectId,
+    storyboardId: "sb_live",
+    accountId: "acc_1",
+    params: goodParams,
+    refs: goodRefs,
+  });
+  const executing = liveRunner.execute(projectId, liveAttempt.id);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const midState = (await taskStore.list(projectId)).find((t) => t.id === liveAttempt.id);
+  eq("提交期间记录为进行中", midState.driver.outcome, "running");
+  eq("提交期间已完成的步骤立刻可见", midState.driver.steps.length, 2);
+  eq("进行中也能看出走到了哪一步", midState.driver.steps[1].detail, "已选择 2.5");
+  releaseSubmit();
+  await executing;
+  const finalState = (await taskStore.list(projectId)).find((t) => t.id === liveAttempt.id);
+  eq("最终结果覆盖进行中状态", finalState.driver.outcome, "failed");
+  eq("最终步骤被完整记录", finalState.driver.steps.length, 3);
+  eq("最终候选控件清单被保留", finalState.driver.candidates[0], "label:发送");
+  eq("失败步骤原因可读", finalState.driver.steps[2].detail, "页面上找不到发送按钮，无法提交生成");
+  eq("失败后状态仍为生成失败", finalState.status, "failed");
+
   fs.rmSync(root, { recursive: true, force: true });
 
   console.log("");

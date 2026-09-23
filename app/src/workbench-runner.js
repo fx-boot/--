@@ -48,6 +48,26 @@ function stepDetail(s) {
   return "";
 }
 
+/** 步骤列表 → 可落库、可展示的形式 */
+function summarizeSteps(list) {
+  return (Array.isArray(list) ? list : []).slice(0, 20).map((s) => ({
+    step: String(s?.step || "").slice(0, 40),
+    ok: s?.ok !== false,
+    detail: stepDetail(s).slice(0, 200),
+  }));
+}
+
+/** 提交进行中的中间态：界面据此显示「正在提交」与已完成的步骤 */
+function runningDriver(message, steps = []) {
+  return {
+    outcome: "running",
+    message: String(message || "提交进行中…").slice(0, 500),
+    at: new Date().toISOString(),
+    steps: summarizeSteps(steps),
+    candidates: [],
+  };
+}
+
 /** 把驱动层返回的步骤整理成可落库、可展示的形式（界面据此给出可见反馈） */
 function summarizeDriver(submitted) {
   const list = Array.isArray(submitted?.steps) ? submitted.steps : [];
@@ -56,11 +76,7 @@ function summarizeDriver(submitted) {
     outcome: String(submitted?.outcome || "").slice(0, 20),
     message: String(submitted?.message || "").slice(0, 500),
     at: new Date().toISOString(),
-    steps: list.slice(0, 20).map((s) => ({
-      step: String(s?.step || "").slice(0, 40),
-      ok: s?.ok !== false,
-      detail: stepDetail(s).slice(0, 200),
-    })),
+    steps: summarizeSteps(list),
     candidates: (sendStep?.candidates || submitted?.candidates || []).slice(0, 12).map((c) => String(c).slice(0, 120)),
   };
 }
@@ -172,6 +188,22 @@ function createRunner(options = {}) {
     state.running.set(attemptId, { projectId, accountId: record.accountId, startedAt: Date.now() });
     notify();
 
+    // 中途步骤与最终结果都会写同一个 tasks.json：串行化写入，保证最终结果最后落盘。
+    // 声明在 try 之外，catch 里才能等它们落地后再写失败结果。
+    const liveSteps = [];
+    let writeChain = Promise.resolve();
+    const onStep = (step) => {
+      liveSteps.push(step);
+      writeChain = writeChain
+        .then(() =>
+          patch(projectId, attemptId, (r) => {
+            r.driver = runningDriver("提交进行中…", liveSteps);
+            return r;
+          })
+        )
+        .catch(() => {});
+    };
+
     try {
       // 1) 快照校验 + 计划
       const assetsById = await resolveAssets(projectId, record.refs);
@@ -190,11 +222,17 @@ function createRunner(options = {}) {
         if (r.status === STATUS.PENDING) applyStatus(r, STATUS.SUBMITTING, "开始提交");
         return r;
       });
+      // 提交期间也必须有可见反馈：先写一条「进行中」，避免界面看起来完全没反应
+      await patch(projectId, attemptId, (r) => {
+        r.driver = runningDriver("正在打开账号页面并逐步提交…");
+        return r;
+      });
 
-      const submitted = await driver.submit({ accountId: record.accountId, plan, attempt: record });
+      const submitted = await driver.submit({ accountId: record.accountId, plan, attempt: record, onStep });
       const outcome = String(submitted?.outcome || (submitted?.platformTaskId ? "ok" : "unknown"));
 
-      // 先把驱动层的逐步结果落库，界面即使失败也能看到「卡在哪一步、页面上有哪些候选控件」
+      // 等中途写入全部落地后，再写最终结果：界面即使失败也能看到「卡在哪一步」
+      await writeChain;
       await patch(projectId, attemptId, (r) => {
         r.driver = summarizeDriver(submitted);
         return r;
@@ -243,7 +281,13 @@ function createRunner(options = {}) {
       schedulePoll(projectId, attemptId, 0);
     } catch (error) {
       const rule = classifyBlock(error?.message);
+      // 先让中途写入落地，再把「进行中」改成失败，避免被后到的步骤写入覆盖
+      await writeChain;
       await patch(projectId, attemptId, (r) => {
+        r.driver = {
+          ...runningDriver(`执行中断：${error?.message || String(error)}`, liveSteps),
+          outcome: "failed",
+        };
         setError(r, rule?.code || "RUNNER_ERROR", error?.message || String(error));
         if (!isTerminal(r.status)) {
           if (r.status === STATUS.PENDING) applyStatus(r, STATUS.SUBMITTING);

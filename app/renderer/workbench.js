@@ -26,7 +26,7 @@
     queue: null,
     // 执行账号可多选：一次为每个勾选账号各建一条尝试
     selectedAccountIds: [],
-    run: { storyboardId: "", accountIds: [] },
+    run: { storyboardId: "", accountIds: [], currentAttemptId: "" },
     search: "",
     saveTimers: new Map(),
     // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
@@ -146,8 +146,31 @@
     renderStoryboards();
     renderAccounts();
     renderTasks();
+    renderRunProgress();
     renderHint();
     restoreFocus(focus);
+  }
+
+  /** 提交确认框里的实时进度：执行期间每一步都会刷新，避免看起来「点了没反应」 */
+  function renderRunProgress() {
+    const modal = $("workbenchRunModal");
+    const status = $("workbenchRunStatus");
+    if (!modal || !status || modal.classList.contains("hidden")) return;
+    const attemptId = state.run.currentAttemptId;
+    if (!attemptId) return;
+    const record = (state.tasks || []).find((t) => t.id === attemptId);
+    if (!record) return;
+    const steps = record.driver?.steps || [];
+    const last = steps[steps.length - 1];
+    if (record.driver?.outcome === "running") {
+      status.textContent = `第 ${steps.length} 步：${
+        last ? STEP_LABEL[last.step] || last.step : "正在打开账号页面"
+      }…（真实提交，请勿关闭窗口）`;
+      return;
+    }
+    if (last) {
+      status.textContent = `最近一步：${STEP_LABEL[last.step] || last.step}${last.detail ? ` · ${last.detail}` : ""}`;
+    }
   }
 
   function renderHint() {
@@ -544,6 +567,7 @@
     attachImages: "附加参考图",
     readState: "读取页面状态",
     send: "点击发送",
+    awaitResponse: "等待平台响应",
   };
   const ACTIVE_STATUSES = ["pending", "submitting", "queued", "generating"];
   const isActiveStatus = (status) => ACTIVE_STATUSES.includes(status);
@@ -695,13 +719,29 @@
     }
 
     // 驱动层逐步结果：让「点了生成没反应」变成「卡在第几步、页面上有哪些候选控件」
-    const steps = record.driver?.steps || [];
-    if (steps.length) {
+    const driver = record.driver || null;
+    const steps = driver?.steps || [];
+    if (driver?.outcome === "running") {
+      const live = document.createElement("div");
+      live.className = "workbench-task-running";
+      const last = steps[steps.length - 1];
+      const lastLabel = last ? STEP_LABEL[last.step] || last.step : "";
+      live.textContent = `${driver.message || "提交进行中…"}${
+        last ? ` · 最近完成：${lastLabel}${last.detail ? `（${last.detail}）` : ""}` : ""
+      }`;
+      card.appendChild(live);
+    }
+    if (driver && (steps.length || driver.outcome === "running")) {
       const box = document.createElement("details");
       box.className = "workbench-task-steps";
+      // 进行中默认展开，用户能实时看到走到哪一步
+      if (driver.outcome === "running") box.open = true;
       const summary = document.createElement("summary");
       const badCount = steps.filter((s) => s.ok === false).length;
-      summary.textContent = `提交步骤（${steps.length} 步${badCount ? `，${badCount} 步未成功` : "，全部成功"}）`;
+      summary.textContent =
+        driver.outcome === "running"
+          ? `提交进行中（已完成 ${steps.length} 步）`
+          : `提交步骤（${steps.length} 步${badCount ? `，${badCount} 步未成功` : "，全部成功"}）`;
       box.appendChild(summary);
       for (const step of steps) {
         const row = document.createElement("div");
@@ -711,10 +751,10 @@
         }`;
         box.appendChild(row);
       }
-      if (record.driver?.candidates?.length) {
+      if (driver.candidates?.length) {
         const row = document.createElement("div");
         row.className = "workbench-step-cands";
-        row.textContent = `页面候选控件：${record.driver.candidates.join(" | ")}`;
+        row.textContent = `页面候选控件：${driver.candidates.join(" | ")}`;
         box.appendChild(row);
       }
       card.appendChild(box);
@@ -1437,6 +1477,7 @@
           }
           try {
             const created = await api.task.enqueue(projectId(), state.run.storyboardId, accountId);
+            state.run.currentAttemptId = created.attempt.id;
             await refresh();
             await api.task.execute(projectId(), created.attempt.id);
             done++;
@@ -1444,6 +1485,7 @@
             failed.push(`${accountName(accountId)}：${error.message}`);
           }
         }
+        state.run.currentAttemptId = "";
         await refresh();
         closeModal("workbenchRunModal");
         if (failed.length) {

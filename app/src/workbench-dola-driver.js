@@ -20,17 +20,30 @@
  * - 不做任何进度百分比的编造：页面没有明确信号时返回 unknown。
  */
 
-const { session, webContents, BrowserWindow } = require("electron");
-const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+const { BrowserWindow } = require("electron");
 const { DOLA_SELECTORS } = require("./workbench-platform");
 
 const CREATE_URL = "https://www.dola.com/";
 const PARTITION_PREFIX = "persist:doubao-manager-";
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
 const SEND_TIMEOUT_MS = 45 * 1000;
+// 每个环节都必须有上限：页面没加载完或脚本挂起时，绝不能把整个提交无限期卡住
+const LOAD_TIMEOUT_MS = 20 * 1000;
+const EVAL_TIMEOUT_MS = 15 * 1000;
+const IMAGE_TIMEOUT_MS = 20 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
+function withTimeout(promise, ms, timeoutValue) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(timeoutValue), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 /** 页面内注入脚本：只做与既有模块同款的 DOM 操作 */
 function pageScript(source) {
@@ -56,10 +69,23 @@ const HELPERS = `
   const textOf = (el) => String(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title') || '').replace(/\\s+/g, ' ').trim();
   const editors = () => [...document.querySelectorAll(SEL.editor)].filter(e => visible(e) && !e.disabled && !e.readOnly);
   const attr = (el, name) => { try { return String(el?.getAttribute?.(name) || ''); } catch { return ''; } };
+  // 失败时把「页面在哪、页面上写着什么」一并回报，便于判断是不是撞了登录墙
+  const pageInfo = () => {
+    try {
+      return { pageUrl: String(location.href), pageExcerpt: String(document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 300) };
+    } catch { return { pageUrl: '', pageExcerpt: '' }; }
+  };
 `;
 
 async function evaluate(contents, source) {
-  return contents.executeJavaScript(pageScript(`${HELPERS}\n${source}`), true);
+  const result = await withTimeout(
+    contents
+      .executeJavaScript(pageScript(`${HELPERS}\n${source}`), true)
+      .catch((error) => ({ ok: false, reason: `页面脚本执行失败：${error?.message || error}` })),
+    EVAL_TIMEOUT_MS,
+    { ok: false, reason: `页面脚本执行超时（${EVAL_TIMEOUT_MS / 1000} 秒无响应，页面可能未加载完成）` }
+  );
+  return result;
 }
 
 /** 点击某个控件并从中选择匹配项；失败时回报实际可见选项 */
@@ -67,7 +93,7 @@ const STEP_CHOOSE = `
   const controlSelector = __SELECTOR__;
   const wanted = __WANTED__;
   const control = document.querySelector(controlSelector);
-  if (!control) return { ok: false, reason: '页面上找不到该控件', available: [] };
+  if (!control) return { ok: false, reason: '页面上找不到该控件', wanted, available: [], ...pageInfo() };
   control.click();
   await new Promise(r => setTimeout(r, 600));
   const menus = [...document.querySelectorAll('[role="menu"],[role="listbox"],[data-slot*="dropdown-menu"],[class*="popover"],[class*="dropdown"]')].filter(visible);
@@ -75,7 +101,7 @@ const STEP_CHOOSE = `
   const labels = [...new Set(options.map(textOf).filter(Boolean))].slice(0, 40);
   const norm = (s) => s.toLowerCase().replace(/[\\s_\\-]/g, '');
   const target = options.find(o => norm(textOf(o)).includes(norm(wanted)));
-  if (!target) return { ok: false, reason: '菜单里没有匹配项', wanted, available: labels };
+  if (!target) return { ok: false, reason: '菜单里没有匹配项', wanted, available: labels, ...pageInfo() };
   target.click();
   await new Promise(r => setTimeout(r, 400));
   return { ok: true, picked: textOf(target), available: labels };
@@ -83,7 +109,7 @@ const STEP_CHOOSE = `
 
 const STEP_SET_TEXT = `
   const list = editors();
-  if (!list.length) return { ok: false, reason: '找不到提示词输入框' };
+  if (!list.length) return { ok: false, reason: '找不到提示词输入框（可能未登录、页面未加载完成或页面结构已变化）', ...pageInfo() };
   const editor = list[0];
   const value = __VALUE__;
   editor.focus();
@@ -150,7 +176,7 @@ const STEP_SEND = `
 
   const candidates = cands.slice(0, 12).map((c) => c.why);
   const target = cands[0];
-  if (!target) return { ok: false, reason: '页面上找不到发送按钮，无法提交生成', candidates };
+  if (!target) return { ok: false, reason: '页面上找不到发送按钮，无法提交生成', candidates, ...pageInfo() };
   target.el.click();
   await new Promise((r) => setTimeout(r, 600));
   return { ok: true, clicked: target.why, candidates };
@@ -196,7 +222,6 @@ function createDolaDriver(options = {}) {
     }
     // 兜底：用账号会话分区自建一个隐藏窗口，不改动用户的可见工作区
     const partition = `${PARTITION_PREFIX}${accountId}`;
-    const target = session.fromPartition(partition);
     const win = new BrowserWindow({
       show: false,
       width: 1280,
@@ -206,11 +231,20 @@ function createDolaDriver(options = {}) {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
-        preload: pathToFileURL(path.join(__dirname, "webview-preload.js")).toString(),
+        // 刻意不挂 webview-preload：那是给 <webview> 用的（依赖 sendToHost），
+        // 装到普通窗口只会报「preload script must have absolute path」之类的错且无效。
+        // 驱动层只需要 DOM 与调试协议，不需要该预加载。
       },
     });
-    void target;
-    await win.loadURL(CREATE_URL).catch(() => {});
+    const loaded = await withTimeout(
+      win
+        .loadURL(CREATE_URL)
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, reason: `页面加载失败：${error?.message || error}` })),
+      LOAD_TIMEOUT_MS,
+      { ok: false, reason: `页面加载超时（${LOAD_TIMEOUT_MS / 1000} 秒），账号会话可能不可用` }
+    );
+    if (!loaded.ok) log("dola-page-load-failed", { accountId, partition, reason: loaded.reason });
     state.pages.set(accountId, win.webContents);
     return win.webContents;
   }
@@ -313,8 +347,17 @@ function createDolaDriver(options = {}) {
     id: "dola",
     verified: state.verified,
 
-    async submit({ accountId, plan }) {
+    async submit({ accountId, plan, onStep }) {
       const steps = [];
+      // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果
+      const record = (step, result) => {
+        steps.push({ step, ...result });
+        if (typeof onStep === "function") {
+          try {
+            onStep({ step, ...result });
+          } catch {}
+        }
+      };
       let contents;
       try {
         contents = await pageFor(accountId);
@@ -329,40 +372,39 @@ function createDolaDriver(options = {}) {
         contents,
         STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.plainText))
       );
-      steps.push({ step: "setPrompt", ...textStep });
+      record("setPrompt", textStep);
       if (!textStep?.ok) {
         return { outcome: "failed", message: `写入提示词失败：${textStep?.reason || "内容未被接受"}`, steps };
       }
 
-      const modelStep = await chooseOption(contents, DOLA_SELECTORS.modelControl, modelLabel(plan.params.model));
-      steps.push({ step: "chooseModel", ...modelStep });
-      const durationStep = await chooseOption(
-        contents,
-        DOLA_SELECTORS.durationControl,
-        String(plan.params.duration)
-      );
-      steps.push({ step: "chooseDuration", ...durationStep });
+      record("chooseModel", await chooseOption(contents, DOLA_SELECTORS.modelControl, modelLabel(plan.params.model)));
+      record("chooseDuration", await chooseOption(contents, DOLA_SELECTORS.durationControl, String(plan.params.duration)));
       // 比例：平台能力表里没有这一项，控件是否存在需要实测；找不到就如实记录，不阻塞提交
-      const ratioStep = plan.params.ratio
-        ? await chooseOption(contents, DOLA_SELECTORS.ratioControl, plan.params.ratio)
-        : { ok: true, skipped: true, reason: "未设置比例" };
-      steps.push({ step: "chooseRatio", ...ratioStep });
+      record(
+        "chooseRatio",
+        plan.params.ratio
+          ? await chooseOption(contents, DOLA_SELECTORS.ratioControl, plan.params.ratio)
+          : { ok: true, skipped: true, reason: "未设置比例" }
+      );
 
-      const uploadStep = await attachImages(contents, plan.uploads);
-      steps.push({ step: "attachImages", ...uploadStep });
+      const uploadStep = await withTimeout(
+        attachImages(contents, plan.uploads),
+        IMAGE_TIMEOUT_MS,
+        { ok: false, reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）` }
+      );
+      record("attachImages", uploadStep);
       if (!uploadStep.ok) {
         return { outcome: "failed", message: uploadStep.reason, steps, limitation: uploadStep.limitation };
       }
 
-      const stateRead = await evaluate(contents, STEP_READ_STATE);
-      steps.push({ step: "readState", ...stateRead });
+      record("readState", await evaluate(contents, STEP_READ_STATE));
 
       // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
       const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
 
       // 关键补漏：此前只写入了内容却没有真正点击发送，因此永远等不到任务 ID
       const sendStep = await evaluate(contents, STEP_SEND);
-      steps.push({ step: "send", ...sendStep });
+      record("send", sendStep);
       if (!sendStep?.ok) {
         return {
           outcome: "failed",
@@ -371,6 +413,15 @@ function createDolaDriver(options = {}) {
         };
       }
 
+      if (typeof onStep === "function") {
+        try {
+          onStep({
+            step: "awaitResponse",
+            ok: true,
+            reason: `已点击发送，等待平台响应（最长 ${SEND_TIMEOUT_MS / 1000} 秒）`,
+          });
+        } catch {}
+      }
       const watched = await watcher;
       if (watched.taskId) {
         return {

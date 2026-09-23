@@ -201,16 +201,25 @@ function makeFixture(file) {
   const storyboardId = added.storyboard.id;
   check("分镜已创建", Boolean(storyboardId));
 
-  const prefix = "镜头推进，";
+  // 光标刻意放在文本「中间」：若 bind 丢掉 {prompt, caret}，token 就会被追加到末尾，
+  // 这里的断言必须能区分「插到光标处」和「追加到末尾」两种情况。
+  const mid = "镜头推进，";
+  const tail = "扇叶转动";
+  const prefix = `${mid}${tail}`;
   await js(
     `window.managerWorkbenchAPI.storyboard.update(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, {name: ${JSON.stringify("开场")}, prompt: ${JSON.stringify(prefix)}})`
   );
   const bound = await js(
-    `window.managerWorkbenchAPI.storyboard.bind(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, ${JSON.stringify(assetId)}, {prompt: ${JSON.stringify(prefix)}, caret: ${prefix.length}})`
+    `window.managerWorkbenchAPI.storyboard.bind(${JSON.stringify(projectId)}, ${JSON.stringify(storyboardId)}, ${JSON.stringify(assetId)}, {prompt: ${JSON.stringify(prefix)}, caret: ${mid.length}})`
   );
   report.steps.bind = { token: bound.token, caret: bound.caret, prompt: bound.storyboard?.prompt };
   check("@图片绑定成功并分配 token", bound.added === true && bound.token === "@图1", report.steps.bind);
-  check("token 插入在光标位置而不是一律追加末尾", String(bound.storyboard?.prompt).startsWith(prefix), bound.storyboard?.prompt);
+  check(
+    "token 精确插入在光标处（而不是一律追加末尾）",
+    String(bound.storyboard?.prompt) === `${mid} @图1${tail}`,
+    { actual: bound.storyboard?.prompt, expected: `${mid} @图1${tail}` }
+  );
+  check("token 之后原有的文字没有被挤走", String(bound.storyboard?.prompt).endsWith(tail), bound.storyboard?.prompt);
   check("引用表记录了 assetId", bound.storyboard?.refs?.[0]?.assetId === assetId, bound.storyboard?.refs);
 
   // ── 3. 改名不影响引用 ──
@@ -418,15 +427,18 @@ function makeFixture(file) {
   await delay(700);
   check("素材列表已重新出现素材", (await js(`document.querySelectorAll('.workbench-asset').length`)) >= 1);
 
-  // 在第一条分镜里输入 @（此刻自动保存仍在防抖窗口内，正是会出问题的时序）
+  // 在第一条分镜里「文本中间」输入 @：光标后面还有文字，
+  // 若 token 被追加到末尾，下面的 endsWith 断言就会失败（这正是用户报的现象）
   const typed = await js(`(() => {
     const ta = document.querySelector('.workbench-sb-prompt');
     if (!ta) return { ok: false };
     ta.focus();
-    ta.value = ${JSON.stringify("镜头推进 @")};
-    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.value = ${JSON.stringify("前段 @后段")};
+    // 光标放在 @ 之后（用 indexOf 定位，避免手算下标出错）
+    const caret = ta.value.indexOf("@") + 1;
+    ta.setSelectionRange(caret, caret);
     ta.dispatchEvent(new Event('input', { bubbles: true }));
-    return { ok: true, value: ta.value };
+    return { ok: true, value: ta.value, caret: ta.selectionStart };
   })()`);
   await delay(150);
   const mentionVisible = await js(`!document.getElementById('workbenchMentionModal').classList.contains('hidden')`);
@@ -450,7 +462,8 @@ function makeFixture(file) {
   })()`);
   report.steps.fixes.afterBind = afterBind;
   check("@绑定后提示词输入框里出现 @图 标记", String(afterBind.textareaValue).includes("@图"), afterBind.textareaValue);
-  check("@绑定后不再是裸 @ 结尾", !String(afterBind.textareaValue).trim().endsWith("@"), afterBind.textareaValue);
+  check("token 插在光标处，@ 之后的文字仍在末尾", String(afterBind.textareaValue).endsWith("后段"), afterBind.textareaValue);
+  check("token 没有跑到文本最后面", !/@图\\d+\\s*$/.test(String(afterBind.textareaValue)), afterBind.textareaValue);
   check("@绑定后出现引用标签", afterBind.chips >= 1, afterBind.chipText);
 
   // ── 13. 粘贴导入通道（剪贴板图片走 base64） ──

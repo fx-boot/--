@@ -135,6 +135,7 @@
 .workbench-task-log summary { cursor: pointer; }
 .workbench-task-log div { margin-top: 3px; line-height: 1.6; }
 .workbench-task-steps { margin-top: 7px; color: var(--muted); font-size: 9px; }
+.workbench-task-running { margin-top: 6px; padding: 6px 8px; border: 1px solid rgba(255,106,61,.3); border-radius: 7px; background: var(--accent-bg); color: var(--accent); font-size: 9px; line-height: 1.6; word-break: break-word; }
 .workbench-task-steps summary { cursor: pointer; }
 .workbench-task-steps div { margin-top: 3px; line-height: 1.6; word-break: break-word; }
 .workbench-step-bad { color: #ff9da6; }

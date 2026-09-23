@@ -124,7 +124,8 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     duplicate: (projectId, id) => ipcRenderer.invoke("workbench:storyboard-duplicate", projectId, id),
     remove: (projectId, id) => ipcRenderer.invoke("workbench:storyboard-delete", projectId, id),
     reorder: (projectId, ids) => ipcRenderer.invoke("workbench:storyboard-reorder", projectId, ids),
-    bind: (projectId, id, assetId) => ipcRenderer.invoke("workbench:storyboard-bind", projectId, id, assetId),
+    bind: (projectId, id, assetId, options) =>
+      ipcRenderer.invoke("workbench:storyboard-bind", projectId, id, assetId, options),
     unbind: (projectId, id, assetId) => ipcRenderer.invoke("workbench:storyboard-unbind", projectId, id, assetId),
   },
   prompt: {
