@@ -42,7 +42,7 @@
  */
 
 const { webContents, session } = require("electron");
-const { DOLA_SELECTORS, classifyAcceptance, classifyPlatformReply } = require("./workbench-platform");
+const { DOLA_SELECTORS, buildSegments, classifyAcceptance, classifyPlatformReply, toPlatformText } = require("./workbench-platform");
 
 const PARTITION_PREFIX = "persist:doubao-manager-";
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
@@ -817,6 +817,41 @@ const STEP_READ_REPLIES = `
   const fresh = urlChanged ? nodes : nodes.slice(Math.max(0, Number(before.count) || 0));
   const replies = fresh.map(n => String(n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300));
   return { ok: true, count: nodes.length, newCount: fresh.length, urlChanged, newReplies: replies, url: location.href };
+`;
+
+/**
+ * 读取本次生成结果（用于「生成成功」的判定与下载源解析）。
+ * 匹配规则刻意保守：只在消息文本里出现「本次写入平台的提示词」时才认，避免把历史视频算到本次头上。
+ * 同时回报视频地址与消息标识；地址取不到就如实返回空，由上层标成「未取得结果地址」。
+ */
+const STEP_READ_RESULT = `
+  const wanted = __TEXT__;
+  const norm = (s) => String(s || '').replace(/\\s+/g, '');
+  const key = norm(wanted).slice(0, 48);
+  const nodes = [...document.querySelectorAll('[data-message-id]')];
+  const hits = [];
+  for (const node of nodes) {
+    const text = norm(node.innerText || node.textContent || '');
+    if (!key || !text.includes(key)) continue;
+    const video = node.querySelector('video');
+    const src = video ? (video.currentSrc || video.src || video.querySelector('source')?.src || '') : '';
+    hits.push({
+      messageId: String(node.getAttribute('data-message-id') || '').slice(0, 60),
+      hasVideo: Boolean(video),
+      videoUrl: String(src || '').slice(0, 4000),
+      tail: String(node.innerText || '').replace(/\\s+/g, ' ').slice(-90),
+    });
+  }
+  const withVideo = hits.filter(h => h.hasVideo);
+  const newest = (withVideo.length ? withVideo : hits).slice(-1)[0] || null;
+  return {
+    ok: true,
+    matched: hits.length,
+    withVideo: withVideo.length,
+    newest,
+    videoCount: document.querySelectorAll('video').length,
+    url: location.href,
+  };
 `;
 
 /**
@@ -1724,23 +1759,61 @@ function createDolaDriver(options = {}) {
       };
     },
 
+    /** 读取本次生成结果：按「本次写入平台的提示词」在消息里匹配，取到视频地址才算数 */
+    async readResult({ accountId, attempt }) {
+      let contents;
+      try {
+        contents = await pageFor(accountId);
+      } catch (error) {
+        return { found: false, reason: `无法读取账号页面：${error?.message || error}` };
+      }
+      const prompt = String(attempt?.params?.prompt || "").trim();
+      const text = prompt ? toPlatformText(buildSegments(prompt, attempt?.refs || [], new Map())) : "";
+      const step = await evaluate(contents, STEP_READ_RESULT.replace("__TEXT__", JSON.stringify(text || ""))).catch(() => null);
+      if (!step?.ok) return { found: false, reason: step?.reason || "页面状态不可读取" };
+      const newest = step.newest || null;
+      return {
+        found: Boolean(newest?.hasVideo && newest?.videoUrl),
+        matched: step.matched,
+        withVideo: step.withVideo,
+        videoCount: step.videoCount,
+        videoUrl: String(newest?.videoUrl || ""),
+        messageId: String(newest?.messageId || ""),
+        tail: String(newest?.tail || ""),
+        reason: newest ? (newest.hasVideo ? "找到本次提示词对应的视频" : "消息里还没有视频") : "页面上没有找到本次提示词对应的消息",
+      };
+    },
+
     /** 页面没有明确信号时返回 unknown，不编造进度 */
-    async poll({ accountId, platformTaskId }) {
+    async poll({ accountId, platformTaskId, attempt }) {
       let contents;
       try {
         contents = await pageFor(accountId);
       } catch (error) {
         return { state: "unknown", message: `无法读取账号页面：${error?.message || error}` };
       }
+      // 先看平台是否已经把本次结果渲染出来（匹配的是本次写入平台的提示词，不会把历史视频算进来）
+      const result = await api.readResult({ accountId, attempt }).catch(() => null);
+      if (result?.found) {
+        return {
+          state: "succeeded",
+          message: "平台已完成生成：页面上出现本次提示词对应的视频",
+          result: { videoUrl: result.videoUrl },
+          evidence: { kind: "result-visible", messageId: result.messageId, matched: result.matched },
+        };
+      }
       const read = await evaluate(contents, STEP_READ_STATE).catch(() => null);
       if (!read?.ok) return { state: "unknown", message: "页面状态不可读取" };
-      const text = String(read.text || "");
-      if (/生成失败|失败|违规|未通过/.test(text) && !/生成中|排队/.test(text)) {
+      const pageText = String(read.text || "");
+      if (/生成失败|失败|违规|未通过/.test(pageText) && !/生成中|排队/.test(pageText)) {
         return { state: "failed", message: "页面显示生成失败", errorCode: "GENERATE_FAILED" };
+      }
+      if (/生成中|排队/.test(pageText)) {
+        return { state: "generating", message: "页面显示正在生成", canCancel: false };
       }
       return {
         state: "unknown",
-        message: "页面未给出可判定的状态标记；阶段2首次实机运行需要据此校准判定规则",
+        message: result?.reason || "页面未给出可判定的状态标记",
       };
     },
 

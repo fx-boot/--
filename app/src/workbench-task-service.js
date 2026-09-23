@@ -11,13 +11,12 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const fsp = require("node:fs/promises");
-const { net } = require("electron");
 
 const { createTaskStore, isActive } = require("./workbench-task-store");
 const { createRunner, stepDetail } = require("./workbench-runner");
 const { createDownloader } = require("./workbench-download");
 const { createDolaDriver, PARTITION_PREFIX } = require("./workbench-dola-driver");
+const { createMediaProbe } = require("./media-probe");
 const { assignStoryboards } = require("./workbench-platform");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
 
@@ -40,51 +39,6 @@ function readAccounts(userDataDir) {
   } catch {
     return [];
   }
-}
-
-/** 用 Electron net 走账号会话下载；沿用页面 Referer，与既有高清原片下载一致 */
-async function electronFetchToFile({ url, filePath, session }) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
-        resolve(value);
-      }
-    };
-    let request;
-    try {
-      request = net.request({ url, session, useSessionCookies: true, redirect: "follow" });
-    } catch (error) {
-      return finish({ ok: false, error: `请求无法建立：${error.message}` });
-    }
-    request.setHeader("Referer", "https://www.dola.com/");
-    request.on("response", (response) => {
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        response.on("data", () => {});
-        return finish({ ok: false, error: `下载失败，HTTP ${response.statusCode}` });
-      }
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.on("end", async () => {
-        try {
-          const buffer = Buffer.concat(chunks);
-          await fsp.mkdir(path.dirname(filePath), { recursive: true });
-          await fsp.writeFile(filePath, buffer);
-          finish({
-            ok: true,
-            bytes: buffer.length,
-            mime: String(response.headers["content-type"] || "").split(";")[0].trim(),
-          });
-        } catch (error) {
-          finish({ ok: false, error: `写入文件失败：${error.message}` });
-        }
-      });
-      response.on("error", (error) => finish({ ok: false, error: error.message }));
-    });
-    request.on("error", (error) => finish({ ok: false, error: error.message }));
-    request.end();
-  });
 }
 
 function createTaskService({ store, assets, userDataDir, log = () => {}, onChanged = () => {} }) {
@@ -126,16 +80,75 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
     listProjectIds,
     onChanged,
     log,
+    // 生成成功后的自动下载钩子：是否开始下载由项目设置决定（默认关），下载失败不回改生成状态
+    onResultReady: async ({ projectId, attemptId }) => {
+      const enabled = await autoDownloadEnabled(projectId);
+      if (!enabled) return;
+      await startDownload({ projectId, attemptId, auto: true });
+    },
   });
 
+  // 下载链路：会话来自账号分区（与既有高清原片下载同一套），来源分组复用 HD 观察器
+  const { session } = require("electron");
+  const hdService = require("./hd-original-service");
+  const parser = require("./hd-candidates").createParser();
+  const probe = createMediaProbe({ executable: path.join(process.resourcesPath, "media-tools/ffprobe.exe") });
   const downloader = createDownloader({
     taskStore,
     outputDirFor: async (projectId) => path.join(store.attachmentsDir(projectId), "downloads"),
-    fetchToFile: async ({ url, filePath, accountId }) => {
-      const { session } = require("electron");
-      return electronFetchToFile({ url, filePath, session: session.fromPartition(`${PARTITION_PREFIX}${accountId}`) });
-    },
+    sessionFor: (accountId) => session.fromPartition(`${PARTITION_PREFIX}${accountId}`),
+    groupsForAccount: (accountId) => hdService.groupsForAccount(accountId),
+    scanAccount: (accountId) => hdService.scanAccount(accountId),
+    probe,
+    parser,
+    onProgress: (payload) => pushDownloadProgress(payload),
   });
+
+  /** 下载进度实时推送（界面用它显示速度/剩余时间；写库另有节流） */
+  function pushDownloadProgress(payload) {
+    for (const win of require("electron").BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
+      try {
+        win.webContents.send("workbench:download-progress", payload);
+      } catch {}
+    }
+  }
+
+  /** 项目设置里的「生成成功后自动下载」开关（默认关，不强制自动） */
+  async function autoDownloadEnabled(projectId) {
+    try {
+      const project = await store.readProject(projectId);
+      return project?.settings?.autoDownload === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 统一的下载入口：解析来源 → 下载（同源优先，可回退） → 校验 → 落盘 */
+  async function startDownload({ projectId, attemptId, sourceId = "", resume = false, auto = false }) {
+    const tasks = await taskStore.list(projectId);
+    const record = tasks.find((t) => t.id === attemptId);
+    if (!record) throw new Error("任务记录不存在");
+    if (record.status !== "succeeded" || !record.result?.videoUrl) {
+      throw new Error("只有生成成功且有结果地址的任务才能下载");
+    }
+    const project = await store.readProject(projectId);
+    const boards = (project?.storyboards || []).map((s) => s.id);
+    const storyboardIndex = Math.max(1, boards.indexOf(record.storyboardId) + 1);
+    const account = readAccounts(userDataDir).find((a) => a.id === record.accountId);
+    return downloader.download({
+      projectId,
+      attemptId,
+      projectName: project?.name || "项目",
+      storyboardIndex,
+      accountName: account?.name || "",
+      sourceId,
+      resume,
+      // 自动下载时只认默认来源（同源优先），失败按同一套回退规则处理
+      allowFallback: true,
+      auto,
+    });
+  }
 
   async function accountView() {
     const accounts = readAccounts(userDataDir);
@@ -312,13 +325,55 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
       "workbench:task-cancel": (_e, projectId, attemptId) => runner.cancel(projectId, attemptId),
       "workbench:task-auto-retry-stop": (_e, projectId, attemptId) => runner.stopAutoRetry(projectId, attemptId),
       "workbench:task-retry": (_e, projectId, attemptId) => runner.retry(projectId, attemptId),
-      "workbench:task-download": async (_e, projectId, attemptId) => {
-        const raw = await store.readProject(projectId);
-        const project = raw ? { name: raw.name, storyboards: raw.storyboards || [] } : { name: "", storyboards: [] };
+      "workbench:task-download": async (_e, projectId, attemptId, options = {}) => {
+        return startDownload({
+          projectId,
+          attemptId,
+          sourceId: String(options?.sourceId || ""),
+          resume: options?.resume === true,
+        });
+      },
+      /** 解析下载源（不下载）：澜川同源是否可用、不可用的原因、回退来源 */
+      "workbench:task-sources": async (_e, projectId, attemptId, options = {}) => {
+        const resolved = await downloader.resolveSources({ projectId, attemptId, refresh: options?.refresh !== false });
+        const resumable = await downloader.resumable(projectId, attemptId);
+        return { ...resolved, ...resumable, running: downloader.running.has(attemptId) };
+      },
+      /** 暂停下载（保留分片，可续传） */
+      "workbench:task-download-pause": async (_e, projectId, attemptId) => downloader.pause(projectId, attemptId),
+      /** 取消下载（删除分片） */
+      "workbench:task-download-cancel": async (_e, projectId, attemptId) => downloader.cancel(projectId, attemptId),
+      /** 打开文件所在目录 */
+      "workbench:task-reveal": async (_e, projectId, attemptId) => {
         const tasks = await taskStore.list(projectId);
         const record = tasks.find((t) => t.id === attemptId);
-        const index = Math.max(1, project.storyboards.findIndex((s) => s.id === record?.storyboardId) + 1);
-        return downloader.download({ projectId, attemptId, projectName: project.name, storyboardIndex: index });
+        const filePath = record?.download?.filePath || record?.result?.filePath || "";
+        if (!filePath) throw new Error("该任务还没有已下载的文件");
+        if (!fs.existsSync(filePath)) throw new Error(`文件已不在原位置：${filePath}`);
+        require("electron").shell.showItemInFolder(filePath);
+        return { ok: true, filePath };
+      },
+      /** 用系统播放器打开本地文件（本地预览） */
+      "workbench:task-open-file": async (_e, projectId, attemptId) => {
+        const tasks = await taskStore.list(projectId);
+        const record = tasks.find((t) => t.id === attemptId);
+        const filePath = record?.download?.filePath || record?.result?.filePath || "";
+        if (!filePath) throw new Error("该任务还没有已下载的文件");
+        if (!fs.existsSync(filePath)) throw new Error(`文件已不在原位置：${filePath}`);
+        const error = await require("electron").shell.openPath(filePath);
+        if (error) throw new Error(`无法打开文件：${error}`);
+        return { ok: true, filePath };
+      },
+      /** 项目设置：生成成功后是否自动下载（默认关） */
+      "workbench:auto-download": async (_e, projectId, enabled) => {
+        const raw = await store.readProject(projectId);
+        if (!raw) throw new Error("项目不存在");
+        const saved = await store.saveProject({
+          ...raw,
+          settings: { ...(raw.settings || {}), autoDownload: enabled === true },
+        });
+        onChanged();
+        return { ok: true, enabled: saved.settings?.autoDownload === true };
       },
       "workbench:queue-status": () => runner.status(),
       /** 交给队列按并发上限调度（多账号并行生成走这里，避免逐个 await 串行执行） */
@@ -350,4 +405,4 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
   };
 }
 
-module.exports = { ACCOUNTS_FILE, createTaskService, electronFetchToFile, readAccounts };
+module.exports = { ACCOUNTS_FILE, createTaskService, readAccounts };

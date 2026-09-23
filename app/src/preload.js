@@ -166,7 +166,16 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     stopAutoRetry: (projectId, attemptId) =>
       ipcRenderer.invoke("workbench:task-auto-retry-stop", projectId, attemptId),
     retry: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-retry", projectId, attemptId),
-    download: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-download", projectId, attemptId),
+    download: (projectId, attemptId, options) =>
+      ipcRenderer.invoke("workbench:task-download", projectId, attemptId, options || {}),
+    // 下载源解析（不下载）：澜川同源是否可用、不可用的原因、可回退来源
+    sources: (projectId, attemptId, options) =>
+      ipcRenderer.invoke("workbench:task-sources", projectId, attemptId, options || {}),
+    pauseDownload: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-download-pause", projectId, attemptId),
+    cancelDownload: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-download-cancel", projectId, attemptId),
+    reveal: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-reveal", projectId, attemptId),
+    openFile: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-open-file", projectId, attemptId),
+    autoDownload: (projectId, enabled) => ipcRenderer.invoke("workbench:auto-download", projectId, enabled),
   },
   queue: {
     status: () => ipcRenderer.invoke("workbench:queue-status"),
@@ -175,6 +184,9 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     resume: () => ipcRenderer.invoke("workbench:queue-resume"),
   },
   onChanged: (callback) => ipcRenderer.on("workbench:changed", () => callback()),
+  // 下载实时进度（速度/剩余时间/阶段）：高频通道，不触发整页刷新
+  onDownloadProgress: (callback) =>
+    ipcRenderer.on("workbench:download-progress", (_event, payload) => callback(payload)),
 });
 
 // 拖拽导入需要把 File 对象换成真实路径；webUtils.getPathForFile 是 Electron 官方推荐做法

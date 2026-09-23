@@ -226,3 +226,148 @@
   .workbench-body { grid-template-columns: 260px 1fr 300px; }
   .workbench-paste-body { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
 }
+
+/* ══════════════════════════════════════════════════════════
+   统一设计语言（本轮 UI 优化）
+   目标：深灰底、明确层级、统一圆角/边框/字号/间距，去掉多层卡片与冗余边框。
+   只作用于工作台区域（.workbench-modal），不改变应用其它页面的既有样式。
+   ══════════════════════════════════════════════════════════ */
+.workbench-modal {
+  --wb-bg: #0d1219;
+  --wb-surface: #121924;
+  --wb-surface-2: #161f2c;
+  --wb-surface-3: #1b2634;
+  --wb-line: rgba(255, 255, 255, .07);
+  --wb-line-strong: rgba(255, 255, 255, .13);
+  --wb-text: #e8eef8;
+  --wb-text-2: #b6c1d2;
+  --wb-muted: #7f8b9d;
+  --wb-accent: #ff6a3d;
+  --wb-ok: #4fd1a5;
+  --wb-warn: #ffc46b;
+  --wb-bad: #ff7d8c;
+  --wb-info: #67b7ff;
+  --wb-radius: 10px;
+  --wb-radius-sm: 7px;
+  --wb-gap: 10px;
+  background: var(--wb-bg);
+  color: var(--wb-text);
+}
+.workbench-modal .workbench-body { background: var(--wb-bg); color: var(--wb-text); }
+
+/* ── 三栏 + 可拖拽分隔条（默认 264 / 1fr / 336，宽度本地保存） ── */
+.workbench-body {
+  grid-template-columns:
+    var(--wb-assets-w, 264px) 6px minmax(0, 1fr) 6px var(--wb-tasks-w, 336px);
+}
+.workbench-body.is-assets-collapsed { grid-template-columns: 44px 0px minmax(0, 1fr) 6px var(--wb-tasks-w, 336px); }
+.workbench-body.is-tasks-collapsed { grid-template-columns: var(--wb-assets-w, 264px) 6px minmax(0, 1fr) 0px 44px; }
+.workbench-body.is-assets-collapsed.is-tasks-collapsed { grid-template-columns: 44px 0px minmax(0, 1fr) 0px 44px; }
+.workbench-splitter { position: relative; cursor: col-resize; background: transparent; }
+.workbench-splitter::after {
+  content: ""; position: absolute; inset: 0 2px; border-radius: 2px; background: var(--wb-line);
+  transition: background .15s ease;
+}
+.workbench-splitter:hover::after, .workbench-splitter.is-dragging::after { background: rgba(255, 106, 61, .55); }
+.workbench-body.is-assets-collapsed #workbenchSplitAssets,
+.workbench-body.is-tasks-collapsed #workbenchSplitTasks { display: none; }
+body.workbench-dragging { cursor: col-resize; user-select: none; }
+body.workbench-dragging iframe, body.workbench-dragging webview { pointer-events: none; }
+
+/* ── 面板统一：深灰底、单层边框、统一内边距 ── */
+.workbench-assets, .workbench-tasks { background: var(--wb-surface); border-color: var(--wb-line); }
+.workbench-assets.is-collapsed, .workbench-tasks.is-collapsed { width: auto; }
+.workbench-tasks.is-collapsed .workbench-task-controls,
+.workbench-tasks.is-collapsed .workbench-account-note,
+.workbench-tasks.is-collapsed .workbench-task-list { display: none; }
+.workbench-tasks.is-collapsed .workbench-section-head { justify-content: center; gap: 6px; padding: 11px 6px; }
+.workbench-tasks.is-collapsed .workbench-section-head strong,
+.workbench-tasks.is-collapsed .count-badge { display: none; }
+.workbench-tasks.is-collapsed .workbench-pane-toggle { writing-mode: vertical-rl; }
+.workbench-section-head { border-bottom: 1px solid var(--wb-line); color: var(--wb-text-2); }
+.workbench-create { background: var(--wb-surface-2); border-bottom: 1px solid var(--wb-line); gap: var(--wb-gap); }
+.workbench-task-controls { border-bottom: 1px solid var(--wb-line); background: var(--wb-surface-2); }
+
+/* ── 主创作区：编辑框主导、行高舒适 ── */
+.workbench-main-prompt { min-height: 220px; line-height: 1.75; font-size: 13px; border-radius: var(--wb-radius); border: 1px solid var(--wb-line-strong); background: #0b1017; }
+.workbench-prompt-label span { color: var(--wb-text); font-size: 12px; }
+.workbench-prompt-label em { color: var(--wb-muted); }
+.workbench-params-row { gap: var(--wb-gap); padding-bottom: 2px; }
+.workbench-run-summary { color: var(--wb-muted); }
+
+/* 引用芯片：小尺寸 + 缩略图角标 + 一键删除，不挤占行高 */
+.workbench-ref-chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 6px 0 4px; border: 1px solid var(--wb-line-strong); border-radius: 999px; background: var(--wb-surface-3); font-size: 10px; }
+.workbench-ref-chip em { color: var(--wb-accent); font-style: normal; font-weight: 600; }
+.workbench-ref-chip img { width: 18px; height: 18px; border-radius: 5px; object-fit: cover; }
+.workbench-ref-chip .workbench-ref-remove { width: 16px; height: 16px; border: 0; border-radius: 50%; background: rgba(255, 255, 255, .08); color: var(--wb-text-2); cursor: pointer; line-height: 1; }
+.workbench-ref-chip .workbench-ref-remove:hover { background: rgba(255, 125, 140, .25); color: #fff; }
+.workbench-refs-meta { display: flex; align-items: center; gap: 10px; color: var(--wb-muted); font-size: 10px; }
+
+/* 主按钮区：动作文案 + 账号数 + 明确状态 */
+.workbench-main-actionbar { gap: 10px; }
+.workbench-auto-download { display: inline-flex; align-items: center; gap: 6px; color: var(--wb-muted); font-size: 10px; cursor: pointer; white-space: nowrap; }
+.workbench-auto-download input { accent-color: var(--wb-accent); }
+.workbench-generate-btn { min-width: 176px; height: 46px; border-radius: var(--wb-radius); }
+.workbench-generate-btn:disabled { background: var(--wb-surface-3); color: var(--wb-muted); }
+.workbench-precheck-btn { height: 46px; border-radius: var(--wb-radius); border-color: var(--wb-line-strong); color: var(--wb-text-2); }
+
+/* ── 账号列表：行更高、勾选区域更大 ── */
+.workbench-account-pick { padding: 8px 10px; border-radius: var(--wb-radius-sm); }
+.workbench-account-pick:hover { background: var(--wb-surface-3); }
+.workbench-account-pick input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--wb-accent); }
+.workbench-account-name { color: var(--wb-text); font-size: 12px; }
+.workbench-account-note { color: var(--wb-muted); }
+
+/* ── 任务卡：精简摘要 + 生成/下载双状态色 + 可展开详情 ── */
+.workbench-task { border: 1px solid var(--wb-line); border-radius: var(--wb-radius); background: var(--wb-surface-2); }
+.workbench-task-active { border-color: rgba(255, 106, 61, .38); }
+.workbench-task-meta { color: var(--wb-muted); }
+.workbench-status { border-radius: 999px; font-size: 9px; }
+.workbench-status-succeeded { color: var(--wb-ok); border-color: rgba(79, 209, 165, .35); }
+.workbench-status-failed, .workbench-status-manual { color: var(--wb-bad); border-color: rgba(255, 125, 140, .35); }
+.workbench-status-queued, .workbench-status-generating { color: var(--wb-info); border-color: rgba(103, 183, 255, .35); }
+
+/* 下载区块（澜川同源独立来源、进度条、速度与剩余时间） */
+.workbench-download { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--wb-line); }
+.workbench-download-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.workbench-download-chip { padding: 2px 8px; border: 1px solid var(--wb-line-strong); border-radius: 999px; color: var(--wb-text-2); font-size: 9px; }
+.workbench-download-chip-downloading { color: var(--wb-info); border-color: rgba(103, 183, 255, .4); }
+.workbench-download-chip-done { color: var(--wb-ok); border-color: rgba(79, 209, 165, .4); }
+.workbench-download-chip-failed { color: var(--wb-bad); border-color: rgba(255, 125, 140, .4); }
+.workbench-download-chip-paused { color: var(--wb-warn); border-color: rgba(255, 196, 107, .4); }
+.workbench-source { padding: 2px 8px; border-radius: 999px; font-size: 9px; border: 1px solid var(--wb-line-strong); }
+.workbench-source-lanchuan { color: #ffd9a8; border-color: rgba(255, 196, 107, .45); background: rgba(255, 196, 107, .08); }
+.workbench-source-playback { color: var(--wb-text-2); }
+.workbench-progress { position: relative; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, .08); overflow: hidden; }
+.workbench-progress > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #ff8a4d, #ff5f34); transition: width .25s ease; }
+.workbench-progress > span.is-unknown { background: linear-gradient(90deg, rgba(255, 138, 77, .4), rgba(255, 95, 52, .25)); }
+.workbench-download-facts { color: var(--wb-muted); font-size: 10px; }
+.workbench-download-note { color: var(--wb-text-2); font-size: 10px; }
+.workbench-download-error { padding: 6px 8px; border: 1px solid rgba(255, 125, 140, .28); border-radius: var(--wb-radius-sm); background: rgba(255, 125, 140, .07); color: #ffb3bc; font-size: 10px; line-height: 1.6; }
+.workbench-source-list { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.workbench-source-item { font-size: 9px; color: var(--wb-muted); }
+.workbench-source-item.is-ok { color: var(--wb-ok); }
+.workbench-source-item.is-off { color: var(--wb-warn); }
+.workbench-task-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.workbench-task-path { color: var(--wb-muted); font-size: 9px; word-break: break-all; }
+
+/* 调试信息统一收纳（内部标识 / 步骤 / 日志都在这里，主视图不再有技术细节） */
+.workbench-debug { margin-top: 6px; }
+.workbench-debug > summary { color: var(--wb-muted); font-size: 10px; cursor: pointer; }
+.workbench-debug-body { display: flex; flex-direction: column; gap: 4px; padding: 6px 0 0 8px; }
+
+/* ── 素材库：统一缩略图、悬停放大、名称截断 ── */
+.workbench-asset-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; padding: 9px; }
+.workbench-asset { border: 1px solid var(--wb-line); border-radius: var(--wb-radius-sm); background: var(--wb-surface-2); padding: 5px; }
+.workbench-asset:hover { border-color: var(--wb-line-strong); background: var(--wb-surface-3); }
+.workbench-asset-thumb { width: 100%; aspect-ratio: 1 / 1; border: 0; padding: 0; border-radius: var(--wb-radius-sm); overflow: hidden; background: #0a0f16; cursor: zoom-in; }
+.workbench-asset-thumb img { width: 100%; height: 100%; object-fit: cover; transition: transform .18s ease; }
+.workbench-asset-thumb:hover img { transform: scale(1.12); }
+.workbench-asset-name { font-size: 10px; color: var(--wb-text-2); }
+
+/* ── 交互反馈：悬停/按下/禁用一致 ── */
+.workbench-modal .text-button:hover:not(:disabled) { color: var(--wb-text); }
+.workbench-modal button:disabled { opacity: .55; cursor: not-allowed; }
+@media (max-width: 1280px) {
+  .workbench-body { grid-template-columns: var(--wb-assets-w, 236px) 6px minmax(0, 1fr) 6px var(--wb-tasks-w, 300px); }
+}

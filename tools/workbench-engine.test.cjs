@@ -625,12 +625,40 @@ const refWarn = platform.validateParams({
   const staleOnes = (await taskStore.list(projectId)).filter((t) => t.poll?.stale);
   check("长时间无更新被标记监控异常", staleOnes.length > 0, staleOnes.length);
 
-  // ══ 10. 下载 ══
+  // ══ 10. 下载（澜川同源 + 平台播放版 双来源） ══
   console.log("── 下载 ──");
-  eq("文件名含项目/分镜/尝试", download.buildFileName({ projectName: "短剧A", storyboardIndex: 3, attemptNumber: 2, url: "https://x/v.mp4" }), "短剧A_分镜03_尝试02.mp4");
+  eq(
+    "文件名含项目/分镜/账号/来源标识",
+    download.buildFileName({ projectName: "短剧A", storyboardIndex: 3, attemptNumber: 2, url: "https://x/v.mp4", accountName: "Dola 004", sourceTag: "澜川同源" }),
+    "短剧A_分镜03_Dola004_澜川同源_v02.mp4"
+  );
   eq("非法字符被替换", download.sanitizeSegment('a/b:c*?"<>|'), "a_b_c" + "_".repeat(6));
   eq("webm 扩展名按 MIME", download.extensionFor("https://x/v", "video/webm"), ".webm");
   eq("未知 MIME 回退 mp4", download.extensionFor("https://x/v", "application/octet-stream"), ".mp4");
+
+  // 10.1 来源识别：同源必须能证明是「同一个视频」才可用
+  const srcApi = require(path.join(SRC, "workbench-sources.js"));
+  const { createParser } = require(path.join(SRC, "hd-candidates.js"));
+  const srcParser = createParser();
+  const playUrl = "https://v3-web.dola.com/abc/def/video.mp4?sign=AAA";
+  const groupsExact = [
+    { id: "g1", title: "视频原片", fallbackApi: "https://v9.byteintlapi.com/video/fplay/?vid=1", variants: [{ url: playUrl, width: 720, height: 1280 }] },
+  ];
+  const withSame = srcApi.buildSources({ videoUrl: playUrl, groups: groupsExact, parser: srcParser });
+  const lanchuan = withSame.sources.find((s) => s.kind === "lanchuan-original");
+  eq("同源来源被识别为可用", lanchuan.available, true);
+  eq("同源匹配方式是地址完全一致", lanchuan.matchedBy, "exact");
+  eq("默认来源优先澜川同源", srcApi.defaultSourceId(withSame.sources), "lanchuan");
+  eq("来源标签用于文件名（澜川同源）", lanchuan.tag, "澜川同源");
+  const noMatch = srcApi.buildSources({ videoUrl: "https://v3-web.dola.com/other.mp4", groups: groupsExact, parser: srcParser });
+  const lanchuanOff = noMatch.sources.find((s) => s.kind === "lanchuan-original");
+  eq("对不上就不给同源（不猜）", lanchuanOff.available, false);
+  check("并写明原因", /无法确认是同一个视频/.test(lanchuanOff.error), lanchuanOff.error);
+  eq("此时默认来源回落到平台播放版", srcApi.defaultSourceId(noMatch.sources), "playback");
+  const redacted = srcApi.redactUrl(playUrl);
+  eq("对外地址脱敏（去掉签名）", redacted, "https://v3-web.dola.com/abc/def/video.mp4");
+  check("同源链接类错误值得回退播放版", srcApi.shouldFallbackToPlayback("ORIGINAL_UNAVAILABLE") && srcApi.shouldFallbackToPlayback("HTTP_403"), true);
+  check("普通网络错误不走回退（先重试同一来源）", srcApi.shouldFallbackToPlayback("ECONNRESET") === false, true);
 
   const dlDir = path.join(root, "downloads");
   const dlStore = task.createTaskStore((id) => path.join(root, id));
@@ -643,39 +671,159 @@ const refWarn = platform.validateParams({
   });
   task.applyStatus(dlAttempt, "submitting");
   task.applyStatus(dlAttempt, "succeeded");
-  task.setResult(dlAttempt, { videoUrl: "https://example.com/v.mp4" });
+  task.setResult(dlAttempt, { videoUrl: playUrl });
   await dlStore.append("prj_dl", dlAttempt);
 
+  const progressEvents = [];
   const failingDownloader = download.createDownloader({
     taskStore: dlStore,
     outputDirFor: async () => dlDir,
-    fetchToFile: async ({ filePath }) => {
-      fs.writeFileSync(filePath, "partial");
-      return { ok: false, error: "连接被重置" };
+    sessionFor: () => ({}),
+    groupsForAccount: () => groupsExact,
+    parser: srcParser,
+    onProgress: (payload) => progressEvents.push(payload),
+    transfer: async () => {
+      throw Object.assign(new Error("连接被重置"), { code: "ECONNRESET" });
     },
+    resolveFallback: async () => "https://v3-web.dola.com/original.mp4",
   });
-  const dlResult = await failingDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1 });
+  const dlResult = await failingDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
   eq("下载失败被如实返回", dlResult.ok, false);
   const afterFail = (await dlStore.list("prj_dl"))[0];
   eq("下载失败后生成状态仍是成功", afterFail.status, "succeeded");
   eq("下载状态为失败", afterFail.download.status, "failed");
-  eq("生成结果未被清空", afterFail.result.videoUrl, "https://example.com/v.mp4");
+  eq("生成结果未被清空", afterFail.result.videoUrl, playUrl);
+  check("失败原因带错误码与建议", /ECONNRESET/.test(afterFail.download.errorCode) && Boolean(afterFail.download.hint), afterFail.download);
+  check("同源失败后按规则回退播放版", progressEvents.some((p) => p.phase === "fallback"), progressEvents.map((p) => p.phase));
 
-  fs.rmSync(dlDir, { recursive: true, force: true });
+  // 10.2 同源可用 → 解析原片并下载成功；进度/来源/校验都落库
   const okDownloader = download.createDownloader({
     taskStore: dlStore,
     outputDirFor: async () => dlDir,
-    fetchToFile: async ({ filePath }) => {
-      fs.writeFileSync(filePath, "video-bytes");
-      return { ok: true, bytes: 11, mime: "video/mp4" };
+    sessionFor: () => ({}),
+    groupsForAccount: () => groupsExact,
+    parser: srcParser,
+    probe: { inspect: async () => ({ status: "ready", width: 720, height: 1280, duration: 5 }) },
+    transfer: async ({ partPath, onProgress }) => {
+      onProgress({ received: 4, total: 11, resumed: false });
+      fs.writeFileSync(partPath, "video-bytes");
+      onProgress({ received: 11, total: 11, resumed: false });
+      return { received: 11, total: 11, resumed: false };
     },
+    resolveFallback: async () => "https://v3-web.dola.com/original.mp4?lr=unwatermarked",
   });
-  const firstDownload = await okDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1 });
+  const firstDownload = await okDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
   check("下载成功", firstDownload.ok, firstDownload);
-  check("文件名符合命名规则", /短剧A_分镜01_尝试01\.mp4$/.test(firstDownload.filePath), firstDownload.filePath);
-  const secondDownload = await okDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1 });
+  check("文件名带账号与来源标识", /短剧A_分镜01_Dola004_澜川同源_v01\.mp4$/.test(firstDownload.filePath), firstDownload.filePath);
+  const afterOk = (await dlStore.list("prj_dl"))[0];
+  eq("来源类型落库为澜川同源", afterOk.download.source, "lanchuan-original");
+  eq("记录下载字节数", afterOk.download.bytes, 11);
+  eq("记录下载耗时字段存在", typeof afterOk.download.elapsedMs, "number");
+  check("地址脱敏落库（不含签名）", !/\?/.test(afterOk.download.urlSafe || "?") || !/sign=/.test(afterOk.download.urlSafe), afterOk.download.urlSafe);
+  check("下载记录留下阶段历史", (afterOk.download.history || []).length >= 1, afterOk.download.history);
+
+  const secondDownload = await okDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
   check("重复下载不覆盖历史文件", secondDownload.filePath !== firstDownload.filePath, secondDownload.filePath);
   check("重复下载结果仍在", fs.existsSync(firstDownload.filePath) && fs.existsSync(secondDownload.filePath));
+
+  // 10.3 完整性校验失败 → 标记失败（不是生成失败）
+  const corruptDownloader = download.createDownloader({
+    taskStore: dlStore,
+    outputDirFor: async () => dlDir,
+    sessionFor: () => ({}),
+    groupsForAccount: () => groupsExact,
+    parser: srcParser,
+    probe: { inspect: async () => ({ status: "unavailable", message: "未发现可读取的视频轨道" }) },
+    transfer: async ({ partPath }) => {
+      fs.writeFileSync(partPath, "broken");
+      return { received: 6, total: 6, resumed: false };
+    },
+    resolveFallback: async () => "https://v3-web.dola.com/original.mp4",
+  });
+  const corrupt = await corruptDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
+  eq("文件损坏判为下载失败", corrupt.ok, false);
+  const afterCorrupt = (await dlStore.list("prj_dl"))[0];
+  eq("损坏错误码明确", afterCorrupt.download.errorCode, "FILE_CORRUPT");
+  eq("损坏也不改生成状态", afterCorrupt.status, "succeeded");
+
+  // 10.4 暂停 → 保留分片 → 续传成功
+  const partProbe = path.join(dlDir, ".dbm-dl-" + dlAttempt.id + ".part");
+  const pauseDownloader = download.createDownloader({
+    taskStore: dlStore,
+    outputDirFor: async () => dlDir,
+    sessionFor: () => ({}),
+    groupsForAccount: () => groupsExact,
+    parser: srcParser,
+    probe: { inspect: async () => ({ status: "ready", width: 720, height: 1280 }) },
+    transfer: async ({ partPath, signal, onProgress }) => {
+      fs.writeFileSync(partPath, "half");
+      onProgress({ received: 4, total: 11, resumed: true });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      if (signal?.aborted) throw Object.assign(new Error("aborted"), { code: "ABORT_ERR" });
+      fs.appendFileSync(partPath, "-rest");
+      return { received: 11, total: 11, resumed: true };
+    },
+    resolveFallback: async () => "https://v3-web.dola.com/original.mp4",
+  });
+  const runPromise = pauseDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const pausedResult = await pauseDownloader.pause("prj_dl", dlAttempt.id);
+  check("暂停指令被接受", pausedResult.ok, pausedResult);
+  const pausedRun = await runPromise;
+  eq("暂停按预期返回", pausedRun.paused === true, true);
+  const afterPause = (await dlStore.list("prj_dl"))[0];
+  eq("暂停状态落库", afterPause.download.status, "paused");
+  check("暂停保留分片（可续传）", fs.existsSync(partProbe), partProbe);
+  const resumableInfo = await pauseDownloader.resumable("prj_dl", dlAttempt.id);
+  check("可续传信息可读", resumableInfo.resumable === true && resumableInfo.bytes > 0, resumableInfo);
+  const resumeRun = await pauseDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004", resume: true });
+  check("续传后下载成功", resumeRun.ok, resumeRun);
+  const afterResume = (await dlStore.list("prj_dl"))[0];
+  eq("续传标记落库", afterResume.download.resumed, true);
+  check("续传不再残留分片", !fs.existsSync(partProbe), partProbe);
+
+  // 10.5 取消 → 删除分片、标记失败但不动生成状态
+  const cancelDownloader = download.createDownloader({
+    taskStore: dlStore,
+    outputDirFor: async () => dlDir,
+    sessionFor: () => ({}),
+    groupsForAccount: () => groupsExact,
+    parser: srcParser,
+    transfer: async ({ partPath, signal, onProgress }) => {
+      fs.writeFileSync(partPath, "half");
+      onProgress({ received: 4, total: 11, resumed: false });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      if (signal?.aborted) throw Object.assign(new Error("aborted"), { code: "ABORT_ERR" });
+      return { received: 11, total: 11, resumed: false };
+    },
+    resolveFallback: async () => "https://v3-web.dola.com/original.mp4",
+  });
+  const cancelPromise = cancelDownloader.download({ projectId: "prj_dl", attemptId: dlAttempt.id, projectName: "短剧A", storyboardIndex: 1, accountName: "Dola 004" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await cancelDownloader.cancel("prj_dl", dlAttempt.id);
+  const cancelRun = await cancelPromise;
+  eq("取消按预期返回", cancelRun.canceled === true, true);
+  check("取消后不留分片", !fs.existsSync(partProbe), partProbe);
+  const afterCancel = (await dlStore.list("prj_dl"))[0];
+  eq("取消后生成状态仍是成功", afterCancel.status, "succeeded");
+  eq("取消记在下载状态里", afterCancel.download.errorCode, "CANCELED");
+
+  // 10.6 来源不可用（本次结果没有地址 / 对不上）时给出可执行原因
+  const noSourceDownloader = download.createDownloader({
+    taskStore: dlStore,
+    outputDirFor: async () => dlDir,
+    sessionFor: () => ({}),
+    groupsForAccount: () => [],
+    parser: srcParser,
+    transfer: async () => {
+      throw new Error("不该被调用");
+    },
+  });
+  const noSource = await noSourceDownloader.resolveSources({ projectId: "prj_dl", attemptId: dlAttempt.id });
+  eq("没有页面分组时同源不可用", noSource.sources.find((s) => s.kind === "lanchuan-original").available, false);
+  eq("播放版仍可用（有地址就能下）", noSource.sources.find((s) => s.kind === "platform-playback").available, true);
+
+  fs.rmSync(dlDir, { recursive: true, force: true });
 
   // ══ 11. 素材删除（离线可测：remove 路径不依赖 Electron） ══
   // 这一段是为了锁住一个真实缺陷：createAssets 内部把缩略图缓存命名为 thumbs，

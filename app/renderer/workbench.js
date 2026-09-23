@@ -42,6 +42,9 @@
     mention: { storyboardId: "", prompt: "", caret: 0, search: "" },
     impact: { assetIds: [] },
     thumbCache: new Map(),
+    // 下载实时进度（attemptId → {received,total,speed,remaining,phase}）与来源解析缓存
+    downloadProgress: new Map(),
+    sourceCache: new Map(),
   };
 
   // ── 小工具 ───────────────────────────────────────────────
@@ -149,6 +152,8 @@
     renderStorage();
     renderProjects();
     renderAssets();
+    // 先把栏宽/折叠状态应用回来，再渲染内容（避免首帧按默认宽度闪一下）
+    applyLayout();
     // 账号先渲染：首次进入会默认勾选第一个账号，主按钮的可用性依赖它
     renderAccounts();
     renderParams();
@@ -688,6 +693,13 @@
         chip.title = `编辑器里写 ${ref.token || `@图${number}`}，提交时写成「参考图${number}」；素材：${
           asset?.name || ref.name || ref.assetId
         }`;
+        // 缩略图角标：一眼看出绑的是哪张图，又不占行高
+        if (asset) {
+          const thumb = document.createElement("img");
+          thumb.alt = asset.name || "";
+          paintThumb(thumb, asset.id);
+          chip.appendChild(thumb);
+        }
         const num = document.createElement("em");
         num.textContent = `参考图${number}`;
         chip.appendChild(num);
@@ -704,6 +716,11 @@
         chip.appendChild(remove);
         refsHost.appendChild(chip);
       });
+      // 已绑定数量与草稿保存状态：放在引用行末尾，不另占空间
+      const meta = document.createElement("span");
+      meta.className = "workbench-refs-meta";
+      meta.textContent = `已绑定 ${refs.length} 张${state.lastSaved ? ` · 草稿已保存 ${state.lastSaved}` : " · 草稿自动保存已开启"}`;
+      refsHost.appendChild(meta);
     if (refs.length) {
         const hint = document.createElement("span");
         hint.className = "workbench-refs-hint";
@@ -740,6 +757,11 @@
       precheck.disabled = Boolean(busy) || !storyboard || !accountCount;
       precheck.textContent =
         busy === "prechecking" ? "校验中…" : `提交前校验（不发送）${accountCount > 1 ? `（${accountCount}）` : ""}`;
+    }
+    const auto = $("workbenchAutoDownload");
+    if (auto) {
+      const on = state.project?.settings?.autoDownload === true;
+      if (auto.checked !== on && document.activeElement !== auto) auto.checked = on;
     }
     if (reasons.length && !busy) {
       setMainStatus(`暂不可提交：${reasons.join("；")}`, "warn");
@@ -919,10 +941,10 @@
       span.textContent = piece;
       meta.appendChild(span);
     }
-    // UUID / 内部标识默认折叠，避免挤占任务卡片的主要信息
+    // UUID / 内部标识默认折叠（调试信息统一收纳，主视图只留业务信息）
     const detailBits = document.createElement("details");
-    detailBits.className = "workbench-task-ids";
-    detailBits.innerHTML = `<summary>内部标识</summary><div>账号 ${record.accountId}</div><div>尝试 ${record.id}${
+    detailBits.className = "workbench-task-ids workbench-debug";
+    detailBits.innerHTML = `<summary>调试信息 · 内部标识</summary><div>账号 ${record.accountId}</div><div>尝试 ${record.id}${
       record.params?.model ? ` · 模型标识 ${record.params.model}` : ""
     }</div>`;
     meta.appendChild(detailBits);
@@ -990,15 +1012,15 @@
     }
     if (driver && (steps.length || driver.outcome === "running")) {
       const box = document.createElement("details");
-      box.className = "workbench-task-steps";
+      box.className = "workbench-task-steps workbench-debug";
       // 进行中默认展开，用户能实时看到走到哪一步
       if (driver.outcome === "running") box.open = true;
       const summary = document.createElement("summary");
       const badCount = steps.filter((s) => s.ok === false).length;
       summary.textContent =
         driver.outcome === "running"
-          ? `提交进行中（已完成 ${steps.length} 步）`
-          : `提交步骤（${steps.length} 步${badCount ? `，${badCount} 步未成功` : "，全部成功"}）`;
+          ? `调试信息 · 提交步骤（已完成 ${steps.length} 步）`
+          : `调试信息 · 提交步骤（${steps.length} 步${badCount ? `，${badCount} 步未成功` : "，全部成功"}）`;
       box.appendChild(summary);
       for (const step of steps) {
         const row = document.createElement("div");
@@ -1019,9 +1041,9 @@
 
     // 状态变化日志：只展示本工作台记录的阶段与脱敏摘要，不含 Cookie / Token
     const log = document.createElement("details");
-    log.className = "workbench-task-log";
+    log.className = "workbench-task-log workbench-debug";
     const summary = document.createElement("summary");
-    summary.textContent = `状态变化（${record.history.length} 条，仅阶段与摘要）`;
+    summary.textContent = `调试信息 · 状态变化（${record.history.length} 条，仅阶段与摘要）`;
     log.appendChild(summary);
     for (const item of record.history) {
       const row = document.createElement("div");
@@ -1032,33 +1054,168 @@
 
     const foot = document.createElement("div");
     foot.className = "workbench-task-foot";
-    const dl = document.createElement("span");
-    dl.className = "workbench-download-state";
-    dl.textContent = `下载：${downloadLabel(record.download?.status)}${
-      record.download?.message ? `（${record.download.message}）` : ""
-    }`;
-    foot.appendChild(dl);
-    if (record.result?.filePath) {
-      const pathText = document.createElement("span");
-      pathText.className = "workbench-task-path";
-      pathText.textContent = record.result.filePath;
-      foot.appendChild(pathText);
-    }
+    foot.appendChild(downloadBlock(record));
 
     const buttons = [];
     if (isActiveStatus(record.status)) buttons.push(["cancel", "取消"]);
-    if (["failed", "manual", "unconfirmed"].includes(record.status)) buttons.push(["retry", "重试"]);
-    if (record.status === "succeeded") buttons.push(["download", "下载"]);
+    if (["failed", "manual", "unconfirmed"].includes(record.status)) buttons.push(["retry", "重新生成"]);
+    if (record.status === "succeeded") {
+      const dlStatus = record.download?.status || "idle";
+      if (dlStatus === "downloading") {
+        buttons.push(["download-pause", "暂停下载"]);
+        buttons.push(["download-cancel", "取消下载"]);
+      } else {
+        buttons.push(["download", dlStatus === "done" ? "重新下载（换来源）" : dlStatus === "paused" ? "继续下载" : dlStatus === "failed" ? "重试下载" : "下载"]);
+      }
+      buttons.push(["sources", "查看下载来源"]);
+      if (record.download?.resumed) buttons.push(["", "已续传"]);
+    }
+    if (record.download?.filePath) {
+      buttons.push(["reveal", "打开所在目录"]);
+      buttons.push(["open-file", "本地播放"]);
+    }
     for (const [act, label] of buttons) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "text-button";
+      if (!act) {
+        button.disabled = true;
+        button.textContent = label;
+        foot.appendChild(button);
+        continue;
+      }
       button.dataset.act = act;
       button.textContent = label;
       foot.appendChild(button);
     }
     card.appendChild(foot);
     return card;
+  }
+
+  const fmtBytes = (value) => {
+    const bytes = Number(value) || 0;
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let index = 0;
+    let size = bytes;
+    while (size >= 1024 && index < units.length - 1) {
+      size /= 1024;
+      index += 1;
+    }
+    return `${size >= 100 || index === 0 ? Math.round(size) : size.toFixed(1)} ${units[index]}`;
+  };
+  const fmtDuration = (seconds) => {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (!total) return "";
+    if (total < 60) return `${total} 秒`;
+    const minutes = Math.floor(total / 60);
+    const rest = total % 60;
+    return `${minutes} 分 ${String(rest).padStart(2, "0")} 秒`;
+  };
+
+  /**
+   * 下载区块：生成状态与下载状态分开显示。
+   * 澜川同源是独立来源，进度条与阶段都单独标出；失败给原因与建议，不笼统报错。
+   */
+  function downloadBlock(record) {
+    const wrap = document.createElement("div");
+    wrap.className = "workbench-download";
+    const dl = record.download || { status: "idle" };
+    wrap.classList.add(`workbench-download-${dl.status}`);
+
+    const head = document.createElement("div");
+    head.className = "workbench-download-head";
+    const chip = document.createElement("span");
+    chip.className = `workbench-download-chip workbench-download-chip-${dl.status}`;
+    chip.textContent = `下载：${downloadLabel(dl.status)}`;
+    head.appendChild(chip);
+    if (dl.sourceLabel || dl.source) {
+      const source = document.createElement("span");
+      source.className = `workbench-source workbench-source-${dl.source === "lanchuan-original" ? "lanchuan" : "playback"}`;
+      source.textContent = `来源：${dl.sourceLabel || dl.source}`;
+      source.title = dl.urlSafe ? `脱敏地址：${dl.urlSafe}` : "";
+      head.appendChild(source);
+    }
+    // 已解析过的来源清单：澜川同源是否可用、不可用原因、可回退来源
+    const cached = state.sourceCache.get(record.id);
+    if (cached?.sources?.length) {
+      const list = document.createElement("div");
+      list.className = "workbench-source-list";
+      for (const item of cached.sources) {
+        const row = document.createElement("span");
+        row.className = `workbench-source-item ${item.available ? "is-ok" : "is-off"}`;
+        row.textContent = `${item.tag}：${item.available ? "可用" : item.error}${item.matchedBy && item.matchedBy !== "none" ? `（${item.matchedBy === "exact" ? "地址完全一致" : "同路径命中"}）` : ""}`;
+        list.appendChild(row);
+      }
+      head.appendChild(list);
+    }
+    if (dl.status === "downloading") {
+      const live = state.downloadProgress.get(record.id) || {};
+      const received = Number(live.received ?? dl.bytes) || 0;
+      const total = Number(live.total ?? dl.expectedBytes) || 0;
+      const percent = total ? Math.min(100, Math.round((received / total) * 100)) : 0;
+      const meter = document.createElement("div");
+      meter.className = "workbench-progress";
+      const fill = document.createElement("span");
+      fill.style.width = `${total ? percent : 6}%`;
+      if (!total) fill.classList.add("is-unknown");
+      meter.appendChild(fill);
+      wrap.appendChild(head);
+      wrap.appendChild(meter);
+      const facts = document.createElement("div");
+      facts.className = "workbench-download-facts";
+      facts.textContent = [
+        total ? `${fmtBytes(received)} / ${fmtBytes(total)}（${percent}%）` : `${fmtBytes(received)}（总大小未知）`,
+        live.speed ? `${fmtBytes(live.speed)}/s` : "",
+        live.remaining ? `剩余约 ${fmtDuration(live.remaining)}` : "",
+        live.resumed || dl.resumed ? "断点续传中" : "",
+        live.phase === "resolve" ? "正在解析澜川同源原片地址" : live.phase === "verify" ? "正在校验文件完整性" : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      wrap.appendChild(facts);
+      if (dl.message) {
+        const note = document.createElement("div");
+        note.className = "workbench-download-note";
+        note.textContent = dl.message;
+        wrap.appendChild(note);
+      }
+      return wrap;
+    }
+
+    wrap.appendChild(head);
+    const facts = document.createElement("div");
+    facts.className = "workbench-download-facts";
+    const parts = [];
+    if (dl.bytes) parts.push(fmtBytes(dl.bytes));
+    if (dl.expectedBytes && dl.expectedBytes !== dl.bytes) parts.push(`共 ${fmtBytes(dl.expectedBytes)}`);
+    if (dl.elapsedMs) parts.push(`耗时 ${fmtDuration(dl.elapsedMs / 1000)}`);
+    if (dl.resumed) parts.push("已用断点续传");
+    if (dl.attempts > 1) parts.push(`第 ${dl.attempts} 次`);
+    if (parts.length) facts.textContent = parts.join(" · ");
+    if (facts.textContent) wrap.appendChild(facts);
+
+    if (dl.status === "failed" && (dl.message || dl.hint)) {
+      const error = document.createElement("div");
+      error.className = "workbench-download-error";
+      error.textContent = `下载失败：${dl.message || ""}${dl.hint && dl.hint !== dl.message ? `；建议：${dl.hint}` : ""}${
+        dl.errorCode ? `（${dl.errorCode}）` : ""
+      }`;
+      wrap.appendChild(error);
+    } else if (dl.message) {
+      const note = document.createElement("div");
+      note.className = "workbench-download-note";
+      note.textContent = dl.message;
+      wrap.appendChild(note);
+    }
+    if (dl.filePath) {
+      const pathText = document.createElement("div");
+      pathText.className = "workbench-task-path";
+      pathText.textContent = dl.filePath;
+      pathText.title = dl.filePath;
+      wrap.appendChild(pathText);
+    }
+    return wrap;
   }
 
   function accountName(accountId) {
@@ -1471,6 +1628,17 @@
 
     $("workbenchGenerate")?.addEventListener("click", generateCurrent);
     $("workbenchPrecheck")?.addEventListener("click", precheckCurrent);
+    $("workbenchAutoDownload")?.addEventListener("change", async (event) => {
+      const enabled = event.target.checked === true;
+      try {
+        const result = await api.task.autoDownload(projectId(), enabled);
+        await refresh();
+        toast(result.enabled ? "已开启：生成成功后自动下载（澜川同源优先）" : "已关闭自动下载");
+      } catch (error) {
+        event.target.checked = !enabled;
+        toast(`设置失败：${error.message}`, "error");
+      }
+    });
 
     $("workbenchRefsRow")?.addEventListener("click", async (event) => {
       const button = event.target.closest('[data-act="compose-unbind"]');
@@ -1488,16 +1656,102 @@
 
     $("workbenchAssetsToggle")?.addEventListener("click", () => {
       state.assetsCollapsed = !state.assetsCollapsed;
-      renderAssetsCollapse();
+      applyLayout({ assetsCollapsed: state.assetsCollapsed });
     });
+    $("workbenchTasksToggle")?.addEventListener("click", () => {
+      const collapsed = !document.querySelector(".workbench-body")?.classList.contains("is-tasks-collapsed");
+      applyLayout({ tasksCollapsed: collapsed });
+    });
+    bindSplitters();
+  }
+
+  // ── 三栏布局：拖拽分隔条 + 折叠状态本地保存 ────────────────
+  const LAYOUT_KEY = "dbm.workbench.layout.v1";
+  const readLayout = () => {
+    try {
+      return JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}") || {};
+    } catch {
+      return {};
+    }
+  };
+  const writeLayout = (patch) => {
+    const next = { ...readLayout(), ...patch };
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(next));
+    } catch {}
+    return next;
+  };
+
+  /** 应用（并记住）栏宽与折叠状态；默认 264 / 336，与既有观感一致 */
+  function applyLayout(patch = {}) {
+    const body = document.querySelector(".workbench-body");
+    if (!body) return;
+    const layout = writeLayout(patch);
+    if (Number(layout.assetsWidth)) body.style.setProperty("--wb-assets-w", `${Number(layout.assetsWidth)}px`);
+    if (Number(layout.tasksWidth)) body.style.setProperty("--wb-tasks-w", `${Number(layout.tasksWidth)}px`);
+    body.classList.toggle("is-assets-collapsed", layout.assetsCollapsed === true);
+    body.classList.toggle("is-tasks-collapsed", layout.tasksCollapsed === true);
+    state.assetsCollapsed = layout.assetsCollapsed === true;
+    const assetsToggle = $("workbenchAssetsToggle");
+    if (assetsToggle) assetsToggle.textContent = state.assetsCollapsed ? "▶ 素材库" : "◀ 素材库";
+    const tasksToggle = $("workbenchTasksToggle");
+    if (tasksToggle) tasksToggle.textContent = layout.tasksCollapsed === true ? "◀ 账号与任务" : "收起 ▶";
+  }
+
+  function bindSplitters() {
+    const body = document.querySelector(".workbench-body");
+    if (!body) return;
+    for (const [id, side, min, max] of [
+      ["workbenchSplitAssets", "left", 180, 460],
+      ["workbenchSplitTasks", "right", 260, 560],
+    ]) {
+      const bar = $(id);
+      if (!bar || bar.dataset.bound === "1") continue;
+      bar.dataset.bound = "1";
+      let dragging = false;
+      const move = (event) => {
+        if (!dragging) return;
+        const rect = body.getBoundingClientRect();
+        const raw = side === "left" ? event.clientX - rect.left : rect.right - event.clientX;
+        const width = Math.max(min, Math.min(max, Math.round(raw)));
+        if (side === "left") body.style.setProperty("--wb-assets-w", `${width}px`);
+        else body.style.setProperty("--wb-tasks-w", `${width}px`);
+      };
+      const up = () => {
+        if (!dragging) return;
+        dragging = false;
+        bar.classList.remove("is-dragging");
+        document.body.classList.remove("workbench-dragging");
+        const computed = getComputedStyle(body).gridTemplateColumns.split(" ").map((v) => parseFloat(v) || 0);
+        // 以实际渲染宽度落盘（第 1 列=素材，第 5 列=任务）
+        applyLayout(
+          side === "left" ? { assetsWidth: Math.round(computed[0] || 264) } : { tasksWidth: Math.round(computed[4] || 336) }
+        );
+      };
+      bar.addEventListener("pointerdown", (event) => {
+        dragging = true;
+        bar.classList.add("is-dragging");
+        document.body.classList.add("workbench-dragging");
+        bar.setPointerCapture?.(event.pointerId);
+      });
+      bar.addEventListener("pointermove", move);
+      bar.addEventListener("pointerup", up);
+      bar.addEventListener("pointercancel", up);
+      bar.addEventListener("dblclick", () => applyLayout(side === "left" ? { assetsWidth: 264 } : { tasksWidth: 336 }));
+      bar.addEventListener("keydown", (event) => {
+        // 键盘可达性：左右方向键微调 16px
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        const layout = readLayout();
+        const current = Number(side === "left" ? layout.assetsWidth : layout.tasksWidth) || (side === "left" ? 264 : 336);
+        const delta = (event.key === "ArrowRight" ? 16 : -16) * (side === "left" ? 1 : -1);
+        event.preventDefault();
+        applyLayout(side === "left" ? { assetsWidth: Math.max(min, Math.min(max, current + delta)) } : { tasksWidth: Math.max(min, Math.min(max, current + delta)) });
+      });
+    }
   }
 
   function renderAssetsCollapse() {
-    const pane = $("workbenchAssetPane");
-    const toggle = $("workbenchAssetsToggle");
-    if (!pane || !toggle) return;
-    pane.classList.toggle("is-collapsed", state.assetsCollapsed);
-    toggle.textContent = state.assetsCollapsed ? "▶ 素材库" : "◀ 素材库";
+    applyLayout({ assetsCollapsed: state.assetsCollapsed === true });
   }
 
   // ── 分镜 ─────────────────────────────────────────────────
@@ -2212,8 +2466,33 @@
           await api.task.retry(projectId(), attemptId);
           toast("已创建新的尝试记录，历史保留");
         } else if (button.dataset.act === "download") {
-          const result = await api.task.download(projectId(), attemptId);
-          toast(result.ok ? `已下载：${result.filePath}` : `下载失败：${result.error}`, result.ok ? "info" : "error");
+          const record = (state.tasks || []).find((t) => t.id === attemptId);
+          const dlStatus = record?.download?.status || "idle";
+          const resumable = dlStatus === "paused" || dlStatus === "failed";
+          const result = await api.task.download(projectId(), attemptId, { resume: resumable });
+          if (result?.paused) toast("下载已暂停（分片已保留，可继续）");
+          else if (result?.canceled) toast("已取消下载");
+          else toast(result.ok ? `已下载：${result.filePath}` : `下载失败：${result.error}`, result.ok ? "info" : "error");
+        } else if (button.dataset.act === "download-pause") {
+          const result = await api.task.pauseDownload(projectId(), attemptId);
+          toast(result?.ok ? "已暂停下载（分片保留，可续传）" : `未暂停：${result?.reason || "未知原因"}`, result?.ok ? "info" : "error");
+        } else if (button.dataset.act === "download-cancel") {
+          const result = await api.task.cancelDownload(projectId(), attemptId);
+          toast(result?.ok ? "已取消下载" : `未取消：${result?.reason || "未知原因"}`, result?.ok ? "info" : "error");
+        } else if (button.dataset.act === "sources") {
+          const info = await api.task.sources(projectId(), attemptId, { refresh: true });
+          state.sourceCache.set(attemptId, info);
+          renderTasks();
+          const lines = (info.sources || []).map(
+            (s) => `${s.tag}：${s.available ? "可用" : `不可用（${s.error}）`}${s.urlSafe ? ` · ${s.urlSafe}` : ""}`
+          );
+          toast(`${info.note || ""}${lines.length ? `｜${lines.join("；")}` : ""}`, info.sources?.some((s) => s.available) ? "info" : "error");
+        } else if (button.dataset.act === "reveal") {
+          const result = await api.task.reveal(projectId(), attemptId);
+          toast(`已在文件管理器中定位：${result.filePath}`);
+        } else if (button.dataset.act === "open-file") {
+          const result = await api.task.openFile(projectId(), attemptId);
+          toast(`已用系统播放器打开：${result.filePath}`);
         }
         await refresh();
       } catch (error) {
@@ -2330,6 +2609,24 @@
   api.onChanged(() => {
     if (!$("workbenchModal") || $("workbenchModal").classList.contains("hidden")) return;
     refresh({ silent: false });
+  });
+
+  // 下载实时进度：只更新受影响的任务卡（节流到 ~4 次/秒），不整页刷新
+  let progressFlush = 0;
+  api.onDownloadProgress((payload) => {
+    if (!payload?.attemptId) return;
+    const current = state.downloadProgress.get(payload.attemptId) || {};
+    state.downloadProgress.set(payload.attemptId, { ...current, ...payload });
+    const now = Date.now();
+    if (now - progressFlush < 250) return;
+    progressFlush = now;
+    if ($("workbenchModal")?.classList.contains("hidden")) return;
+    const card = document.querySelector(`.workbench-task[data-attempt-id="${payload.attemptId}"]`);
+    if (!card) return;
+    const record = (state.tasks || []).find((t) => t.id === payload.attemptId);
+    if (!record) return;
+    const host = card.querySelector(".workbench-download");
+    if (host) host.replaceWith(downloadBlock(record));
   });
 
   if (document.readyState === "loading") {

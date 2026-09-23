@@ -253,6 +253,10 @@
           </div>
         </aside>
 
+        <!-- 分隔条：拖动调整栏宽（双击复位，宽度本地保存） -->
+        <div class="workbench-splitter" id="workbenchSplitAssets" role="separator" aria-orientation="vertical" tabindex="0"
+          title="拖动调整素材库宽度（双击复位）"></div>
+
         <div class="workbench-main">
           <!-- 单条创作主区：一个编辑框 + 上方参数 + 下方主操作栏 -->
           <div class="workbench-create" id="workbenchCreate">
@@ -266,6 +270,10 @@
             <div class="workbench-refs-row" id="workbenchRefsRow"></div>
             <div class="workbench-main-actionbar">
               <div class="workbench-run-summary" id="workbenchRunSummary"></div>
+              <label class="workbench-auto-download" title="默认关闭；开启后生成成功的任务会自动按「澜川同源优先」开始下载（下载失败不影响生成结果）">
+                <input type="checkbox" id="workbenchAutoDownload" />
+                <span>生成成功后自动下载</span>
+              </label>
               <button type="button" class="text-button workbench-precheck-btn" id="workbenchPrecheck"
                 title="真实走一遍：进入视频模式 → 写提示词 → 设参数 → 上传参考图 → 核实引用，然后在点击发送前停下（不消耗额度）">提交前校验（不发送）</button>
               <button type="button" class="primary-action workbench-generate-btn" id="workbenchGenerate">生成视频</button>
@@ -289,10 +297,15 @@
           <span class="workbench-hint" id="workbenchHint"></span>
         </div>
 
-        <aside class="workbench-tasks">
+        <div class="workbench-splitter" id="workbenchSplitTasks" role="separator" aria-orientation="vertical" tabindex="0"
+          title="拖动调整账号与任务面板宽度（双击复位）"></div>
+
+        <aside class="workbench-tasks" id="workbenchTaskPane">
           <div class="workbench-section-head">
             <strong>账号与任务</strong>
             <span class="count-badge" id="workbenchTaskCount">0</span>
+            <button type="button" class="text-button workbench-pane-toggle" id="workbenchTasksToggle"
+              title="折叠/展开账号与任务面板">收起 ▶</button>
           </div>
           <div class="workbench-task-controls">
             <div class="workbench-field workbench-account-field">

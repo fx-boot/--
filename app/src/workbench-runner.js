@@ -600,6 +600,15 @@ function createRunner(options = {}) {
 
     if (rule) blockAccount(record.accountId, rule, polled?.message);
 
+    // 生成成功后：按设置决定是否自动开始下载（下载完全独立，失败不影响生成状态）
+    if (polled?.state === "succeeded" && typeof options.onResultReady === "function") {
+      try {
+        await options.onResultReady({ projectId, attemptId });
+      } catch (error) {
+        log("auto-download-skipped", { projectId, attemptId, reason: error?.message || String(error) });
+      }
+    }
+
     const latest = await loadRecord(projectId, attemptId);
     if (latest && !isTerminal(latest.status) && latest.status !== STATUS.MANUAL) {
       schedulePoll(projectId, attemptId, backoff);

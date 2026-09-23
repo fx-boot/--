@@ -72,6 +72,7 @@ const TERMINAL_STATUSES = Object.freeze([STATUS.SUCCEEDED, STATUS.FAILED, STATUS
 const DOWNLOAD_STATUS = Object.freeze({
   IDLE: "idle",
   RUNNING: "downloading",
+  PAUSED: "paused",
   DONE: "done",
   FAILED: "failed",
 });
@@ -79,6 +80,7 @@ const DOWNLOAD_STATUS = Object.freeze({
 const DOWNLOAD_LABEL = Object.freeze({
   idle: "未下载",
   downloading: "下载中",
+  paused: "已暂停",
   done: "已下载",
   failed: "下载失败",
 });
@@ -166,9 +168,27 @@ function normalizeAttempt(input = {}) {
       : null,
     download: {
       status: downloadStatus,
+      // 下载来源与进度：与生成状态完全独立，「下载失败不改变生成结果」
+      source: text(input.download?.source, 40),
+      sourceLabel: text(input.download?.sourceLabel, 80),
+      url: text(input.download?.url, 2000),
+      urlSafe: text(input.download?.urlSafe, 300),
       filePath: text(input.download?.filePath, 500),
       message: text(input.download?.message, 300),
+      hint: text(input.download?.hint, 300),
+      errorCode: text(input.download?.errorCode, 60),
+      bytes: Number(input.download?.bytes) || 0,
+      expectedBytes: Number(input.download?.expectedBytes) || 0,
+      elapsedMs: Number(input.download?.elapsedMs) || 0,
+      resumed: input.download?.resumed === true,
+      startedAt: text(input.download?.startedAt),
       attempts: Number(input.download?.attempts) || 0,
+      history: (Array.isArray(input.download?.history) ? input.download.history : []).slice(-20).map((h) => ({
+        status: text(h?.status, 20),
+        at: text(h?.at),
+        note: text(h?.note, 200),
+        source: text(h?.source, 40),
+      })),
       at: text(input.download?.at),
     },
     poll: {
@@ -279,14 +299,30 @@ function setResult(record, patch = {}) {
 function setDownload(record, status, patch = {}) {
   if (!Object.values(DOWNLOAD_STATUS).includes(status)) throw new Error(`未知下载状态：${status}`);
   const at = new Date().toISOString();
+  const previous = record.download || {};
   record.download = {
     status,
-    filePath: text(patch.filePath ?? record.download?.filePath, 500),
+    // 来源（澜川同源 / 平台播放版）与脱敏地址：界面据此标注，完整地址只作为请求参数保留
+    source: text(patch.source ?? previous.source, 40),
+    sourceLabel: text(patch.sourceLabel ?? previous.sourceLabel, 80),
+    url: text(patch.url ?? previous.url, 2000),
+    urlSafe: text(patch.urlSafe ?? previous.urlSafe, 300),
+    filePath: text(patch.filePath ?? previous.filePath, 500),
     message: text(patch.message ?? "", 300),
+    hint: text(patch.hint ?? "", 300),
+    errorCode: text(patch.errorCode ?? "", 60),
+    bytes: Number(patch.bytes ?? previous.bytes) || 0,
+    expectedBytes: Number(patch.expectedBytes ?? previous.expectedBytes) || 0,
+    elapsedMs: Number(patch.elapsedMs ?? previous.elapsedMs) || 0,
+    resumed: patch.resumed === true || (patch.resumed === undefined && previous.resumed === true),
+    startedAt: text(patch.startedAt ?? previous.startedAt),
     attempts:
       status === DOWNLOAD_STATUS.RUNNING
-        ? (Number(record.download?.attempts) || 0) + 1
-        : Number(record.download?.attempts) || 0,
+        ? (Number(previous.attempts) || 0) + 1
+        : Number(previous.attempts) || 0,
+    history: (Array.isArray(previous.history) ? previous.history : []).slice(-19).concat([
+      { status, at, note: text(patch.message ?? "", 200), source: text(patch.source ?? previous.source, 40) },
+    ]),
     at,
   };
   record.updatedAt = at;

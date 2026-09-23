@@ -91,3 +91,7 @@ function install(){
  app.on('before-quit',()=>{for(const job of jobs.values())job.controller.abort();});
 }
 module.exports={install,saveUnique,accountFor};
+// 工作台下载链路复用同一份观察结果（含 fallbackApi）：只读访问器，不改变既有 HD 行为。
+// 返回的是内部结构（带 fallbackApi），仅限主进程内部使用，不要直接透给渲染层。
+module.exports.groupsForAccount=accountId=>[...groups.values()].filter(g=>g.accountId===accountId);
+module.exports.scanAccount=async accountId=>{let scanned=0;for(const contents of webContents.getAllWebContents()){if(contents.isDestroyed()||contents.getType()!=='webview')continue;if(accountFor(contents)?.id===accountId){await contents.executeJavaScript('window.__DBM_HD_OBSERVER__?.scan()').catch(()=>{});scanned++;}}return {scanned};};
