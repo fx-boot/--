@@ -742,6 +742,31 @@ async function main() {
   eq("候选控件清单被带出（供首次实机校准）", summarized.candidates.length, 1);
   eq("候选控件来自发送步骤", summarized.candidates[0], "label:发送");
 
+  // 12.1b 脚本超时时必须带上主进程侧的页面事实，否则只剩一句「超时」无法判断
+  const timedOut = summarizeDriver({
+    outcome: "failed",
+    message: "写入提示词失败",
+    steps: [
+      {
+        step: "setPrompt",
+        ok: false,
+        reason: "页面脚本执行超时（15 秒无响应）",
+        url: "https://www.dola.com/",
+        loading: true,
+        webContentsId: 42,
+      },
+    ],
+  });
+  check("超时步骤带上页面地址", timedOut.steps[0].detail.includes("https://www.dola.com/"), timedOut.steps[0].detail);
+  check("超时步骤标出页面仍在加载", timedOut.steps[0].detail.includes("页面仍在加载"), timedOut.steps[0].detail);
+  check("超时步骤标出实际驱动的 webContents 编号", timedOut.steps[0].detail.includes("#42"), timedOut.steps[0].detail);
+  const crashed = summarizeDriver({
+    outcome: "failed",
+    message: "x",
+    steps: [{ step: "setPrompt", ok: false, reason: "脚本失败", crashed: true }],
+  });
+  check("渲染进程崩溃会被明确标出", crashed.steps[0].detail.includes("渲染进程已崩溃"), crashed.steps[0].detail);
+
   // 12.2 驱动步骤随任务记录一起落库，界面才有东西可展示
   const driverStore = task.createTaskStore((projectId) => path.join(root, "driverproj", projectId));
   const driverAttempt = task.createAttempt({ projectId: "prj_driver", storyboardId: "sb_1", accountId: "acct_1" });

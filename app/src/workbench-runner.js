@@ -36,16 +36,25 @@ function classifyBlock(message) {
   return null;
 }
 
-/** 每一步的可见说明：优先取失败原因 / 实际命中项，成功也给一句人话 */
+/** 每一步的可见说明：优先取失败原因 / 实际命中项，并补上主进程侧的页面事实 */
 function stepDetail(s) {
-  if (s?.reason) return String(s.reason);
-  if (s?.picked) return `已选择 ${s.picked}`;
-  if (s?.clicked) return `命中控件：${s.clicked}`;
-  if (Number(s?.count)) return `已上传 ${s.count} 张参考图`;
-  if (s?.skipped) return "已跳过";
-  if (s?.step === "setPrompt") return "已写入提示词";
-  if (s?.step === "readState") return "已读取页面状态";
-  return "";
+  const bits = [];
+  if (s?.reason) bits.push(String(s.reason));
+  else if (s?.picked) bits.push(`已选择 ${s.picked}`);
+  else if (s?.clicked) bits.push(`命中控件：${s.clicked}`);
+  else if (Number(s?.count)) bits.push(`已上传 ${s.count} 张参考图`);
+  else if (s?.skipped) bits.push("已跳过");
+  else if (s?.step === "openPage") bits.push("已找到账号页面");
+  else if (s?.step === "setPrompt") bits.push("已写入提示词");
+  else if (s?.step === "readState") bits.push("已读取页面状态");
+
+  // 页面地址 / 加载中 / 渲染进程崩溃：这些是判断「是不是撞了登录墙或页面没加载完」的依据
+  const url = String(s?.pageUrl || s?.url || "");
+  if (url && !bits.some((bit) => bit.includes(url))) bits.push(`页面：${url}`);
+  if (s?.loading) bits.push("页面仍在加载");
+  if (s?.crashed) bits.push("渲染进程已崩溃");
+  if (Number(s?.webContentsId)) bits.push(`webContents #${s.webContentsId}`);
+  return bits.join(" · ");
 }
 
 /** 步骤列表 → 可落库、可展示的形式 */

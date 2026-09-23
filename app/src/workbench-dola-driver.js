@@ -40,6 +40,9 @@ const SEND_TIMEOUT_MS = 45 * 1000;
 // 每个环节都必须有上限：页面没就绪或脚本挂起时，绝不能把整个提交无限期卡住
 const EVAL_TIMEOUT_MS = 15 * 1000;
 const IMAGE_TIMEOUT_MS = 20 * 1000;
+// 选页前先做一次极轻量的脚本探测：同一个账号分区下可能有多个 webview，
+// 必须挑出脚本通道真正可用的那个，否则后面每步都会白白超时。
+const PROBE_TIMEOUT_MS = 5 * 1000;
 const DOLA_HOST_RE = /(^|\.)dola\.com$/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,7 +58,28 @@ function hostOf(url) {
 const isDolaUrl = (url) => DOLA_HOST_RE.test(hostOf(url));
 
 /**
- * 找到账号「真实」的 webview。
+ * 页面事实：全部来自主进程 API，不依赖脚本通道，因此永远不会挂起。
+ * 用于在「脚本超时」时给出可判断的信息，而不是只留一句超时。
+ */
+function describeView(contents) {
+  const facts = { webContentsId: contents?.id };
+  const read = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return undefined;
+    }
+  };
+  facts.url = read(() => contents.getURL()) || "";
+  facts.type = read(() => contents.getType());
+  facts.loading = Boolean(read(() => contents.isLoading()));
+  facts.crashed = Boolean(read(() => contents.isCrashed()));
+  facts.rendererPid = read(() => contents.getOSProcessId());
+  return facts;
+}
+
+/**
+ * 找到账号「真实」的 webview 候选。
  * 找不到时返回可执行的原因（而不是含糊的失败），让用户知道该先做什么。
  */
 function findAccountWebview(accountId) {
@@ -78,8 +102,8 @@ function findAccountWebview(accountId) {
       reason: `账号 ${accountId} 的页面当前没有打开。请先在应用左侧选中该账号，等它的页面加载出来再提交`,
     };
   }
-  const onDola = views.find((contents) => isDolaUrl(contents.getURL()));
-  if (!onDola) {
+  const onDola = views.filter((contents) => isDolaUrl(contents.getURL()));
+  if (!onDola.length) {
     return {
       ok: false,
       reason: `账号 ${accountId} 的页面当前不在 dola 上，未擅自跳转。实际地址：${views
@@ -87,7 +111,7 @@ function findAccountWebview(accountId) {
         .join(" | ")}`,
     };
   }
-  return { ok: true, contents: onDola, url: onDola.getURL() };
+  return { ok: true, candidates: onDola, all: views.map(describeView) };
 }
 
 /** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
@@ -142,7 +166,25 @@ async function evaluate(contents, source) {
       .executeJavaScript(pageScript(`${HELPERS}\n${source}`), true)
       .catch((error) => ({ ok: false, reason: `页面脚本执行失败：${error?.message || error}` })),
     EVAL_TIMEOUT_MS,
-    { ok: false, reason: `页面脚本执行超时（${EVAL_TIMEOUT_MS / 1000} 秒无响应，页面可能未加载完成）` }
+    {
+      ok: false,
+      reason: `页面脚本执行超时（${EVAL_TIMEOUT_MS / 1000} 秒无响应）`,
+      // 超时时补上主进程侧的页面事实，否则只剩一句「超时」无法判断
+      ...describeView(contents),
+    }
+  );
+  return result;
+}
+
+/** 极轻量的脚本通道探测：用来在多个候选 webview 里挑出真正可用的那个 */
+async function probeView(contents) {
+  const result = await withTimeout(
+    contents.executeJavaScript("1+1", true).then(
+      (value) => ({ ok: value === 2 }),
+      (error) => ({ ok: false, reason: error?.message || String(error) })
+    ),
+    PROBE_TIMEOUT_MS,
+    { ok: false, reason: `脚本通道 ${PROBE_TIMEOUT_MS / 1000} 秒无响应` }
   );
   return result;
 }
@@ -279,15 +321,41 @@ function createDolaDriver(options = {}) {
       state.pages.set(accountId, contents);
       return contents;
     }
-    // 直接借用应用自己为账号挂的 webview：已登录、带应用 preload，且不需要我们自己加载页面
+    // 直接借用应用自己为账号挂的 webview：已登录、带应用 preload，且不需要我们自己加载页面。
+    // 同一分区下可能有多个候选，必须逐个探测脚本通道，挑出真正可用的那个。
     const found = findAccountWebview(accountId);
     if (!found.ok) {
       log("dola-webview-not-found", { accountId, reason: found.reason });
       throw new Error(found.reason);
     }
-    log("dola-webview-resolved", { accountId, url: found.url, webContentsId: found.contents.id });
-    state.pages.set(accountId, found.contents);
-    return found.contents;
+    const tried = [];
+    for (const candidate of found.candidates) {
+      const probe = await probeView(candidate);
+      tried.push({ ...describeView(candidate), probe });
+      if (probe.ok) {
+        // 关掉后台节流：账号不是当前标签页时，页面才不会停摆
+        try {
+          if (typeof candidate.setBackgroundThrottling === "function") {
+            candidate.setBackgroundThrottling(false);
+          }
+        } catch {}
+        log("dola-webview-resolved", { accountId, ...describeView(candidate) });
+        state.pages.set(accountId, candidate);
+        return candidate;
+      }
+    }
+    const detail = tried
+      .map(
+        (item) =>
+          `#${item.webContentsId} ${item.url || "(空白)"}${item.loading ? " [仍在加载]" : ""}${
+            item.crashed ? " [渲染进程已崩溃]" : ""
+          } 探测：${item.probe.reason || "无响应"}`
+      )
+      .join("；");
+    log("dola-webview-unusable", { accountId, tried });
+    throw new Error(
+      `账号 ${accountId} 有 ${tried.length} 个页面，但脚本通道都无响应。${detail}。请确认该账号页面已完全加载（必要时点开该账号页面再提交）`
+    );
   }
 
   async function chooseOption(contents, selector, wanted) {
@@ -410,6 +478,7 @@ function createDolaDriver(options = {}) {
       if (!plan?.valid) {
         return { outcome: "failed", message: `计划无效：${(plan?.errors || []).join("；")}`, steps };
       }
+      record("openPage", { ok: true, ...describeView(contents) });
 
       const textStep = await evaluate(
         contents,
