@@ -727,12 +727,20 @@
     button.textContent =
       busy === "checking"
         ? "正在检查…"
-        : busy === "submitting"
-          ? "正在提交…"
-          : accountCount > 1
-            ? `多账号生成（${accountCount}）`
-            : "生成视频";
+        : busy === "prechecking"
+          ? "正在校验（不发送）…"
+          : busy === "submitting"
+            ? "正在提交…"
+            : accountCount > 1
+              ? `多账号生成（${accountCount}）`
+              : "生成视频";
     button.title = reasons.length ? `不可提交：${reasons.join("；")}` : "向平台提交这一条（真实提交）";
+    const precheck = $("workbenchPrecheck");
+    if (precheck) {
+      precheck.disabled = Boolean(busy) || !storyboard || !accountCount;
+      precheck.textContent =
+        busy === "prechecking" ? "校验中…" : `提交前校验（不发送）${accountCount > 1 ? `（${accountCount}）` : ""}`;
+    }
     if (reasons.length && !busy) {
       setMainStatus(`暂不可提交：${reasons.join("；")}`, "warn");
     } else if (!busy && state.compose.statusKind === "warn") {
@@ -1342,6 +1350,75 @@
     }
   }
 
+  /**
+   * 提交前校验：真实走一遍到「发送前」为止（进入视频模式 → 写提示词 → 设参数 → 上传参考图 → 核实引用），
+   * 不点击发送、不消耗额度，也不落任务记录；多账号按并发上限同时校验，结果按账号分别展示。
+   */
+  async function precheckCurrent() {
+    if (state.compose.busy) return;
+    const storyboard = currentStoryboard();
+    if (!storyboard) return setMainStatus("还没有分镜，先新增一条", "warn");
+    const accountIds = [...new Set((state.selectedAccountIds || []).slice())];
+    if (!accountIds.length) return setMainStatus("请先在右侧勾选执行账号", "warn");
+
+    state.compose.busy = "prechecking";
+    renderCompose();
+    setMainStatus(`正在校验 ${accountIds.length} 个账号：走到发送前停下，不消耗生成额度…`);
+    const notReady = await ensureAccountPages(accountIds);
+    const usable = accountIds.filter((id) => !notReady.some((item) => item.accountId === id));
+    if (!usable.length) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(
+        `账号页面未就绪：${notReady.map((n) => `${accountName(n.accountId)}（${n.reason}）`).join("；")}`,
+        "error"
+      );
+    }
+
+    const results = [];
+    const line = () =>
+      usable
+        .map((id) => {
+          const hit = results.find((item) => item.accountId === id);
+          return `${accountName(id)}：${!hit ? "校验中…" : hit.ok ? "通过（未发送）" : "未通过"}`;
+        })
+        .join("；");
+    const limit = Math.max(1, Math.min(3, Number(state.queue?.limits?.globalConcurrency) || 3));
+    let cursor = 0;
+    const worker = async () => {
+      for (;;) {
+        const index = cursor++;
+        if (index >= usable.length) return;
+        const accountId = usable[index];
+        try {
+          const result = await api.task.precheck(projectId(), storyboard.id, accountId);
+          results.push({ accountId, ...result });
+        } catch (error) {
+          results.push({ accountId, ok: false, message: `校验失败：${error.message}` });
+        }
+        setMainStatus(line());
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, usable.length) }, worker));
+
+    state.compose.busy = "";
+    renderCompose();
+    const passed = results.filter((item) => item.ok);
+    const detail = usable
+      .map((id) => {
+        const hit = results.find((item) => item.accountId === id);
+        return `${accountName(id)}：${hit?.ok ? "通过" : `未通过（${hit?.message || "未知原因"}）`}`;
+      })
+      .join("；");
+    const blockedNote = notReady.length
+      ? `；页面未就绪：${notReady.map((n) => `${accountName(n.accountId)}（${n.reason}）`).join("；")}`
+      : "";
+    setMainStatus(
+      `提交前校验完成（未发送、未消耗额度）：${detail}${blockedNote}`,
+      passed.length === usable.length && !notReady.length ? "ok" : "error"
+    );
+  }
+
   /** 创作区的 @ 提及、粘贴与拖拽：与素材库行为保持一致 */
   function bindComposeEvents() {
     const prompt = $("workbenchMainPrompt");
@@ -1393,6 +1470,7 @@
     });
 
     $("workbenchGenerate")?.addEventListener("click", generateCurrent);
+    $("workbenchPrecheck")?.addEventListener("click", precheckCurrent);
 
     $("workbenchRefsRow")?.addEventListener("click", async (event) => {
       const button = event.target.closest('[data-act="compose-unbind"]');

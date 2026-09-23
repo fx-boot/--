@@ -750,10 +750,28 @@ const refWarn = platform.validateParams({
   eq("失败步骤被标注为失败", summarized.steps[2].ok, false);
   eq("失败步骤带上原因", summarized.steps[2].detail, "页面上找不到该控件");
   eq("选择类步骤记录实际命中项", summarized.steps[1].detail, "已选择 2.5");
-  eq("上传类步骤记录数量", summarized.steps[3].detail, "已上传 2 张参考图");
+  eq("上传类步骤记录数量", summarized.steps[3].detail, "参考图 2/2 张");
   eq("发送失败原因被带出", summarized.steps[4].detail, "页面上找不到发送按钮，无法提交生成");
   eq("候选控件清单被带出（供首次实机校准）", summarized.candidates.length, 1);
   eq("候选控件来自发送步骤", summarized.candidates[0], "label:发送");
+
+  // 12.1a 重试场景必须能看出「没有重复上传」：复用张数与残留清理都要落库可见
+  const reusedRun = summarizeDriver({
+    outcome: "submitted",
+    steps: [
+      { step: "waitComposer", ok: true },
+      { step: "attachmentsPre", ok: true, count: 3, alts: ["asset_a.png", "asset_b.png", "asset_c.png"] },
+      { step: "attachImages", ok: true, count: 3, expected: 3, reused: 3, removedExtras: 1 },
+      { step: "verifyRefs", ok: true, expected: 3, attachmentCards: 3, orderMatched: true },
+    ],
+  });
+  eq("输入区已有附件时显示「核对归属后复用」", reusedRun.steps[1].detail, "输入区已有 3 张参考图（核对归属后复用）");
+  eq(
+    "复用与残留清理都在步骤里写明（证明没有重复上传）",
+    reusedRun.steps[2].detail,
+    "参考图 3/3 张（复用 3 张，未重复上传）（移除本工具残留 1 张）"
+  );
+  eq("参考图核实步骤写明顺序是否一致", reusedRun.steps[3].detail, "参考图核实 缩略图 3/3、顺序一致：是");
 
   // 12.1b 脚本超时时必须带上主进程侧的页面事实，否则只剩一句「超时」无法判断
   const timedOut = summarizeDriver({

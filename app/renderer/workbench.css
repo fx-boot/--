@@ -40,6 +40,10 @@
 .workbench-generate-btn:hover:not(:disabled) { filter: brightness(1.06); }
 .workbench-generate-btn:disabled { color: #8a93a3; background: #1b2431; box-shadow: none; cursor: not-allowed; }
 .workbench-main-status { min-height: 16px; color: var(--muted); font-size: 10px; line-height: 1.7; }
+/* 提交前校验：次级按钮（真实走到发送前停下，不消耗额度） */
+.workbench-precheck-btn { height: 46px; padding: 0 14px; border: 1px solid var(--line); border-radius: 11px; font-size: 11px; color: var(--muted); background: transparent; cursor: pointer; white-space: nowrap; }
+.workbench-precheck-btn:hover:not(:disabled) { color: #e8edf7; border-color: rgba(255,106,61,.5); }
+.workbench-precheck-btn:disabled { color: #5c6472; cursor: not-allowed; }
 .workbench-main-status-ok { color: #7ee2b8; }
 .workbench-main-status-warn { color: #ffcf9a; }
 .workbench-main-status-error { color: #ff9da6; }

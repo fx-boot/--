@@ -15,7 +15,7 @@ const fsp = require("node:fs/promises");
 const { net } = require("electron");
 
 const { createTaskStore, isActive } = require("./workbench-task-store");
-const { createRunner } = require("./workbench-runner");
+const { createRunner, stepDetail } = require("./workbench-runner");
 const { createDownloader } = require("./workbench-download");
 const { createDolaDriver, PARTITION_PREFIX } = require("./workbench-dola-driver");
 const { assignStoryboards } = require("./workbench-platform");
@@ -166,6 +166,35 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
 
   /** 入队前先把「校验结果与限制」返回给界面，避免用户盲提交 */
   async function previewPlan(projectId, storyboardId, accountId) {
+    const context = await planContext(projectId, storyboardId);
+    const { plan, params, snapshotRefs } = context;
+    return {
+      accountId,
+      params,
+      // 快照用引用：带名称与内容哈希，入队时直接落库
+      refs: snapshotRefs.map((ref) => ({
+        assetId: ref.assetId,
+        token: ref.token,
+        name: ref.name,
+        sha256: ref.sha256,
+      })),
+      valid: plan.valid,
+      errors: plan.errors,
+      warnings: plan.warnings,
+      limitations: plan.limitations,
+      uploads: plan.uploads,
+      references: plan.references,
+      durationMode: plan.params.durationMode,
+      // 真正会写进平台编辑器的文本（@图N → 参考图N，不含占位符）
+      promptPreview: plan.platformText,
+    };
+  }
+
+  /**
+   * 生成计划上下文：入队预览、提交前校验共用同一口径，避免两处漂移。
+   * 只做本地计算（参数/引用/文件名），不接触平台。
+   */
+  async function planContext(projectId, storyboardId) {
     const { normalizeProject } = require("./workbench-store");
     const raw = await store.readProject(projectId);
     if (!raw) throw new Error("项目不存在");
@@ -191,29 +220,51 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
     }));
     const plan = buildPlan({
       target,
-      attempt: { params, refs: snapshotRefs },
+      // attempt 形态与runner 执行时一致：storyboardId 供驱动层按「账号+分镜」记账附件
+      attempt: { storyboardId, params, refs: snapshotRefs },
       assetsById,
       capabilities,
     });
+    plan.storyboardId = storyboardId;
+    return { project, storyboard, params, snapshotRefs, plan };
+  }
+
+  /**
+   * 提交前校验：真实走一遍驱动（进入视频模式 → 写提示词 → 设参数 → 上传参考图 → 核实），
+   * 在「点击发送」前停下；不消耗生成额度，也不落任务记录。
+   */
+  async function precheck(projectId, storyboardId, accountId) {
+    const { plan } = await planContext(projectId, storyboardId);
+    if (!plan.valid) {
+      return {
+        ok: false,
+        accountId,
+        outcome: "invalid",
+        message: `参数/引用不满足提交条件：${plan.errors.join("；")}`,
+        steps: [],
+      };
+    }
+    const started = Date.now();
+    let result;
+    try {
+      result = await driver.submit({ accountId, plan, dryRun: true });
+    } catch (error) {
+      return { ok: false, accountId, outcome: "failed", message: `提交前校验失败：${error?.message || error}`, steps: [] };
+    }
+    const steps = (result?.steps || []).map((s) => ({
+      step: String(s?.step || ""),
+      ok: s?.ok !== false,
+      // 与任务卡片同一套摘要（复用/清理张数在这里也要看得到）
+      detail: String(stepDetail(s)).slice(0, 200),
+    }));
     return {
+      ok: result?.outcome === "dry-run",
       accountId,
-      params,
-      // 快照用引用：带名称与内容哈希，入队时直接落库
-      refs: snapshotRefs.map((ref) => ({
-        assetId: ref.assetId,
-        token: ref.token,
-        name: ref.name,
-        sha256: ref.sha256,
-      })),
-      valid: plan.valid,
-      errors: plan.errors,
-      warnings: plan.warnings,
-      limitations: plan.limitations,
-      uploads: plan.uploads,
-      references: plan.references,
-      durationMode: plan.params.durationMode,
-      // 真正会写进平台编辑器的文本（@图N → 参考图N，不含占位符）
-      promptPreview: plan.platformText,
+      outcome: String(result?.outcome || "unknown"),
+      message: String(result?.message || "").slice(0, 500),
+      evidence: result?.evidence || null,
+      elapsedMs: Date.now() - started,
+      steps,
     };
   }
 
@@ -223,6 +274,10 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
 
       "workbench:task-preview": (_e, projectId, storyboardId, accountId) =>
         previewPlan(projectId, storyboardId, accountId),
+
+      /** 提交前校验：走到「发送前」为止（上传 + 核实），不点发送、不消耗额度、不落任务记录 */
+      "workbench:task-precheck": (_e, projectId, storyboardId, accountId) =>
+        precheck(projectId, storyboardId, accountId),
 
       /** 单条入队：参数与素材引用在此刻拍成快照，之后分镜再改也不影响本记录 */
       "workbench:task-enqueue": async (_e, projectId, storyboardId, accountId) => {

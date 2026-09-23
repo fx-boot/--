@@ -46,10 +46,21 @@ function stepDetail(s) {
   else if (s?.picked) bits.push(`已选择 ${s.picked}`);
   else if (s?.step === "enterVideoMode") bits.push("已进入视频生成模式");
   else if (s?.step === "waitReady") bits.push("页面已就绪");
-  else if (s?.step === "clearAttachments") bits.push(`已清空 ${Number(s?.removed) || 0} 张残留参考图`);
+  else if (s?.step === "waitComposer") bits.push("输入区已就绪（编辑器/上传入口/发送按钮齐全）");
+  else if (s?.step === "attachmentsPre") bits.push(`输入区已有 ${Number(s?.count) || 0} 张参考图（核对归属后复用）`);
+  else if (s?.step === "attachImages")
+    bits.push(
+      `参考图 ${Number(s?.count) || 0}/${Number(s?.expected) || Number(s?.count) || 0} 张` +
+        (Number(s?.reused) ? `（复用 ${s.reused} 张，未重复上传）` : "") +
+        (Number(s?.removedExtras) ? `（移除本工具残留 ${s.removedExtras} 张）` : "")
+    );
   else if (Number(s?.count)) bits.push(`已上传 ${s.count} 张参考图`);
   else if (s?.step === "verifyRefs")
-    bits.push(`参考图缩略图 ${Number(s?.attachmentCards) || 0}/${Number(s?.expected) || 0}，编辑器内联节点 ${Number(s?.atomicCount) || 0}`);
+    bits.push(
+      `参考图核实 缩略图 ${Number(s?.attachmentCards) || 0}/${Number(s?.expected) || 0}、顺序一致：${
+        s?.orderMatched === false ? "否" : "是"
+      }`
+    );
   else if (s?.step === "openPage") bits.push("已找到账号页面");
   else if (s?.step === "setPrompt") bits.push("已写入提示词");
   else if (s?.step === "sendReaction")
@@ -76,6 +87,13 @@ function stepDetail(s) {
   else if (s?.storageUnderUserData === false) bits.push("会话存储不在本实例数据目录");
   else if (s?.storagePath) bits.push(`会话存储：${String(s.storagePath).slice(0, 80)}`);
   if (s?.inVideoMode === false) bits.push("不在视频生成模式");
+  if (s?.activation) {
+    bits.push(
+      s.activation.lifecycle === "active"
+        ? `后台页面已激活（生命周期 active${s.activation.focusEmulated ? "、已模拟焦点" : ""}）`
+        : `后台页面未能激活${(s.activation.errors || []).length ? `（${s.activation.errors.join("；")}）` : ""}`
+    );
+  }
   if (s?.loading) bits.push("页面仍在加载");
   if (s?.crashed) bits.push("渲染进程已崩溃");
   if (Number(s?.webContentsId)) bits.push(`webContents #${s.webContentsId}`);
@@ -314,6 +332,9 @@ function createRunner(options = {}) {
       // 1) 快照校验 + 计划
       const assetsById = await resolveAssets(projectId, record.refs);
       const plan = buildPlan({ target: targetOf(), attempt: record, assetsById, capabilities });
+      // 附件复用是按「账号 + 分镜」记账的（驱动层的 attachKey 用 plan.storyboardId），
+      // buildPlan 本身不产出该字段，这里补上，避免不同分镜共用同一份附件账。
+      plan.storyboardId = record.storyboardId;
       if (!plan.valid) {
         await patch(projectId, attemptId, (r) => {
           setError(r, "INVALID_PARAMS", plan.errors.join("；"));
@@ -745,4 +766,4 @@ function createRunner(options = {}) {
   };
 }
 
-module.exports = { ACCOUNT_BLOCK_PATTERNS, classifyBlock, createRunner, summarizeDriver };
+module.exports = { ACCOUNT_BLOCK_PATTERNS, classifyBlock, createRunner, stepDetail, summarizeDriver };

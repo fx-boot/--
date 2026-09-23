@@ -154,6 +154,8 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   task: {
     preview: (projectId, storyboardId, accountId) =>
       ipcRenderer.invoke("workbench:task-preview", projectId, storyboardId, accountId),
+    precheck: (projectId, storyboardId, accountId) =>
+      ipcRenderer.invoke("workbench:task-precheck", projectId, storyboardId, accountId),
     enqueue: (projectId, storyboardId, accountId) =>
       ipcRenderer.invoke("workbench:task-enqueue", projectId, storyboardId, accountId),
     list: (projectId) => ipcRenderer.invoke("workbench:tasks", projectId),

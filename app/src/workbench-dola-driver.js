@@ -69,6 +69,9 @@ function hostOf(url) {
 
 const isDolaUrl = (url) => DOLA_HOST_RE.test(hostOf(url));
 
+/** 文件名（平台附件卡的 img.alt 回落到上传时的原文件名，用它做跨会话的归属判定） */
+const baseNameOf = (filePath) => String(filePath || "").split(/[\\/]/).pop() || "";
+
 const readSafe = (fn) => {
   try {
     return fn();
@@ -165,6 +168,44 @@ function findAccountWebview(accountId) {
     all: views.map(describeView),
     evidence: onDola.map((contents) => ({ ...describeView(contents), ...sessionEvidence(contents, accountId) })),
   };
+}
+
+/**
+ * 把「非当前账号」的隐藏页拉回可驱动的状态。
+ * 实测（2026-09-24）：三个账号的页面 document.hidden 均为 true，隐藏页会被 Chromium
+ * 降级/冻结，脚本调用表现为 15 秒无响应（正是 att_4c080b957c39 等的失败点）。
+ * 处理：借调试通道声明页面生命周期为 active 并开启焦点模拟；失败或读不到就如实回报，
+ * 不影响归属判定与后续步骤（写脚本通道仍然可用）。
+ */
+async function ensurePageActive(contents) {
+  const dbg = contents.debugger;
+  const owned = !dbg.isAttached();
+  const result = { lifecycle: "", focusEmulated: false, errors: [] };
+  try {
+    if (owned) dbg.attach("1.3");
+    try {
+      await dbg.sendCommand("Page.enable", {});
+      await dbg.sendCommand("Page.setWebLifecycleState", { state: "active" });
+      result.lifecycle = "active";
+    } catch (error) {
+      result.errors.push(`生命周期：${error?.message || error}`);
+    }
+    try {
+      await dbg.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+      result.focusEmulated = true;
+    } catch (error) {
+      result.errors.push(`焦点模拟：${error?.message || error}`);
+    }
+  } catch (error) {
+    result.errors.push(String(error?.message || error));
+  } finally {
+    if (owned && dbg.isAttached()) {
+      try {
+        dbg.detach();
+      } catch {}
+    }
+  }
+  return result;
 }
 
 /** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
@@ -308,6 +349,58 @@ async function probeView(contents) {
     { ok: false, reason: `脚本通道 ${PROBE_TIMEOUT_MS / 1000} 秒无响应` }
   );
   return result;
+}
+
+/**
+ * 幂等写入（提示词）专用：脚本通道偶发超时。
+ * 实测（2026-09-23 真实提交 att_4c080b957c39 / att_ac50acc770cb）：上传完成后写入提示词时
+ * 出现「页面脚本执行超时（15 秒无响应）」，两账号同时命中；此时页面并没有崩溃（事后 1ms 可响应）。
+ * 处理：先等到页面不在导航中，再用 1+1 探测通道可用性，然后重试同一段幂等写入；
+ * 重试过程落到证据里；两次都不行才判失败，绝不静默继续。
+ */
+async function evaluateIdempotent(contents, source) {
+  const first = await evaluate(contents, source);
+  if (first?.ok) return { ...first, retried: false };
+  const reason = String(first?.reason || "");
+  if (!/超时|无响应/.test(reason)) return { ...first, retried: false };
+  const waitUntil = Date.now() + 5000;
+  while (readSafe(() => contents.isLoading()) && Date.now() < waitUntil) await sleep(300);
+  const probe = await probeView(contents);
+  if (!probe.ok) return { ...first, retried: true, retryProbe: probe.reason || "脚本通道仍无响应" };
+  const second = await evaluate(contents, source);
+  return { ...second, retried: true, firstReason: reason };
+}
+
+/** 组合就绪检查：可用的编辑器 + 文件入口 + 发送按钮都在（进入视频模式后页面会重渲染） */
+const STEP_COMPOSER_READY = `
+  const editor = editors()[0] || null;
+  const input = document.querySelector(SEL.fileInput);
+  const send = document.querySelector(SEL.sendButton);
+  const anyEditor = document.querySelector(SEL.editor);
+  return {
+    ok: Boolean(editor && input && send),
+    hasEditor: Boolean(editor),
+    editorCount: editors().length,
+    anyEditorPresent: Boolean(anyEditor),
+    hasFileInput: Boolean(input),
+    hasSend: Boolean(send),
+    ...pageInfo(),
+  };
+`;
+
+/** 等输入区就绪：每次 4 秒上限，最多等 timeoutMs，避免一步吃掉整段预算 */
+async function waitForComposer(contents, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  for (;;) {
+    last = await withTimeout(evaluate(contents, STEP_COMPOSER_READY), 4000, {
+      ok: false,
+      reason: "页面脚本 4 秒无响应",
+    });
+    if (last?.ok) return last;
+    if (Date.now() >= deadline) return { ...last, reason: last?.reason || "输入区未就绪（编辑器/上传入口/发送按钮不全）" };
+    await sleep(400);
+  }
 }
 
 /**
@@ -553,16 +646,71 @@ const STEP_ATTACHMENTS_STATE = `
   const candidates = climb(editor || send || input);
   const root = candidates.find(hasBlob) || candidates[0] || input;
   if (!root) return { ok: false, reason: '无法定位当前会话的输入容器', ...pageInfo() };
+  // 卡片归组：实测两种真实类名——视频参考图条是 thumb-card-*（内含 delete-btn-*），
+  // 会话输入区的图片附件是 image-wrapper-*；两者都按「含 blob 图的最内层卡片」归组。
+  const cardOf = (img) => img.closest('[class*="thumb-card"]') || img.closest('[class*="image-wrapper"]') || img.parentElement;
   const blobs = [...root.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
-  const cards = [...new Set(blobs.map(img => img.closest('[class*="image-wrapper"]') || img.parentElement))];
-  const urls = cards.map(card => String(card.querySelector('img[src^="blob:"]')?.getAttribute('src') || ''));
+  const cards = [...new Set(blobs.map(cardOf))];
+  const items = cards.map(card => {
+    const img = card.querySelector('img[src^="blob:"]');
+    return {
+      url: String(img?.getAttribute('src') || ''),
+      // alt = 上传时的原文件名（实测：asset_xxxx.png），是「跨会话可复核」的附件身份
+      alt: String(img?.getAttribute('alt') || ''),
+      cls: String(card.className || '').slice(0, 40),
+      deletable: Boolean(card.querySelector('button[class*="delete-btn"]')),
+    };
+  });
   return {
     ok: true,
     rootCls: String(root.className || '').slice(0, 60),
-    count: cards.length,
-    urls,
+    count: items.length,
+    urls: items.map(item => item.url),
+    items,
+    alts: items.map(item => item.alt),
     pageUrl: String(location.href),
   };
+`;
+
+/**
+ * 只移除「能确认属于本工具本次/上次尝试」的指定附件（按附件标识精确匹配）。
+ * 实测（2026-09-23）：视频参考图卡片是 thumb-card-*，内含 button[class*="delete-btn"]；
+ * 会话输入区的 image-wrapper-* 卡片没有删除入口，此时如实回报失败，不做别的动作。
+ */
+const STEP_REMOVE_CARDS = `
+  const targets = __URLS__;
+  const input = document.querySelector(SEL.fileInput);
+  const send = document.querySelector(SEL.sendButton);
+  const editorNode = document.querySelector(SEL.editor);
+  const climb = (start) => {
+    const list = [];
+    let node = start;
+    let guard = 0;
+    while (node && guard < 40) {
+      const cls = String(node.className || '');
+      if (/guidance-input/.test(cls) && node.contains(input) && node.contains(send)) list.push(node);
+      node = node.parentElement;
+      guard++;
+    }
+    return list;
+  };
+  const hasBlob = (node) => [...node.querySelectorAll('img')].some(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const candidates = climb(editorNode || send || input);
+  const root = candidates.find(hasBlob) || candidates[0] || input;
+  const cardOf = (img) => img.closest('[class*="thumb-card"]') || img.closest('[class*="image-wrapper"]') || img.parentElement;
+  const removed = [];
+  const refused = [];
+  for (const url of targets) {
+    const img = [...root.querySelectorAll('img[src^="blob:"]')].find(node => String(node.getAttribute('src') || '') === url);
+    if (!img) { refused.push({ url: String(url).slice(0, 40), reason: '卡片已不在输入区' }); continue; }
+    const card = cardOf(img);
+    const btn = card.querySelector('button[class*="delete-btn"]');
+    if (!btn) { refused.push({ url: String(url).slice(0, 40), reason: '该卡片没有删除入口（不能确认可移除）' }); continue; }
+    btn.click();
+    removed.push(String(url).slice(0, 40));
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return { ok: refused.length === 0, removed: removed.length, refused, ...pageInfo() };
 `;
 
 /**
@@ -572,6 +720,7 @@ const STEP_ATTACHMENTS_STATE = `
  */
 const STEP_VERIFY_REFS = `
   const expectedUrls = __URLS__;   // 本次上传得到的附件标识，按 参考图1..N 的顺序
+  const expectedAlts = __ALTS__;   // 本次上传的文件名（平台 alt 原样回落），按同一顺序
   const labels = __LABELS__;
   const input = document.querySelector(SEL.fileInput);
   const send = document.querySelector(SEL.sendButton);
@@ -593,19 +742,27 @@ const STEP_VERIFY_REFS = `
   const root = candidates.find(hasBlob) || candidates[0] || input;
   if (!root) return { ok: false, reason: '无法定位当前会话的输入容器', ...pageInfo() };
   const blobs = [...root.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
-  const cards = [...new Set(blobs.map(img => img.closest('[class*="image-wrapper"]') || img.parentElement))];
+  const cardOf = (img) => img.closest('[class*="thumb-card"]') || img.closest('[class*="image-wrapper"]') || img.parentElement;
+  const cards = [...new Set(blobs.map(cardOf))];
   const urls = cards.map(card => String(card.querySelector('img[src^="blob:"]')?.getAttribute('src') || ''));
+  const alts = cards.map(card => String(card.querySelector('img[src^="blob:"]')?.getAttribute('alt') || ''));
   const text = (() => { const list = editors(); return list[0] ? String(list[0].textContent || '') : ''; })();
   const countOk = urls.length === expectedUrls.length;
   const orderMatched = countOk && expectedUrls.every((u, i) => urls[i] === u);
+  // 文件名序列：跨会话也适用的附件身份核对（alt = 上传时的原文件名）
+  const altKnown = expectedAlts.filter(Boolean).length === expectedAlts.length && expectedAlts.length > 0;
+  const altOrderMatched = altKnown && alts.length === expectedAlts.length && expectedAlts.every((a, i) => alts[i] === a);
   const missing = expectedUrls.filter(u => !urls.includes(u));
   const extra = urls.filter(u => !expectedUrls.includes(u));
   const missingLabels = labels.filter(l => !text.includes(l));
   return {
-    ok: countOk && orderMatched && missingLabels.length === 0,
+    ok: countOk && orderMatched && (!altKnown || altOrderMatched) && missingLabels.length === 0,
     expected: expectedUrls.length,
     attachmentCards: urls.length,
     orderMatched,
+    altOrderMatched,
+    actualAlts: alts,
+    expectedAlts,
     missingCount: missing.length,
     extraCount: extra.length,
     labelsInText: labels.filter(l => text.includes(l)),
@@ -616,9 +773,11 @@ const STEP_VERIFY_REFS = `
       ? '输入区里的附件数量与本次不一致（本次 ' + expectedUrls.length + ' 张，输入区 ' + urls.length + ' 张，多出 ' + extra.length + ' 张、缺 ' + missing.length + ' 张）'
       : !orderMatched
         ? '输入区里附件顺序与「参考图1..N」不一致（按实际附件映射判断，不靠改编号掩盖）'
-        : missingLabels.length
-          ? '文本里缺少参考图编号标注：' + missingLabels.join('、')
-          : undefined,
+        : altKnown && !altOrderMatched
+          ? '输入区里附件的文件名序列与本次不一致（平台显示 ' + alts.join('、') + '，本次 ' + expectedAlts.join('、') + '）'
+          : missingLabels.length
+            ? '文本里缺少参考图编号标注：' + missingLabels.join('、')
+            : undefined,
   };
 `;
 
@@ -763,6 +922,8 @@ function createDolaDriver(options = {}) {
   const state = {
     verified: false, // 实机验证前一律为 false
     pages: new Map(),
+    // 每个账号页面的「激活」结果（生命周期/焦点模拟），落进步骤证据便于事后核对
+    activation: new Map(),
     // 本工具在「某账号 + 某分镜」输入区上传过的附件：assetId ↔ 平台附件标识（blob URL）
     attachments: new Map(),
     // 每账号的上传/提交互斥锁：同一账号同时只跑一次，防止重复点击造成附件叠加
@@ -819,7 +980,17 @@ function createDolaDriver(options = {}) {
                 candidate.setBackgroundThrottling(false);
               }
             } catch {}
-            log("dola-webview-resolved", { accountId, ...describeView(candidate), ...sessionEvidence(candidate, accountId) });
+            // 实测（2026-09-24 提交前校验）：非当前账号的页面 document.hidden=true，
+            // 15 秒无响应的「写入提示词」正是这种隐藏页被 Chromium 冻结/降级的症状。
+            // 借调试通道把页面生命周期拉回 active，并模拟焦点，避免驱动隐藏页时被卡住。
+            const activation = await ensurePageActive(candidate);
+            state.activation.set(accountId, activation);
+            log("dola-webview-resolved", {
+              accountId,
+              ...describeView(candidate),
+              ...sessionEvidence(candidate, accountId),
+              activation,
+            });
             state.pages.set(accountId, candidate);
             return candidate;
           }
@@ -879,62 +1050,186 @@ function createDolaDriver(options = {}) {
 
   /**
    * 逐张上传并建立「assetId → 平台附件标识（blob URL）」映射。
-   * 逐张上传：能确认每一张是否真的完成；拿不到新附件就是这张失败，只补传它，绝不整批重传。
-   * 已在输入区且属于本工具上传过的，直接复用。
+   * 归属判定（实测 2026-09-23）：平台附件卡的 img.alt = 上传时的原文件名（例如 asset_3f21....png），
+   *   因此「本次要传的文件名」可以把输入区里已有的附件认成本工具自己的，跨重启也成立（blob URL 则不行）。
+   * 复用优先：本次会话的 URL 映射 → 文件名匹配 → 都没有才真正上传，避免重试时重复上传。
+   * 只清理「能确认属于本工具」的多余附件（按文件名确认，且卡片有删除入口）；
+   *   来源不明的卡片一律不动，交由上层按冲突处理。
    */
   async function attachImages(contents, uploads, knownUrls = []) {
     const wanted = (uploads || []).filter((item) => item?.filePath);
     if (!wanted.length) return { ok: true, skipped: true, reason: "没有参考图片", mapping: [] };
+    const wantedNames = new Set(wanted.map((item) => baseNameOf(item.filePath)).filter(Boolean));
     const dbg = contents.debugger;
     const owned = !dbg.isAttached();
     const mapping = [];
     const failed = [];
+    const claimed = new Set();
     try {
       if (owned) dbg.attach("1.3");
       await dbg.sendCommand("DOM.enable", {});
-      const before = (await evaluate(contents, STEP_ATTACHMENTS_STATE)).urls || [];
-      for (const item of wanted) {
-        const recorded = knownUrls.find((entry) => entry.assetId === item.assetId);
-        if (recorded && before.includes(recorded.url)) {
-          mapping.push({ ...recorded, reused: true });
-          continue;
-        }
-        const seen = new Set([...(await evaluate(contents, STEP_ATTACHMENTS_STATE)).urls, ...mapping.map((m) => m.url)]);
-        await evaluate(contents, STEP_RESET_FILE_INPUT);
-        const { root } = await dbg.sendCommand("DOM.getDocument", { depth: 1 });
-        const { nodeId } = await dbg.sendCommand("DOM.querySelector", {
-          nodeId: root.nodeId,
-          selector: DOLA_SELECTORS.fileInput,
-        });
-        if (!nodeId) {
-          return { ok: false, reason: "当前页面没有可用的文件上传入口，无法附加参考图片", mapping };
-        }
-        await dbg.sendCommand("DOM.setFileInputFiles", { nodeId, files: [item.filePath] });
-        // 等这一张真的进入输入区（最多 8 秒），拿到它的附件标识
-        let url = "";
-        const deadline = Date.now() + 8000;
-        while (Date.now() < deadline) {
-          await sleep(300);
-          const now = await evaluate(contents, STEP_ATTACHMENTS_STATE);
-          const fresh = (now.urls || []).find((value) => value && !seen.has(value));
-          if (fresh) {
-            url = fresh;
-            break;
+
+      /** 一张一张地「复用或补传」：只补缺失/失败的，已有且属于本工具的直接复用 */
+      const runPass = async () => {
+        for (const item of wanted) {
+          const fileName = baseNameOf(item.filePath);
+          const recorded = knownUrls.find((entry) => entry.assetId === item.assetId);
+          const stateNow = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+          const present = (stateNow.items || []).map((card) => card.url);
+          if (recorded && present.includes(recorded.url) && !claimed.has(recorded.url)) {
+            claimed.add(recorded.url);
+            mapping.push({ ...recorded, reused: true, reusedBy: "session-url" });
+            continue;
           }
+          // 文件名归属：输入区里已有同名附件（本工具上次尝试留下的）→ 直接复用，不再重复上传
+          const byName = (stateNow.items || []).find(
+            (card) => card.alt && card.alt === fileName && !claimed.has(card.url)
+          );
+          if (byName) {
+            claimed.add(byName.url);
+            mapping.push({
+              assetId: item.assetId,
+              token: item.token,
+              label: item.label,
+              name: item.name,
+              filePath: item.filePath,
+              url: byName.url,
+              reused: true,
+              reusedBy: "file-name",
+            });
+            continue;
+          }
+          const seen = new Set([...(stateNow.urls || []), ...mapping.map((m) => m.url)]);
+          await evaluate(contents, STEP_RESET_FILE_INPUT);
+          const { root } = await dbg.sendCommand("DOM.getDocument", { depth: 1 });
+          const { nodeId } = await dbg.sendCommand("DOM.querySelector", {
+            nodeId: root.nodeId,
+            selector: DOLA_SELECTORS.fileInput,
+          });
+          if (!nodeId) {
+            // 没有文件入口就不能上传：立刻阻断并说明，不静默跳过（否则会发出不带参考图的请求）
+            return { ok: false, reason: "当前页面没有可用的文件上传入口，无法附加参考图片", mapping };
+          }
+          await dbg.sendCommand("DOM.setFileInputFiles", { nodeId, files: [item.filePath] });
+          // 等这一张真的进入输入区（最多 8 秒），拿到它的附件标识
+          let url = "";
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline) {
+            await sleep(300);
+            const now = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+            const fresh = (now.urls || []).find((value) => value && !seen.has(value));
+            if (fresh) {
+              url = fresh;
+              break;
+            }
+          }
+          if (!url) {
+            failed.push(item);
+            continue;
+          }
+          claimed.add(url);
+          mapping.push({ assetId: item.assetId, token: item.token, label: item.label, name: item.name, filePath: item.filePath, url, reused: false });
         }
-        if (!url) {
-          failed.push(item);
-          continue;
-        }
-        mapping.push({ assetId: item.assetId, token: item.token, label: item.label, name: item.name, url });
+        return null;
+      };
+
+      /** 只移除「按文件名确认属于本工具」的指定卡片；移除不掉就如实回报 */
+      const removeCards = async (urls) => {
+        const step = await evaluate(contents, STEP_REMOVE_CARDS.replace("__URLS__", JSON.stringify(urls)));
+        return {
+          removed: Number(step?.removed) || 0,
+          refused: (step?.refused || []).map((entry) => entry?.reason || "未知原因"),
+        };
+      };
+
+      /** 核对输入区：数量、顺序、以及还剩下什么（属本工具的 vs 来源不明的） */
+      const audit = async () => {
+        const now = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+        const items = now.items || [];
+        const left = items.filter((card) => card.url && !claimed.has(card.url));
+        return {
+          items,
+          ownExtras: left.filter((card) => card.alt && wantedNames.has(card.alt)),
+          strangers: left.filter((card) => !card.alt || !wantedNames.has(card.alt)),
+          // 顺序：输入区的第 i 张必须就是 mapping[i]（参考图i+1）
+          orderOk: items.length === mapping.length && mapping.every((item, i) => items[i]?.url === item.url),
+        };
+      };
+
+      const abortFirst = await runPass();
+      if (abortFirst) return { ...abortFirst, failedNames: failed.map((item) => baseNameOf(item.filePath)) };
+      let state = await audit();
+      let removedExtras = 0;
+      let rebuilt = false;
+
+      if (state.strangers.length) {
+        return {
+          ok: false,
+          count: mapping.length,
+          expected: wanted.length,
+          mapping,
+          failedNames: failed.map((item) => baseNameOf(item.filePath)),
+          strangers: state.strangers.map((card) => ({ alt: card.alt, cls: card.cls })),
+          reason: `上传期间输入区出现了 ${state.strangers.length} 张来源不明的附件，未提交也不擅自清空`,
+        };
       }
+
+      // 本工具残留的多余附件（同名但本次用不到）：确认可删才删，删不掉就阻断
+      if (state.ownExtras.length) {
+        const step = await removeCards(state.ownExtras.map((card) => card.url));
+        removedExtras = step.removed;
+        if (step.refused.length) {
+          return {
+            ok: false,
+            count: mapping.length,
+            expected: wanted.length,
+            mapping,
+            failedNames: failed.map((item) => baseNameOf(item.filePath)),
+            reason: `本工具上次留下的多余附件无法自动移除（${step.refused.join("；")}），未提交`,
+          };
+        }
+        state = await audit();
+      }
+
+      // 顺序不一致（典型场景：复用了上次留下的附件，而平台顺序与参考图编号不同）：
+      // 不靠改编号掩盖——把确认属于本工具的卡片全部移除后按参考图顺序重传一遍，重建确定性顺序。
+      if (state.items.length && !state.orderOk) {
+        const ownUrls = state.items.map((card) => card.url);
+        const step = await removeCards(ownUrls);
+        if (step.refused.length || step.removed !== ownUrls.length) {
+          return {
+            ok: false,
+            count: mapping.length,
+            expected: wanted.length,
+            mapping,
+            failedNames: failed.map((item) => baseNameOf(item.filePath)),
+            reason: `输入区附件顺序与参考图编号不一致，且无法自动重建（${step.refused.join("；") || "移除未全部成功"}），未提交`,
+          };
+        }
+        // 全部清掉后按参考图1..N 重传
+        mapping.length = 0;
+        failed.length = 0;
+        claimed.clear();
+        rebuilt = true;
+        const abortRebuild = await runPass();
+        if (abortRebuild) return { ...abortRebuild, rebuilt: true };
+        state = await audit();
+      }
+
       return {
-        ok: failed.length === 0 && mapping.length === wanted.length,
+        ok: failed.length === 0 && mapping.length === wanted.length && state.orderOk,
         count: mapping.length,
         expected: wanted.length,
         mapping,
-        failedNames: failed.map((item) => String(item.filePath).split(/[\\/]/).pop()),
-        reason: failed.length ? `有 ${failed.length} 张参考图上传后没有出现在输入区` : undefined,
+        reused: mapping.filter((item) => item.reused).length,
+        removedExtras,
+        rebuilt,
+        failedNames: failed.map((item) => baseNameOf(item.filePath)),
+        reason: failed.length
+          ? `有 ${failed.length} 张参考图上传后没有出现在输入区`
+          : !state.orderOk
+            ? "重建后输入区附件顺序仍与参考图编号不一致"
+            : undefined,
       };
     } catch (error) {
       return { ok: false, reason: error?.message || String(error), mapping };
@@ -1041,7 +1336,7 @@ function createDolaDriver(options = {}) {
       return withAccountLock(args?.accountId, () => api._submit(args));
     },
 
-    async _submit({ accountId, plan, onStep }) {
+    async _submit({ accountId, plan, onStep, dryRun = false }) {
       const steps = [];
       // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果
       const record = (step, result) => {
@@ -1068,7 +1363,12 @@ function createDolaDriver(options = {}) {
 
       // 归属证据：只有能证明「本进程 + 该账号隔离会话」时才继续操作
       const evidence = sessionEvidence(contents, accountId);
-      record("openPage", { ok: evidence.partitionMatches, ...describeView(contents), ...evidence });
+      record("openPage", {
+        ok: evidence.partitionMatches,
+        ...describeView(contents),
+        ...evidence,
+        activation: state.activation.get(accountId) || null,
+      });
       if (!evidence.partitionMatches) {
         return fail(
           `账号页面的会话归属无法核实（期望 ${evidence.expectedPartition}），已停止操作该页面`
@@ -1092,28 +1392,49 @@ function createDolaDriver(options = {}) {
         return fail(`无法进入视频生成模式：${mode?.reason || "未知原因"}`);
       }
 
-      // 3) 先读输入区已有附件：属于本工具上传过的会被复用；来源不明的停下报告冲突（绝不擅自清空）
+      // 2b) 等输入区就绪：进入视频模式后页面会重渲染，实测出现过「找不到输入框」与「脚本 15 秒无响应」
+      //     （真实提交 att_47716bb2e812 / att_de77d7a10f0f），所以先等编辑器/上传入口/发送按钮齐全
+      const composer = await waitForComposer(contents);
+      record("waitComposer", composer);
+      if (!composer?.ok) return fail(`输入区未就绪：${composer?.reason || "编辑器/上传入口/发送按钮不全"}`);
+
+      // 3) 先读输入区已有附件：本工具传过的（本次会话的 URL 映射，或文件名对得上）会被复用；
+      //    来源不明的停下报告冲突（绝不擅自清空）
       const attachKey = `${accountId}|${plan.storyboardId}`;
       const knownAttachments = state.attachments.get(attachKey) || [];
+      const ourFileNames = new Set((plan.references || []).map((item) => baseNameOf(item.filePath)).filter(Boolean));
       const preAttach = await evaluate(contents, STEP_ATTACHMENTS_STATE);
-      record("attachmentsPre", { ok: preAttach?.ok, count: preAttach?.count ?? 0, rootCls: preAttach?.rootCls });
+      record("attachmentsPre", {
+        ok: preAttach?.ok,
+        count: preAttach?.count ?? 0,
+        rootCls: preAttach?.rootCls,
+        alts: preAttach?.alts || [],
+      });
       if (!preAttach?.ok) return fail(`无法读取输入区状态：${preAttach?.reason || "未知原因"}`);
-      const unknownUrls = (preAttach.urls || []).filter((url) => !knownAttachments.some((entry) => entry.url === url));
-      if (unknownUrls.length) {
+      const preItems = preAttach.items || [];
+      const attributable = (card) =>
+        knownAttachments.some((entry) => entry.url === card.url) || (card.alt && ourFileNames.has(card.alt));
+      const foreign = preItems.filter((card) => !attributable(card));
+      if (foreign.length) {
         return {
           outcome: "failed",
           errorCode: "ATTACHMENT_CONFLICT",
           accepted: false,
           retryable: false,
           needsUser: true,
-          evidence: { kind: "attachment-conflict", unknown: unknownUrls.length, known: knownAttachments.length },
-          message: `输入区里已有 ${unknownUrls.length} 张来源不明的参考图（可能是平台恢复的草稿或手工加入的），为避免发错图片，本次不提交、也不擅自清空；请在平台输入区手动清空后重试`,
+          evidence: {
+            kind: "attachment-conflict",
+            unknown: foreign.length,
+            known: preItems.length - foreign.length,
+            foreignAlts: foreign.map((card) => card.alt || "(无文件名)"),
+          },
+          message: `输入区里已有 ${foreign.length} 张来源不明的参考图（可能是平台恢复的草稿或手工加入的），为避免发错图片，本次不提交、也不擅自清空；请在平台输入区手动清空后重试`,
           steps,
         };
       }
 
       // 4) 写入提示词：@图N 已在主进程转成「参考图N」，不再写入任何占位符
-      const textStep = await evaluate(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
+      const textStep = await evaluateIdempotent(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
       record("setPrompt", textStep);
       if (!textStep?.ok) {
         return fail(`写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`);
@@ -1191,6 +1512,9 @@ function createDolaDriver(options = {}) {
         count: uploadStep.count,
         expected: uploadStep.expected,
         reused: (uploadStep.mapping || []).filter((item) => item.reused).length,
+        reusedBy: (uploadStep.mapping || []).filter((item) => item.reused).map((item) => item.reusedBy),
+        removedExtras: uploadStep.removedExtras,
+        rebuilt: Boolean(uploadStep.rebuilt),
         failedNames: uploadStep.failedNames,
         reason: uploadStep.reason,
       });
@@ -1202,24 +1526,25 @@ function createDolaDriver(options = {}) {
 
       // 实测（2026-09-23）：平台在上传参考图的过程中可能重渲染并清空输入框里的文本，
       // 因此上传完成后重新写入一次提示词（幂等），否则后面「文本里有没有参考图N」会被误判成失败。
-      const textStep2 = await evaluate(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
-      record("setPromptAfterUpload", { ok: textStep2?.ok, actualText: textStep2?.actualText, reason: textStep2?.reason });
+      const textStep2 = await evaluateIdempotent(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
+      record("setPromptAfterUpload", { ok: textStep2?.ok, retried: textStep2?.retried, actualText: textStep2?.actualText, reason: textStep2?.reason });
       if (!textStep2?.ok) {
         return fail(`上传后重新写入提示词失败：${textStep2?.reason || "编辑器回读与预期不一致"}`);
       }
 
       const refsStep = await evaluate(
         contents,
-        STEP_VERIFY_REFS.replace("__URLS__", JSON.stringify(mapping.map((item) => item.url))).replace(
-          "__LABELS__",
-          JSON.stringify(refLabels)
-        )
+        STEP_VERIFY_REFS.replace("__URLS__", JSON.stringify(mapping.map((item) => item.url)))
+          .replace("__ALTS__", JSON.stringify(mapping.map((item) => baseNameOf(item.filePath) || "")))
+          .replace("__LABELS__", JSON.stringify(refLabels))
       );
       record("verifyRefs", {
         ok: refsStep?.ok,
         expected: refsStep?.expected,
         attachmentCards: refsStep?.attachmentCards,
         orderMatched: refsStep?.orderMatched,
+        altOrderMatched: refsStep?.altOrderMatched,
+        actualAlts: refsStep?.actualAlts,
         extraCount: refsStep?.extraCount,
         missingCount: refsStep?.missingCount,
         labelsInText: refsStep?.labelsInText,
@@ -1238,6 +1563,43 @@ function createDolaDriver(options = {}) {
       const preflight = await evaluate(contents, STEP_READ_STATE);
       record("readState", preflight);
       if (!preflight?.ok) return fail("提交前无法读取页面状态");
+
+      // 7b) 提交前校验模式：走到「发送前」为止就返回，不点击发送、不消耗额度。
+      //     用于用户要求的「上传 → 校验 → 重试」多轮验收，以及正式提交前的自查。
+      if (dryRun) {
+        const okCount = mapping.length;
+        const detail = `编辑器文本与参数已回读；参考图 ${okCount} 张已按 参考图1..N 的顺序落到平台，未点击发送`;
+        if (typeof onStep === "function") {
+          try {
+            onStep({ step: "precheckDone", ok: true, count: okCount, detail });
+          } catch {}
+        }
+        return {
+          outcome: "dry-run",
+          accepted: false,
+          retryable: false,
+          needsUser: false,
+          message: `提交前校验通过（未发送）：${detail}`,
+          evidence: {
+            kind: "precheck",
+            attachments: mapping.map((item) => ({
+              assetId: item.assetId,
+              label: item.label,
+              url: String(item.url || "").slice(0, 60),
+              reused: Boolean(item.reused),
+              reusedBy: item.reusedBy || "",
+            })),
+            attachmentCards: refsStep?.attachmentCards,
+            orderMatched: refsStep?.orderMatched,
+            altOrderMatched: refsStep?.altOrderMatched,
+            actualAlts: refsStep?.actualAlts,
+            labelsInText: refsStep?.labelsInText,
+            sendDisabled: preflight?.sendDisabled,
+            durationMode: plan.params?.durationMode || "native",
+          },
+          steps,
+        };
+      }
 
       // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
       const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
