@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self';">
+  <title>激活豆包管理器</title>
+  <link rel="stylesheet" href="activation.css">
+</head>
+<body>
+  <header class="activation-titlebar"><div class="mini-brand"><span>豆</span> 豆包管理器</div><div><button id="windowMin">—</button><button id="windowClose">×</button></div></header>
+  <main>
+    <div class="activation-mark"><span>豆</span><i></i><b>授权</b></div>
+    <span class="eyebrow">DEVICE LICENSE</span>
+    <h1 id="mainTitle">激活这台设备</h1>
+    <p class="lead">复制设备码发给软件提供方，收到专属激活码后粘贴到下方。</p>
+
+    <section class="step-card">
+      <div class="step-head"><span>01</span><div><strong>本机设备码</strong><small>每台电脑对应一个唯一设备码</small></div></div>
+      <div class="copy-row"><code id="deviceId">读取中…</code><button id="copyDevice">复制</button></div>
+    </section>
+
+    <section class="step-card">
+      <div class="step-head"><span>02</span><div><strong>输入激活码</strong><small>激活码仅对上面的设备有效</small></div></div>
+      <textarea id="licenseCode" rows="4" spellcheck="false" placeholder="DBM1.eyJ2Ijox..."> </textarea>
+    </section>
+
+    <button class="activate-button" id="activateButton"><span>验证并进入工作台</span><b>→</b></button>
+    <p class="message" id="message"></p>
+    <div class="security-note"><span>✓</span><p><strong>离线签名验证</strong><br>激活过程无需上传账号、Cookie 或创作数据。</p></div>
+  </main>
+  <script src="activation.js"></script>
+</body>
+</html>

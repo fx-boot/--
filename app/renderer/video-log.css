@@ -1,0 +1,16 @@
+.video-log-modal {width:min(1120px,96vw);max-height:90vh;padding:20px;display:flex;flex-direction:column;gap:12px;overflow:auto}
+.vl-controls {display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.vl-controls input,.vl-controls select {padding:7px 10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--panel-3);color:var(--text);max-width:240px}
+.vl-controls label {display:flex;gap:6px;align-items:center;font-size:13px}
+.vl-note {font-size:12px;color:var(--soft);line-height:1.7;margin:0}
+.vl-status {font-size:13px;min-height:20px;color:var(--green)}
+.vl-list {overflow:auto;min-height:180px;max-height:48vh;border:1px solid var(--line-strong);border-radius:10px;flex-shrink:0}
+.vl-row {padding:10px 12px;border-bottom:1px solid var(--line-strong)}
+.vl-row:last-child {border-bottom:0}
+.vl-row summary {cursor:pointer;font-size:13px;overflow-wrap:anywhere;line-height:1.6}
+.vl-row pre {white-space:pre-wrap;overflow-wrap:anywhere;background:var(--panel-3);padding:12px;border-radius:8px;font-size:12px;max-height:300px;overflow:auto;color:var(--text)}
+.vl-empty {padding:30px 18px;color:var(--muted);font-size:13px;line-height:1.8}
+#showVideoLog[data-recording="true"] {color:#b42318;background:#fff0ee}
+.vl-controls button:disabled {opacity:.45;cursor:default}
+.vl-controls input[type="number"] {width:100px}
+.vl-task h4 {font-size:12px;color:var(--soft);margin:0;padding:10px 12px;background:var(--panel-3);overflow-wrap:anywhere}

@@ -1,0 +1,24 @@
+{
+  "format": "doubao-manager-protected-build",
+  "version": 2,
+  "releaseName": "V2.0",
+  "appVersion": "2.0.0",
+  "generatedAt": "2026-08-06T15:12:14.914Z",
+  "sourceMaps": false,
+  "bytecode": {
+    "format": "electron-main-v8-bytecode",
+    "file": "src/main.jsc",
+    "sha256": "b4f9dc7840cc773182bb9ed35c06b79eb793f3ebe30c470e0db0563d811cac01",
+    "bytes": 536328,
+    "loaderBytes": 417,
+    "electronVersion": "43.2.0"
+  },
+  "resolver": {
+    "sourceSha256": "d9af0220349c5c0d986793ec3f6cc572f6f6375668aa2780fd3534f62c5d71dc",
+    "protectedPlaintextSha256": "4575216ec0e279aee706c0f1117762f2e83afa44b7067c76e5db5c5b07c9499a",
+    "encryptedPayloadSha256": "cdc3dec62327abccd2fbde11f8be1204cd93135397401af74702a27444852b0b",
+    "sourceBytes": 48633,
+    "protectedBytes": 27603,
+    "encryptedBytes": 27639
+  }
+}

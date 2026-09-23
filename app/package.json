@@ -1,0 +1,13 @@
+{
+  "name": "doubao-account-manager",
+  "version": "2.0.0",
+  "description": "豆包多账号管理器 V2.0 - 独立会话、资源管理与离线授权",
+  "main": "src/main.js",
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "bytenode": "^1.6.0",
+    "ffmpeg-static": "5.3.0"
+  }
+}

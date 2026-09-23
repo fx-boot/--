@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self';">
+  <title>豆包管理器</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="hd-original.css">
+  <link rel="stylesheet" href="video-log.css">
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brand">
+      <div class="brand-mark">豆</div>
+      <div>
+        <strong>豆包管理器</strong>
+        <span>多账号工作台</span>
+      </div>
+    </div>
+    <nav class="top-actions">
+      <button class="toolbar-btn" id="refreshPage" title="刷新当前网页">
+        <svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9A7 7 0 0 1 18 6l2 5M17.9 15A7 7 0 0 1 6 18l-2-5"/></svg><span>刷新</span>
+      </button>
+      <button class="toolbar-btn" id="openDownloads">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 20h16"/></svg><span>下载目录</span>
+      </button>
+      <button class="toolbar-btn" id="showLibrary">
+        <svg viewBox="0 0 24 24"><path d="M4 5h6l2 2h8v12H4z"/></svg><span>素材库</span>
+      </button>
+      <button class="toolbar-btn toolbar-accent" id="downloadCurrentVideoNoWatermark" title="下载当前豆包或 Dola 页面中的视频并输出无水印文件">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16v12H4zM9 10l6 4-6 4z"/><path d="M12 3v5m0 0 3-3m-3 3L9 5"/></svg><span>下载视频无水印</span>
+      </button>
+      <button class="toolbar-btn toolbar-accent" id="showWatermarkTool">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16v12H4zM9 10l6 4-6 4z"/><path d="m17 4 3 3"/></svg><span>视频去水印</span>
+      </button>
+      <button class="toolbar-btn toolbar-focus" id="toggleWebFocus" title="让网页占满整个工作区">
+        <svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg><span>网页大屏</span>
+      </button>
+      <button class="toolbar-btn" id="toggleResourcesPanel" title="收起或展开素材栏">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM15 5v14"/></svg><span>素材栏</span>
+      </button>
+    </nav>
+    <div class="license-pill" id="licensePill">
+      <span class="status-dot"></span>
+      <span id="licenseText">授权读取中</span>
+      <button id="renewLicense">续期</button>
+    </div>
+    <div class="window-controls">
+      <button id="windowMin" title="最小化">—</button>
+      <button id="windowMax" title="最大化">□</button>
+      <button id="windowClose" class="close" title="关闭">×</button>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="left-panel">
+      <div class="panel-heading">
+        <div><span class="eyebrow">ACCOUNT SPACE</span><h2>账号管理</h2></div>
+        <div class="heading-actions">
+          <button class="import-account-button" id="importAccountsTop" title="导入完整备份、JSON 或 CSV 账号">导入</button>
+          <button class="icon-button primary" id="addAccount" title="添加账号">＋</button>
+        </div>
+      </div>
+      <div class="account-tools">
+        <label class="search-box">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+          <input id="accountSearch" type="search" placeholder="搜索账号或备注">
+        </label>
+        <select id="groupFilter" aria-label="按分组筛选"><option value="all">全部分组</option></select>
+      </div>
+      <div class="platform-filter" id="platformFilter"></div>
+      <div class="account-list" id="accountList"></div>
+      <div class="account-footer">
+        <span id="accountCount">0 个账号</span>
+        <div>
+          <button class="text-button" id="importAccounts">导入</button>
+          <button class="text-button" id="exportAccounts" title="导出包含登录状态的完整账号备份">完整备份</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <div class="tab-strip" id="tabStrip">
+        <div class="tab-placeholder" id="tabPlaceholder">尚未打开账号</div>
+      </div>
+      <div class="address-row">
+        <button class="nav-button" id="goBack" title="后退">←</button>
+        <button class="nav-button" id="goForward" title="前进">→</button>
+        <div class="page-address"><span class="secure-mark">●</span><span id="pageAddress">请选择左侧账号开始工作</span></div>
+        <button class="nav-button" id="reloadInline" title="重新加载">↻</button>
+      </div>
+      <section class="browser-stack" id="browserStack">
+        <div class="welcome" id="welcome">
+          <div class="welcome-orbit"><span>豆</span></div>
+          <span class="eyebrow">ONE DESK · MANY ACCOUNTS</span>
+          <h1>把每个创作账号<br>放在同一个工作台</h1>
+          <p>不同账号的 Cookie 与登录状态相互隔离。选择已有账号，或添加你的第一个账号。</p>
+          <button class="primary-action" id="welcomeAdd">添加账号 <span>→</span></button>
+          <div class="welcome-features">
+            <span>独立会话</span><i></i><span>快捷切换</span><i></i><span>素材捕获</span>
+          </div>
+        </div>
+      </section>
+      <footer class="statusbar"><span class="status-light"></span><span id="statusText">就绪</span><span class="status-spacer"></span><span id="activeAccountHint">未选择账号</span></footer>
+    </main>
+
+    <aside class="right-panel">
+      <div class="panel-heading resource-heading">
+        <div><span class="eyebrow">CAPTURED MEDIA</span><h2>素材捕获</h2></div>
+        <span class="count-badge" id="resourceCount">0</span>
+      </div>
+      <div class="resource-toolbar">
+        <div class="segmented" id="resourceFilter">
+          <button class="active" data-type="all">全部</button>
+          <button data-type="image">图片</button>
+          <button data-type="video">视频</button>
+        </div>
+        <button class="clear-button" id="clearResources">清空</button>
+      </div>
+      <div class="resource-list" id="resourceList">
+        <div class="resource-empty">
+          <svg viewBox="0 0 64 64"><rect x="10" y="13" width="44" height="38" rx="7"/><path d="m17 43 11-12 8 8 5-5 7 9"/><circle cx="42" cy="25" r="4"/></svg>
+          <strong>等待捕获素材</strong>
+          <p>打开账号后，网页中的大图和视频会显示在这里。</p>
+        </div>
+      </div>
+      <div class="capture-note"><span>i</span> 仅下载当前账号有权访问的资源</div>
+    </aside>
+  </div>
+
+  <div class="overlay hidden" id="accountModal">
+    <form class="modal account-modal" id="accountForm">
+      <div class="modal-title"><div><span class="eyebrow" id="accountModalEyebrow">NEW WORKSPACE</span><h2 id="accountModalTitle">添加账号</h2></div><button type="button" class="modal-close" data-close="accountModal">×</button></div>
+      <div class="modal-body">
+        <label class="field"><span>平台</span><select id="platformSelect" required></select></label>
+        <label class="field"><span>账号名称</span><input id="accountName" maxlength="60" placeholder="例如：主账号 / 客户 A"></label>
+        <div class="two-fields">
+          <label class="field"><span>分组</span><input id="accountGroup" maxlength="40" placeholder="例如：客户账号"></label>
+          <label class="field"><span>备注</span><input id="accountRemark" maxlength="100" placeholder="用途说明"></label>
+        </div>
+        <label class="field hidden" id="customUrlField"><span>网站地址</span><input id="customUrl" type="url" placeholder="https://example.com"></label>
+        <div class="isolation-tip"><span>✓</span><p><strong>登录状态独立保存</strong><br>每个账号使用单独的浏览器会话，不会互相串号。</p></div>
+      </div>
+      <div class="modal-actions"><button type="button" class="secondary-action" data-close="accountModal">取消</button><button type="submit" class="primary-action" id="saveAccount">创建账号</button></div>
+    </form>
+  </div>
+
+  <div class="overlay hidden" id="libraryModal">
+    <section class="modal library-modal">
+      <div class="modal-title"><div><span class="eyebrow">DOWNLOAD CENTER</span><h2>本地素材库</h2><p id="libraryPath"></p></div><button type="button" class="modal-close" data-close="libraryModal">×</button></div>
+      <div class="library-toolbar">
+        <label class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input id="librarySearch" type="search" placeholder="搜索文件名"></label>
+        <button class="secondary-action compact" id="chooseDownloadPath">更改目录</button>
+        <button class="secondary-action compact" id="refreshLibrary">刷新</button>
+      </div>
+      <div class="library-list" id="libraryList"></div>
+      <div class="modal-actions"><span id="librarySummary">共 0 个文件</span><button class="primary-action compact" id="openLibraryFolder">打开文件夹</button></div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="confirmModal">
+    <section class="modal confirm-modal">
+      <div class="danger-icon">!</div><h2>移除这个账号？</h2><p id="confirmMessage">账号将从列表中移除。请选择是否同时清除本机登录数据。</p>
+      <div class="delete-choice-list">
+        <button class="delete-choice" id="confirmDeleteKeepData">
+          <strong>仅移除账号</strong>
+          <span>保留 Cookie、缓存、登录状态和账号指纹</span>
+        </button>
+        <button class="delete-choice danger" id="confirmDeleteAndData">
+          <strong>移除账号并清除数据</strong>
+          <span>清除该账号的本机登录状态与浏览器数据，无法恢复</span>
+        </button>
+      </div>
+      <div class="modal-actions"><button class="secondary-action" data-close="confirmModal">取消</button></div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="finalRemoveModal">
+    <section class="modal confirm-modal final-remove-modal">
+      <div class="danger-icon">!</div>
+      <h2 id="finalRemoveTitle">再次确认移除</h2>
+      <p id="finalRemoveMessage">请确认是否继续。</p>
+      <div class="modal-actions">
+        <button class="secondary-action" data-close="finalRemoveModal">取消</button>
+        <button class="danger-action" id="confirmFinalRemove">确认移除</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="watermarkModal">
+    <section class="modal watermark-modal">
+      <div class="modal-title"><div><span class="eyebrow">LOCAL VIDEO TOOL</span><h2>视频生成去水印</h2><p>在本机处理视频，不上传到任何第三方服务器</p></div><button type="button" class="modal-close" data-close="watermarkModal">×</button></div>
+      <div class="watermark-body">
+        <button class="video-picker" id="chooseWatermarkVideo">
+          <span class="video-picker-icon">▶</span>
+          <span><strong id="watermarkVideoName">选择生成后的视频</strong><small id="watermarkVideoInfo">支持 MP4、MOV、MKV、WebM 等格式</small></span>
+          <b>选择文件</b>
+        </button>
+        <div class="watermark-settings">
+          <label class="field"><span>水印位置</span><select id="watermarkPosition"><option value="bottom-right">右下角</option><option value="bottom-left">左下角</option><option value="top-right">右上角</option><option value="top-left">左上角</option></select></label>
+          <label class="range-field"><span>区域宽度 <b id="watermarkWidthValue">20%</b></span><input id="watermarkWidth" type="range" min="5" max="45" value="20"></label>
+          <label class="range-field"><span>区域高度 <b id="watermarkHeightValue">12%</b></span><input id="watermarkHeight" type="range" min="3" max="35" value="12"></label>
+        </div>
+        <div class="watermark-preview">
+          <div class="preview-screen"><span>视频画面</span><i id="watermarkRegion"></i></div>
+          <p>橙色区域应完全覆盖水印。区域越小，对原画面的影响越少。</p>
+        </div>
+        <div class="processing hidden" id="watermarkProcessing"><div><span id="watermarkProgressBar"></span></div><p id="watermarkProgressText">正在处理 0%</p></div>
+        <div class="watermark-result hidden" id="watermarkResult"><span>✓</span><p><strong id="watermarkResultName">处理完成</strong><small>新视频已保存，原文件不会被修改。</small></p><button id="openWatermarkOutput">打开位置</button></div>
+        <div class="isolation-tip watermark-tip"><span>i</span><p><strong>处理说明</strong><br>工具会重建所选区域的像素来淡化固定水印。复杂背景可能需要缩小区域后重新处理。</p></div>
+      </div>
+      <div class="modal-actions"><button type="button" class="secondary-action" data-close="watermarkModal">取消</button><button type="button" class="primary-action" id="startWatermarkRemoval" disabled>开始去水印</button></div>
+    </section>
+  </div>
+
+  <div class="toast-region" id="toastRegion"></div>
+  <script src="app.js"></script>
+  <script src="account-batch-tools.js"></script>
+  <script src="account-proxy-tools.js"></script>
+  <script src="account-pool-tools.js"></script>
+  <script src="hd-original.js"></script>
+  <script src="video-log-shared.js"></script>
+  <script src="video-log.js"></script>
+</body>
+</html>

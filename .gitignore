@@ -1,0 +1,95 @@
+# ── 依赖 ─────────────────────────────────────────────
+# app/node_modules 体积约 79MB，不入库；可由发布包 app.asar 内的同名目录还原
+app/node_modules/
+node_modules/
+
+# ── 运行时副本与构建产物 ───────────────────────────────
+# Electron 运行时副本（exe + dll + resources，约 528MB）含大量二进制，不入库
+runtime/
+*.building
+*.asar
+*.asar.orig
+*.asar.bak
+app-custom.asar
+
+# 注意：以下两个文件是“基线输入”，不是本项目的构建产物，
+# 且无法重新生成，必须入库 —— 因此不在此忽略：
+#   app/src/main.jsc          厂商混淆字节码（536KB）
+#   app/src/runtime-resolver.bin
+
+# ── 用户数据 / 会话 / Cookie / 密钥 ────────────────────
+# 明确排除，防止任何真实账号数据、登录态或凭据进入仓库
+local-data/
+data/
+Partitions/
+Local Storage/
+Session Storage/
+Network/
+Cookies
+Cookies-journal
+"Local State"
+Preferences
+SharedStorage*
+DIPS*
+*.cookie
+*cookies*.json
+accounts.json
+account-proxies.json
+account-proxy-pool.json
+browser-fingerprints.json
+pending-storage.json
+license.json
+license-cache.json
+*.p12
+*.pfx
+*.key
+*secret*.json
+runtime-secrets.local.js
+
+# ── 日志与临时产物 ────────────────────────────────────
+*.log
+logs/
+*-report.json
+boot-probe-report.json
+boot-probe-data/
+*.tmp
+*.bak
+~$*
+
+# ── 缓存 ──────────────────────────────────────────────
+cache/
+Code Cache/
+GPUCache/
+DawnGraphiteCache/
+DawnWebGPUCache/
+"Shared Dictionary"
+Dictionaries/
+
+# ── 实际用户素材与生成视频 ────────────────────────────
+# 项目素材目录与成片均不入库（Git 不能替代二进制备份）
+projects/
+素材/
+素材库/
+media/
+downloads/
+输出/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+# 阶段0 用于校验的样例视频也不入库
+sample-*.mp4
+
+# ── 本地环境配置 ──────────────────────────────────────
+.env
+.env.*
+*.local
+.vscode/
+.idea/
+*.code-workspace
+
+# ── 系统 ──────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
