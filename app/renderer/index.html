@@ -247,7 +247,7 @@
             </label>
             <button type="button" class="secondary-action compact" id="workbenchAssetImport">导入图片</button>
           </div>
-          <div class="workbench-dropzone" id="workbenchDropzone">把图片拖到这里，或点击「导入图片」</div>
+          <div class="workbench-dropzone" id="workbenchDropzone">把图片拖到这里、点击「导入图片」，或直接 Ctrl+V 粘贴</div>
           <div class="workbench-asset-list" id="workbenchAssetList"></div>
         </aside>
         <div class="workbench-main">
@@ -265,7 +265,10 @@
             <span class="count-badge" id="workbenchTaskCount">0</span>
           </div>
           <div class="workbench-task-controls">
-            <label class="workbench-field"><span>执行账号</span><select id="workbenchAccountSelect"></select></label>
+            <div class="workbench-field workbench-account-field">
+              <span>执行账号（可多选）</span>
+              <div class="workbench-account-picks" id="workbenchAccountPicks"></div>
+            </div>
             <div class="workbench-task-buttons">
               <button type="button" class="secondary-action compact" id="workbenchQueuePause">暂停队列</button>
               <button type="button" class="secondary-action compact" id="workbenchQueueResume">恢复队列</button>

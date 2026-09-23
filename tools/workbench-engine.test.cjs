@@ -17,7 +17,7 @@ const path = require("node:path");
 const SRC = path.join(__dirname, "..", "app", "src");
 const task = require(path.join(SRC, "workbench-task-store.js"));
 const platform = require(path.join(SRC, "workbench-platform.js"));
-const { createRunner, classifyBlock } = require(path.join(SRC, "workbench-runner.js"));
+const { createRunner, classifyBlock, summarizeDriver } = require(path.join(SRC, "workbench-runner.js"));
 const download = require(path.join(SRC, "workbench-download.js"));
 const { createAssets } = require(path.join(SRC, "workbench-assets.js"));
 const { VIDEO_CAPABILITIES } = require(path.join(SRC, "video-capabilities.js"));
@@ -716,6 +716,94 @@ async function main() {
   check("素材文件已删除", !fs.existsSync(path.join(assetsDir, `${fakeId}.png`)));
   check("缩略图已删除", !fs.existsSync(path.join(thumbsDir, `${fakeId}.png`)));
   eq("目录记录已更新", JSON.parse(fs.readFileSync(catalogFile, "utf8")).assets.length, 0);
+
+  // ══ 12. 用户反馈修复项（离线可测部分） ══
+  console.log("── 修改项：发送步骤回报 / 比例候选 / 粘贴导入 ──");
+
+  // 12.1 驱动层步骤整理：把「点了生成没反应」变成逐步骤的可见结果
+  const summarized = summarizeDriver({
+    outcome: "failed",
+    message: "页面上找不到发送按钮，无法提交生成",
+    steps: [
+      { step: "setPrompt", ok: true, readback: "镜头推进" },
+      { step: "chooseModel", ok: true, picked: "2.5", available: ["2.5", "2.0"] },
+      { step: "chooseRatio", ok: false, reason: "页面上找不到该控件" },
+      { step: "attachImages", ok: true, count: 2 },
+      { step: "send", ok: false, reason: "页面上找不到发送按钮，无法提交生成", candidates: ["label:发送"] },
+    ],
+  });
+  eq("步骤数量被完整保留", summarized.steps.length, 5);
+  eq("成功步骤被标注为成功", summarized.steps[0].ok, true);
+  eq("失败步骤被标注为失败", summarized.steps[2].ok, false);
+  eq("失败步骤带上原因", summarized.steps[2].detail, "页面上找不到该控件");
+  eq("选择类步骤记录实际命中项", summarized.steps[1].detail, "已选择 2.5");
+  eq("上传类步骤记录数量", summarized.steps[3].detail, "已上传 2 张参考图");
+  eq("发送失败原因被带出", summarized.steps[4].detail, "页面上找不到发送按钮，无法提交生成");
+  eq("候选控件清单被带出（供首次实机校准）", summarized.candidates.length, 1);
+  eq("候选控件来自发送步骤", summarized.candidates[0], "label:发送");
+
+  // 12.2 驱动步骤随任务记录一起落库，界面才有东西可展示
+  const driverStore = task.createTaskStore((projectId) => path.join(root, "driverproj", projectId));
+  const driverAttempt = task.createAttempt({ projectId: "prj_driver", storyboardId: "sb_1", accountId: "acct_1" });
+  await driverStore.append("prj_driver", driverAttempt);
+  await driverStore.update("prj_driver", driverAttempt.id, (record) => {
+    record.driver = summarized;
+    return record;
+  });
+  const driverReloaded = (await driverStore.list("prj_driver"))[0];
+  eq("驱动步骤已落库并可重启后恢复", driverReloaded.driver.steps.length, 5);
+  eq("落库后失败标记仍准确", driverReloaded.driver.steps[4].ok, false);
+  eq("落库后候选控件仍在", driverReloaded.driver.candidates[0], "label:发送");
+  eq("驱动总体结果已落库", driverReloaded.driver.outcome, "failed");
+
+  // 12.3 比例：给出常见候选值，且继续标注「平台能力未核实」
+  check("比例候选值非空", platform.RATIO_OPTIONS.length >= 4, platform.RATIO_OPTIONS);
+  check(
+    "比例候选含 16:9 与 9:16",
+    platform.RATIO_OPTIONS.includes("16:9") && platform.RATIO_OPTIONS.includes("9:16"),
+    platform.RATIO_OPTIONS
+  );
+  check(
+    "比例控件选择器已登记（探测不到会如实回报而不是猜）",
+    typeof platform.DOLA_SELECTORS.ratioControl === "string" && platform.DOLA_SELECTORS.ratioControl.length > 0,
+    platform.DOLA_SELECTORS.ratioControl
+  );
+  const ratioWarning = platform
+    .validateParams({
+      target: "dola",
+      params: { model: "seedance2.5", duration: "10", prompt: "x", ratio: "9:16" },
+      refs: [],
+      capabilities: VIDEO_CAPABILITIES,
+    })
+    .warnings.join("；");
+  check("比例仍被标注为未核实", /未核实|以平台实际结果为准/.test(ratioWarning), ratioWarning);
+  check("比例不再声称「不会被提交」", !/不会被提交/.test(ratioWarning), ratioWarning);
+
+  // 12.4 粘贴导入：剪贴板图片走 base64 落盘，并沿用内容哈希去重
+  const pasteRoot = path.join(root, "pasteproj");
+  const pasteAssetsDir = path.join(pasteRoot, "assets");
+  const pasteThumbsDir = path.join(pasteRoot, "thumbs");
+  fs.mkdirSync(pasteAssetsDir, { recursive: true });
+  fs.mkdirSync(pasteThumbsDir, { recursive: true });
+  const pasteApi = createAssets({
+    assetsDir: () => pasteAssetsDir,
+    thumbsDir: () => pasteThumbsDir,
+    assetCatalogFile: () => path.join(pasteRoot, "assets.json"),
+  });
+  const pngBase64 = Buffer.from("paste-png-bytes").toString("base64");
+  const pasted = await pasteApi.importBuffers("prj_paste", [{ name: "粘贴图片 1", ext: ".png", base64: pngBase64 }]);
+  eq("粘贴导入新增 1 张", pasted.imported.length, 1);
+  check("粘贴导入沿用内容哈希命名", /^asset_[0-9a-f]{12}$/.test(pasted.imported[0].id), pasted.imported[0].id);
+  check("粘贴图片已写入素材目录", fs.existsSync(path.join(pasteAssetsDir, pasted.imported[0].fileName)));
+  const pastedAgain = await pasteApi.importBuffers("prj_paste", [{ name: "粘贴图片 2", ext: ".png", base64: pngBase64 }]);
+  eq("同一内容再次粘贴被复用", pastedAgain.reused.length, 1);
+  eq("复用时 assetId 不变", pastedAgain.reused[0].id, pasted.imported[0].id);
+  const pastedBad = await pasteApi.importBuffers("prj_paste", [
+    { name: "坏扩展名", ext: ".txt", base64: pngBase64 },
+    { name: "空内容", ext: ".png", base64: "" },
+  ]);
+  eq("不支持的扩展名与空内容都被拒绝", pastedBad.failed.length, 2);
+  eq("失败项不会被记为导入", pastedBad.imported.length, 0);
 
   fs.rmSync(root, { recursive: true, force: true });
 

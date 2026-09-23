@@ -21,12 +21,21 @@ const TOKEN_RE = /@图(\d{1,3})/g;
 /** 平台未提供、因此界面必须显示「未知」的能力项 */
 const UNKNOWN_CAPABILITIES = Object.freeze(["ratio", "maxReferenceImages", "quota"]);
 
+/**
+ * 比例候选值：平台能力表里没有 ratios，所以这里只提供行业常见值供用户选择，
+ * 并明确标注「平台比例能力未核实」。绝不声称这些值一定被平台接受。
+ */
+const RATIO_OPTIONS = Object.freeze(["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]);
+
 const DOLA_SELECTORS = Object.freeze({
   editor: 'textarea, [contenteditable="true"], [contenteditable="plaintext-only"]',
   modelControl:
     '[data-input-engine-actionbar-control-key="video-model"], [data-input-engine-actionbar-control-key="model"]',
   durationControl:
     '[data-input-engine-actionbar-control-key="video-duration"], [data-input-engine-actionbar-control-key="duration"]',
+  // 同理：按键名推导，是否真的存在需要实机探测，探测不到就如实回报
+  ratioControl:
+    '[data-input-engine-actionbar-control-key="video-ratio"], [data-input-engine-actionbar-control-key="ratio"], [data-input-engine-actionbar-control-key="video-aspect"]',
   actionbar: '[data-input-engine-actionbar], [class*="actionbar"], [class*="action-bar"]',
   atomicMark: "\uFFFC",
   fileInput: 'input[type="file"]',
@@ -122,7 +131,7 @@ function validateParams({ target = "dola", params = {}, refs = [], capabilities 
   if (!text(params.prompt).trim()) errors.push("提示词为空，拒绝提交");
 
   if (text(params.ratio) && (!caps || !Array.isArray(caps.ratios))) {
-    warnings.push("平台未提供比例能力表，比例设置不会被提交");
+    warnings.push("平台未提供比例能力表，比例会尝试按页面控件设置，是否生效以平台实际结果为准");
   }
 
   const list = Array.isArray(refs) ? refs : [];
@@ -182,6 +191,7 @@ function buildPlan({ target = "dola", attempt, assetsById = new Map(), capabilit
 
 module.exports = {
   DOLA_SELECTORS,
+  RATIO_OPTIONS,
   TOKEN_RE,
   UNKNOWN_CAPABILITIES,
   buildPlan,

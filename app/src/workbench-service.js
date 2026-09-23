@@ -28,6 +28,7 @@ const { createAssets, MAX_BYTES } = require("./workbench-assets");
 const { createTaskService } = require("./workbench-task-service");
 const { DOWNLOAD_LABEL, STATUS_LABEL } = require("./workbench-task-store");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
+const { RATIO_OPTIONS } = require("./workbench-platform");
 
 const CHANGED = "workbench:changed";
 const PROJECT_DIR_NAME = "workbench";
@@ -176,6 +177,8 @@ async function snapshot() {
     project,
     assets: assetList,
     capabilities: VIDEO_CAPABILITIES,
+    // 比例候选值：平台能力表没有 ratios，这里只给常见值，界面必须标注「未核实」
+    ratioOptions: RATIO_OPTIONS,
     limits: { maxAssetBytes: MAX_BYTES },
     accounts: accountList,
     tasks: taskList,
@@ -385,6 +388,11 @@ function baseHandlers() {
     "workbench:asset-import-paths": async (_e, projectId, filePaths) => {
       const project = await requireProject(projectId);
       return assets().importPaths(project.id, filePaths);
+    },
+    /** 粘贴导入：渲染层拿不到剪贴板图片的路径，改传 base64 */
+    "workbench:asset-import-buffers": async (_e, projectId, items) => {
+      const project = await requireProject(projectId);
+      return assets().importBuffers(project.id, Array.isArray(items) ? items : []);
     },
     "workbench:asset-list": async (_e, projectId, options) => {
       const project = await requireProject(projectId);

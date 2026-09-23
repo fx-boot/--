@@ -178,6 +178,19 @@ function normalizeAttempt(input = {}) {
       message: text(input.poll?.message, 300),
       stale: Boolean(input.poll?.stale),
     },
+    // 驱动层逐步执行结果：把「哪一步成功/失败、失败时的候选控件」落库，
+    // 界面据此给出可见反馈，而不是只显示一个笼统的失败
+    driver: {
+      outcome: text(input.driver?.outcome, 20),
+      message: text(input.driver?.message, 500),
+      at: text(input.driver?.at),
+      steps: (Array.isArray(input.driver?.steps) ? input.driver.steps : []).slice(0, 20).map((s) => ({
+        step: text(s?.step, 40),
+        ok: s?.ok !== false,
+        detail: text(s?.detail, 200),
+      })),
+      candidates: (Array.isArray(input.driver?.candidates) ? input.driver.candidates : []).slice(0, 12).map((c) => text(c, 120)),
+    },
     canCancel: input.canCancel !== false,
   };
 }

@@ -143,6 +143,8 @@ function main() {
       删除: d.removed.length,
       未改动: unchanged,
       新增示例: d.added.slice(0, 5),
+      改动示例: d.changed.slice(0, 5),
+      删除示例: d.removed.slice(0, 5),
     });
   }
 

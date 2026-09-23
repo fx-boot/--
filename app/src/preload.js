@@ -134,6 +134,7 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   asset: {
     importDialog: () => ipcRenderer.invoke("workbench:asset-import-dialog"),
     importPaths: (projectId, filePaths) => ipcRenderer.invoke("workbench:asset-import-paths", projectId, filePaths),
+    importBuffers: (projectId, items) => ipcRenderer.invoke("workbench:asset-import-buffers", projectId, items),
     list: (projectId, options) => ipcRenderer.invoke("workbench:asset-list", projectId, options),
     rename: (projectId, assetId, name) => ipcRenderer.invoke("workbench:asset-rename", projectId, assetId, name),
     thumb: (projectId, assetId) => ipcRenderer.invoke("workbench:asset-thumb", projectId, assetId),

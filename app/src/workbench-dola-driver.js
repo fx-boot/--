@@ -27,8 +27,8 @@ const { DOLA_SELECTORS } = require("./workbench-platform");
 
 const CREATE_URL = "https://www.dola.com/";
 const PARTITION_PREFIX = "persist:doubao-manager-";
-const SEND_TIMEOUT_MS = 90 * 1000;
-const RESULT_TIMEOUT_MS = 20 * 1000;
+// 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
+const SEND_TIMEOUT_MS = 45 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -42,6 +42,7 @@ const HELPERS = `
     editor: DOLA_SELECTORS.editor,
     model: DOLA_SELECTORS.modelControl,
     duration: DOLA_SELECTORS.durationControl,
+    ratio: DOLA_SELECTORS.ratioControl,
     actionbar: DOLA_SELECTORS.actionbar,
     fileInput: DOLA_SELECTORS.fileInput,
   })};
@@ -54,6 +55,7 @@ const HELPERS = `
   };
   const textOf = (el) => String(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title') || '').replace(/\\s+/g, ' ').trim();
   const editors = () => [...document.querySelectorAll(SEL.editor)].filter(e => visible(e) && !e.disabled && !e.readOnly);
+  const attr = (el, name) => { try { return String(el?.getAttribute?.(name) || ''); } catch { return ''; } };
 `;
 
 async function evaluate(contents, source) {
@@ -106,6 +108,52 @@ const STEP_SET_TEXT = `
 const STEP_READ_STATE = `
   const body = document.body ? document.body.innerText : '';
   return { ok: true, text: String(body).replace(/\\s+/g, ' ').slice(0, 800), url: location.href };
+`;
+
+/**
+ * 点击发送。
+ * 既有可读模块里没有留下发送按钮的实测选择器，所以这里不写死，
+ * 而是按「无障碍标签 → 输入区工具栏尾部」的顺序探测候选控件，
+ * 无论成功失败都把候选清单回报出来，首次实机运行即可据此校准。
+ */
+const STEP_SEND = `
+  const cands = [];
+  const add = (el, why) => {
+    if (!el || !visible(el)) return;
+    if (cands.some((c) => c.el === el)) return;
+    if (el.matches(SEL.model) || el.closest(SEL.model)) return;
+    if (el.matches(SEL.duration) || el.closest(SEL.duration)) return;
+    if (el.matches(SEL.ratio) || el.closest(SEL.ratio)) return;
+    cands.push({ el, why });
+  };
+  const describe = (el) => {
+    const label = [textOf(el), attr(el, 'aria-label'), attr(el, 'title'), attr(el, 'class')].filter(Boolean).join(' ');
+    return String(label).replace(/\\s+/g, ' ').trim().slice(0, 60);
+  };
+
+  // 1) 按文字/无障碍标签命中「发送 / 生成 / 提交」
+  const wanted = /发送|生成|提交|立即|send|generate|submit/i;
+  for (const el of [...document.querySelectorAll('button,[role="button"],[tabindex="0"]')]) {
+    if (wanted.test(describe(el))) add(el, 'label:' + describe(el));
+  }
+
+  // 2) 输入区工具栏里最后一个可点元素通常就是发送
+  if (cands.length < 2) {
+    const bar = document.querySelector(SEL.actionbar)
+      || document.querySelector(SEL.model)?.parentElement
+      || document.querySelector(SEL.editor)?.parentElement;
+    if (bar) {
+      const inside = [...bar.querySelectorAll('button,[role="button"],[tabindex="0"]')].filter(visible).reverse();
+      for (const el of inside.slice(0, 6)) add(el, 'toolbar-tail:' + describe(el));
+    }
+  }
+
+  const candidates = cands.slice(0, 12).map((c) => c.why);
+  const target = cands[0];
+  if (!target) return { ok: false, reason: '页面上找不到发送按钮，无法提交生成', candidates };
+  target.el.click();
+  await new Promise((r) => setTimeout(r, 600));
+  return { ok: true, clicked: target.why, candidates };
 `;
 
 /** 从响应体中收集任务类 ID：只认既有模块已确认的字段名，不猜 */
@@ -277,8 +325,6 @@ function createDolaDriver(options = {}) {
         return { outcome: "failed", message: `计划无效：${(plan?.errors || []).join("；")}`, steps };
       }
 
-      const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
-
       const textStep = await evaluate(
         contents,
         STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.plainText))
@@ -296,6 +342,11 @@ function createDolaDriver(options = {}) {
         String(plan.params.duration)
       );
       steps.push({ step: "chooseDuration", ...durationStep });
+      // 比例：平台能力表里没有这一项，控件是否存在需要实测；找不到就如实记录，不阻塞提交
+      const ratioStep = plan.params.ratio
+        ? await chooseOption(contents, DOLA_SELECTORS.ratioControl, plan.params.ratio)
+        : { ok: true, skipped: true, reason: "未设置比例" };
+      steps.push({ step: "chooseRatio", ...ratioStep });
 
       const uploadStep = await attachImages(contents, plan.uploads);
       steps.push({ step: "attachImages", ...uploadStep });
@@ -306,20 +357,36 @@ function createDolaDriver(options = {}) {
       const stateRead = await evaluate(contents, STEP_READ_STATE);
       steps.push({ step: "readState", ...stateRead });
 
+      // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
+      const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
+
+      // 关键补漏：此前只写入了内容却没有真正点击发送，因此永远等不到任务 ID
+      const sendStep = await evaluate(contents, STEP_SEND);
+      steps.push({ step: "send", ...sendStep });
+      if (!sendStep?.ok) {
+        return {
+          outcome: "failed",
+          message: `${sendStep?.reason || "点击发送失败"}；页面候选控件：${(sendStep?.candidates || []).join(" | ") || "无"}`,
+          steps,
+        };
+      }
+
       const watched = await watcher;
       if (watched.taskId) {
         return {
           outcome: "ok",
           platformTaskId: watched.taskId,
           state: "queued",
-          message: "已从平台响应中取得任务 ID",
+          message: "已点击发送，并从平台响应中取得任务 ID",
           steps,
         };
       }
       // 关键：没有确认到任务 ID 就绝不当作已提交，交由编排层标记「提交结果待确认」
       return {
         outcome: "unknown",
-        message: watched.error || "未能在超时时间内确认平台任务 ID，未重复提交",
+        message: `${watched.error || "已点击发送，但未在超时时间内确认平台任务 ID"}，未重复提交；发送按钮命中：${
+          sendStep?.clicked || "未知"
+        }`,
         observedIds: watched.ids,
         steps,
       };

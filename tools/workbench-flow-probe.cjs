@@ -63,6 +63,27 @@ app.setPath = (name, value) =>
     : nativeSetPath(name, value);
 app.setPath("userData", appDataDir);
 
+// 造 3 个占位账号：只为验证「多选账号 / 批量入队 / 提交预览」的界面与数据链路，
+// 全程不调用 task.execute，因此不会有任何真实提交、不消耗任何额度。
+try {
+  fs.writeFileSync(
+    path.join(appDataDir, "accounts.json"),
+    `${JSON.stringify(
+      {
+        accounts: [
+          { id: "probe-acct-001", name: "探针账号A", platform: "dola" },
+          { id: "probe-acct-002", name: "探针账号B", platform: "dola" },
+          { id: "probe-acct-003", name: "探针账号C", platform: "dola" },
+        ],
+      },
+      null,
+      2
+    )}\n`
+  );
+} catch (error) {
+  report.diagnostics.push({ label: "写占位账号", error: error.message });
+}
+
 app.on("web-contents-created", (_event, contents) => {
   contents.on("console-message", (_e, level, message) => {
     // level 3 = error
@@ -333,6 +354,177 @@ function makeFixture(file) {
   );
   check("渲染层未产生控制台错误", report.consoleErrors.length === 0, report.consoleErrors.slice(0, 3));
   check("渲染层未出现 preload / 加载失败", report.pageErrors.length === 0, report.pageErrors.slice(0, 3));
+
+  // ── 10. 比例可选 / 提示词框加大（用户反馈项） ──
+  report.steps.fixes = {};
+  const defaultsInfo = await js(`(() => {
+    const selects = [...document.querySelectorAll('#workbenchDefaults select')];
+    if (selects.length < 3) return { count: selects.length };
+    const ratio = selects[2];
+    return {
+      count: selects.length,
+      ratioDisabled: ratio.disabled,
+      ratioOptions: [...ratio.options].map((o) => o.value),
+      ratioValue: ratio.value,
+      notes: [...document.querySelectorAll('#workbenchDefaults .workbench-unknown')].map((n) => n.textContent),
+    };
+  })()`);
+  report.steps.fixes.defaults = defaultsInfo;
+  check("全局默认参数含比例下拉", defaultsInfo.count >= 3, defaultsInfo);
+  check("比例下拉可选（不再被禁用）", defaultsInfo.ratioDisabled === false, defaultsInfo);
+  check("比例下拉提供多个常见候选值", (defaultsInfo.ratioOptions || []).length >= 4, defaultsInfo.ratioOptions);
+  check(
+    "比例旁仍标注平台能力未核实",
+    (defaultsInfo.notes || []).some((t) => String(t).includes("未核实")),
+    defaultsInfo.notes
+  );
+
+  const promptBox = await js(`(() => {
+    const ta = document.querySelector('.workbench-sb-prompt');
+    if (!ta) return null;
+    const style = getComputedStyle(ta);
+    return { minHeight: style.minHeight, fontSize: style.fontSize };
+  })()`);
+  report.steps.fixes.promptBox = promptBox;
+  check("提示词输入框已放大（最小高度 >= 200px）", promptBox && parseFloat(promptBox.minHeight) >= 200, promptBox);
+
+  // ── 11. 执行账号改为多选 ──
+  const accountPicks = await js(`(() => {
+    const host = document.getElementById('workbenchAccountPicks');
+    if (!host) return { boxes: 0, checked: 0, names: [], note: '' };
+    const boxes = [...host.querySelectorAll('input[type="checkbox"]')];
+    return {
+      boxes: boxes.length,
+      checked: boxes.filter((b) => b.checked).length,
+      names: [...host.querySelectorAll('.workbench-account-name')].map((n) => n.textContent),
+      note: document.getElementById('workbenchAccountNote')?.textContent || '',
+    };
+  })()`);
+  report.steps.fixes.accounts = accountPicks;
+  check("账号已是多选复选框列表", accountPicks.boxes >= 3, accountPicks);
+  check("默认至少勾选一个账号", accountPicks.checked >= 1, accountPicks.checked);
+  check("账号来自本机账号列表（只读）", accountPicks.names.includes("探针账号A"), accountPicks.names);
+
+  // ── 12. @图片绑定后视觉同步（用户反馈「艾特过后未关联」） ──
+  const reimported = await js(
+    `window.managerWorkbenchAPI.asset.importPaths(${JSON.stringify(projectId)}, [${JSON.stringify(fixture.file)}])`
+  );
+  check(
+    "重新导入素材以便验证 @ 绑定（已删过，故可能复用）",
+    reimported.imported.length + reimported.reused.length === 1,
+    reimported
+  );
+  await js(`document.getElementById('showWorkbench').click()`);
+  await delay(700);
+  check("素材列表已重新出现素材", (await js(`document.querySelectorAll('.workbench-asset').length`)) >= 1);
+
+  // 在第一条分镜里输入 @（此刻自动保存仍在防抖窗口内，正是会出问题的时序）
+  const typed = await js(`(() => {
+    const ta = document.querySelector('.workbench-sb-prompt');
+    if (!ta) return { ok: false };
+    ta.focus();
+    ta.value = ${JSON.stringify("镜头推进 @")};
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return { ok: true, value: ta.value };
+  })()`);
+  await delay(150);
+  const mentionVisible = await js(`!document.getElementById('workbenchMentionModal').classList.contains('hidden')`);
+  check("输入 @ 会弹出素材选择器", mentionVisible === true, typed);
+  const clickedRow = await js(`(() => {
+    const row = document.querySelector('#workbenchMentionList .workbench-mention-row');
+    if (!row) return false;
+    row.click();
+    return true;
+  })()`);
+  check("素材选择器里能点选素材", clickedRow === true);
+  // 等到超过自动保存防抖时间再看：若旧值仍会覆盖，这里就会看到裸 @
+  await delay(1200);
+  const afterBind = await js(`(() => {
+    const ta = document.querySelector('.workbench-sb-prompt');
+    return {
+      textareaValue: ta ? ta.value : '',
+      chips: document.querySelectorAll('.workbench-ref-chip').length,
+      chipText: document.querySelector('.workbench-ref-chip')?.textContent || '',
+    };
+  })()`);
+  report.steps.fixes.afterBind = afterBind;
+  check("@绑定后提示词输入框里出现 @图 标记", String(afterBind.textareaValue).includes("@图"), afterBind.textareaValue);
+  check("@绑定后不再是裸 @ 结尾", !String(afterBind.textareaValue).trim().endsWith("@"), afterBind.textareaValue);
+  check("@绑定后出现引用标签", afterBind.chips >= 1, afterBind.chipText);
+
+  // ── 13. 粘贴导入通道（剪贴板图片走 base64） ──
+  const pasteBase64 = fs.readFileSync(fixture.file).toString("base64");
+  const pasted = await js(
+    `window.managerWorkbenchAPI.asset.importBuffers(${JSON.stringify(projectId)}, [{ name: "探针粘贴图片", ext: ".png", base64: ${JSON.stringify(
+      pasteBase64
+    )} }])`
+  );
+  report.steps.fixes.paste = { imported: pasted.imported.length, reused: pasted.reused.length, failed: pasted.failed };
+  check(
+    "粘贴导入通道可用（base64 → 素材库）",
+    pasted.imported.length + pasted.reused.length === 1 && pasted.failed.length === 0,
+    pasted
+  );
+
+  // ── 14. 批量账号提交预览（只预览，绝不点确认，不消耗额度） ──
+  await js(`(() => { document.querySelector('#workbenchAccountNote [data-act="accounts-all"]')?.click(); })()`);
+  await delay(250);
+  const allChecked = await js(
+    `[...document.querySelectorAll('#workbenchAccountPicks input[type="checkbox"]')].filter((b) => b.checked).length`
+  );
+  check("「全选」勾上了全部账号", allChecked === 3, allChecked);
+
+  await js(`(() => { document.querySelector('.workbench-sb .workbench-run-button')?.click(); })()`);
+  await delay(1800);
+  const runModal = await js(`(() => {
+    const modal = document.getElementById('workbenchRunModal');
+    return {
+      visible: !modal.classList.contains('hidden'),
+      status: document.getElementById('workbenchRunStatus')?.textContent ?? null,
+      rows: [...document.querySelectorAll('#workbenchRunPreview .workbench-run-row')].map((r) => r.textContent),
+    };
+  })()`);
+  report.steps.fixes.runModal = runModal;
+  check("点「生成这一条」会打开提交确认，而不是毫无反应", runModal.visible === true, runModal);
+  check(
+    "确认框列出了被勾选的全部账号（一账号一条尝试）",
+    (runModal.rows || []).some((t) => t.includes("探针账号A") && t.includes("探针账号C")),
+    runModal.rows
+  );
+  check("确认框内有可见的状态位，提交时不再静默", runModal.status !== null, runModal.status);
+  await js(`(() => { document.querySelector('#workbenchRunModal [data-close]')?.click(); })()`);
+  await delay(300);
+
+  // ── 15. 驱动步骤落库后能被界面展示（「卡在哪一步」可见） ──
+  const probeTasksFile = path.join(projectDir, "tasks.json");
+  const probeTasksDoc = JSON.parse(fs.readFileSync(probeTasksFile, "utf8"));
+  probeTasksDoc.tasks[0].driver = {
+    outcome: "failed",
+    message: "页面上找不到发送按钮，无法提交生成",
+    at: new Date().toISOString(),
+    steps: [
+      { step: "setPrompt", ok: true, detail: "已写入提示词" },
+      { step: "send", ok: false, detail: "页面上找不到发送按钮，无法提交生成" },
+    ],
+    candidates: ["label:发送", "toolbar-tail:button"],
+  };
+  fs.writeFileSync(probeTasksFile, `${JSON.stringify(probeTasksDoc, null, 2)}\n`);
+  await js(`document.getElementById('showWorkbench').click()`);
+  await delay(1000);
+  const stepView = await js(`(() => {
+    const box = document.querySelector('.workbench-task-steps');
+    return {
+      count: document.querySelectorAll('.workbench-task-steps').length,
+      text: box ? box.textContent : '',
+      bad: document.querySelectorAll('.workbench-step-bad').length,
+      candidates: document.querySelector('.workbench-step-cands')?.textContent || '',
+    };
+  })()`);
+  report.steps.fixes.stepView = stepView;
+  check("任务卡片展示提交步骤", stepView.count >= 1, stepView);
+  check("失败步骤被单独标出并写明步骤名", stepView.bad >= 1 && stepView.text.includes("点击发送"), stepView.text);
+  check("失败步骤带上页面候选控件清单", stepView.candidates.includes("label:发送"), stepView.candidates);
 
   await delay(800);
   check("隔离内未出现越界写入（报告目录仍在隔离根内）", reportPath.startsWith(exeDir));

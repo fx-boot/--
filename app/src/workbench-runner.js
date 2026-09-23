@@ -36,6 +36,35 @@ function classifyBlock(message) {
   return null;
 }
 
+/** 每一步的可见说明：优先取失败原因 / 实际命中项，成功也给一句人话 */
+function stepDetail(s) {
+  if (s?.reason) return String(s.reason);
+  if (s?.picked) return `已选择 ${s.picked}`;
+  if (s?.clicked) return `命中控件：${s.clicked}`;
+  if (Number(s?.count)) return `已上传 ${s.count} 张参考图`;
+  if (s?.skipped) return "已跳过";
+  if (s?.step === "setPrompt") return "已写入提示词";
+  if (s?.step === "readState") return "已读取页面状态";
+  return "";
+}
+
+/** 把驱动层返回的步骤整理成可落库、可展示的形式（界面据此给出可见反馈） */
+function summarizeDriver(submitted) {
+  const list = Array.isArray(submitted?.steps) ? submitted.steps : [];
+  const sendStep = list.find((s) => s?.step === "send");
+  return {
+    outcome: String(submitted?.outcome || "").slice(0, 20),
+    message: String(submitted?.message || "").slice(0, 500),
+    at: new Date().toISOString(),
+    steps: list.slice(0, 20).map((s) => ({
+      step: String(s?.step || "").slice(0, 40),
+      ok: s?.ok !== false,
+      detail: stepDetail(s).slice(0, 200),
+    })),
+    candidates: (sendStep?.candidates || submitted?.candidates || []).slice(0, 12).map((c) => String(c).slice(0, 120)),
+  };
+}
+
 function createRunner(options = {}) {
   const taskStore = options.taskStore;
   const driver = options.driver;
@@ -164,6 +193,12 @@ function createRunner(options = {}) {
 
       const submitted = await driver.submit({ accountId: record.accountId, plan, attempt: record });
       const outcome = String(submitted?.outcome || (submitted?.platformTaskId ? "ok" : "unknown"));
+
+      // 先把驱动层的逐步结果落库，界面即使失败也能看到「卡在哪一步、页面上有哪些候选控件」
+      await patch(projectId, attemptId, (r) => {
+        r.driver = summarizeDriver(submitted);
+        return r;
+      });
 
       if (outcome === "failed") {
         const rule = classifyBlock(submitted?.message);
@@ -445,4 +480,4 @@ function createRunner(options = {}) {
   };
 }
 
-module.exports = { ACCOUNT_BLOCK_PATTERNS, classifyBlock, createRunner };
+module.exports = { ACCOUNT_BLOCK_PATTERNS, classifyBlock, createRunner, summarizeDriver };

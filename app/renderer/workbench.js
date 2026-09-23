@@ -19,12 +19,14 @@
     project: null,
     assets: [],
     capabilities: null,
+    ratioOptions: [],
     limits: null,
     accounts: [],
     tasks: [],
     queue: null,
-    selectedAccountId: "",
-    run: { storyboardId: "", attemptId: "" },
+    // 执行账号可多选：一次为每个勾选账号各建一条尝试
+    selectedAccountIds: [],
+    run: { storyboardId: "", accountIds: [] },
     search: "",
     saveTimers: new Map(),
     // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
@@ -99,6 +101,7 @@
           project: snapshot.project,
           assets: snapshot.assets,
           capabilities: snapshot.capabilities,
+          ratioOptions: snapshot.ratioOptions || [],
           limits: snapshot.limits,
           accounts: snapshot.accounts || [],
           tasks: snapshot.tasks || [],
@@ -321,6 +324,62 @@
     }
   }
 
+  /** 剪贴板图片没有文件路径，只能按 MIME 推断扩展名 */
+  const MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+  };
+
+  function readAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const comma = result.indexOf(",");
+        resolve(comma >= 0 ? result.slice(comma + 1) : "");
+      };
+      reader.onerror = () => reject(reader.error || new Error("读取剪贴板图片失败"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  /** 直接把剪贴板里的图片存进素材库（不写临时文件，走 base64 通道） */
+  async function importClipboardImages(files) {
+    if (!state.project) {
+      toast("请先新建或选择项目", "error");
+      return;
+    }
+    const stamp = formatTime(new Date()).replace(/:/g, "");
+    const items = [];
+    for (const [index, file] of files.entries()) {
+      const ext = MIME_EXT[file.type] || (/\.[a-z0-9]+$/i.exec(file.name || "")?.[0] || "").toLowerCase();
+      if (!ext) {
+        toast(`不支持的图片格式：${file.type || file.name || "未知"}`, "error");
+        continue;
+      }
+      const base64 = await readAsBase64(file);
+      if (!base64) continue;
+      items.push({ name: `粘贴图片 ${stamp}-${index + 1}`, ext, base64 });
+    }
+    if (!items.length) return;
+    try {
+      const result = await api.asset.importBuffers(projectId(), items);
+      const parts = [];
+      if (result.imported.length) parts.push(`新增 ${result.imported.length} 张`);
+      if (result.reused.length) parts.push(`复用已有 ${result.reused.length} 张（内容相同）`);
+      if (result.failed.length) parts.push(`失败 ${result.failed.length} 张`);
+      toast(`粘贴导入：${parts.join("，") || "没有导入任何图片"}`, result.failed.length ? "error" : "info");
+      for (const item of result.failed) toast(`${item.file}：${item.message}`, "error");
+      state.thumbCache.clear();
+      await refresh();
+    } catch (error) {
+      toast(`粘贴导入失败：${error.message}`, "error");
+    }
+  }
+
   async function deleteAsset(assetId, resolution) {
     try {
       const result = await api.asset.remove(projectId(), [assetId], resolution);
@@ -416,14 +475,21 @@
     duration.value = String(defaults.duration);
     host.appendChild(field("时长", duration));
 
+    // 比例：平台能力表里没有 ratios，所以给「常见值」供选择并明确标注未核实
     const ratio = document.createElement("select");
-    ratio.disabled = true;
     ratio.dataset.focusKey = "default:ratio";
-    const placeholder = document.createElement("option");
-    placeholder.value = defaults.ratio;
-    placeholder.textContent = "平台比例能力未核实";
-    ratio.appendChild(placeholder);
+    ratioOptions(defaults.ratio).forEach((value) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      ratio.appendChild(option);
+    });
+    ratio.value = defaults.ratio;
     host.appendChild(field("比例", ratio));
+    const ratioNote = document.createElement("span");
+    ratioNote.className = "workbench-unknown";
+    ratioNote.textContent = "平台比例能力未核实，是否生效以平台结果为准";
+    host.appendChild(ratioNote);
 
     const refLimit = document.createElement("span");
     refLimit.className = "workbench-unknown";
@@ -445,6 +511,15 @@
     };
     model.addEventListener("change", onChange);
     duration.addEventListener("change", onChange);
+    ratio.addEventListener("change", onChange);
+  }
+
+  /** 比例候选：主进程给的常见值 + 当前值（保证历史项目里已有的值也能选中） */
+  function ratioOptions(current) {
+    const list = (state.ratioOptions || []).slice();
+    if (current && !list.includes(current)) list.unshift(current);
+    if (!list.length) list.push("16:9");
+    return list;
   }
 
   function field(name, control) {
@@ -460,6 +535,16 @@
   // ── 执行账号与任务 ───────────────────────────────────────
   const statusLabel = (status) => state.statusLabels?.[status] || status;
   const downloadLabel = (status) => state.downloadLabels?.[status] || status;
+  // 驱动层步骤的中文名，与 workbench-dola-driver 里的 step 字段一一对应
+  const STEP_LABEL = {
+    setPrompt: "写入提示词",
+    chooseModel: "选择模型",
+    chooseDuration: "选择时长",
+    chooseRatio: "设置比例",
+    attachImages: "附加参考图",
+    readState: "读取页面状态",
+    send: "点击发送",
+  };
   const ACTIVE_STATUSES = ["pending", "submitting", "queued", "generating"];
   const isActiveStatus = (status) => ACTIVE_STATUSES.includes(status);
 
@@ -468,49 +553,79 @@
   }
 
   function renderAccounts() {
-    const select = $("workbenchAccountSelect");
+    const host = $("workbenchAccountPicks");
     const note = $("workbenchAccountNote");
-    if (!select) return;
+    if (!host) return;
     const accounts = state.accounts || [];
+    host.innerHTML = "";
+
     if (!accounts.length) {
-      select.innerHTML = "";
-      const option = document.createElement("option");
-      option.value = "";
-      option.textContent = "（没有可执行账号）";
-      select.appendChild(option);
+      host.appendChild(emptyDiv("（没有可执行账号）"));
       if (note) note.textContent = "未读到任何账号。账号来自本机既有账号列表，工作台不会新建或修改账号。";
       return;
     }
-    if (!accounts.some((a) => a.id === state.selectedAccountId)) {
-      state.selectedAccountId = accounts[0].id;
-    }
-    select.innerHTML = "";
+
+    // 账号集合变化时剔除失效选择；首次进入默认勾选第一个，避免「一个都没选」的困惑
+    const valid = new Set(accounts.map((a) => a.id));
+    state.selectedAccountIds = state.selectedAccountIds.filter((id) => valid.has(id));
+    if (!state.selectedAccountIds.length) state.selectedAccountIds = [accounts[0].id];
+    const picked = new Set(state.selectedAccountIds);
+
     for (const account of accounts) {
-      const option = document.createElement("option");
-      option.value = account.id;
-      option.textContent = `${account.name}${account.blocked ? "（已暂停）" : ""} · 执行中 ${account.activeTasks}`;
-      select.appendChild(option);
+      const row = document.createElement("label");
+      row.className = "workbench-account-pick";
+      row.dataset.accountId = account.id;
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = account.id;
+      box.checked = picked.has(account.id);
+      box.dataset.focusKey = `account:${account.id}`;
+      box.dataset.act = "account-toggle";
+      row.appendChild(box);
+
+      const name = document.createElement("span");
+      name.className = "workbench-account-name";
+      name.textContent = account.name;
+      row.appendChild(name);
+
+      const meta = document.createElement("em");
+      meta.textContent = account.blocked ? "已暂停" : `执行中 ${account.activeTasks}`;
+      row.appendChild(meta);
+
+      if (account.blocked) {
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "text-button";
+        clear.dataset.act = "clear-block";
+        clear.dataset.accountId = account.id;
+        clear.textContent = "解除暂停";
+        row.appendChild(clear);
+      }
+      host.appendChild(row);
     }
-    select.value = state.selectedAccountId;
 
     if (!note) return;
     note.innerHTML = "";
-    const current = accounts.find((a) => a.id === state.selectedAccountId);
+    const blocked = accounts.filter((a) => picked.has(a.id) && a.blocked);
     const line = document.createElement("span");
-    if (current?.blocked) {
-      line.textContent = `已暂停：${current.blocked.label}（${current.blocked.message || "无详情"}）`;
-    } else {
+    line.textContent = blocked.length
+      ? `已选 ${picked.size} 个账号，其中 ${blocked.length} 个已暂停：${blocked
+          .map((a) => `${a.name}（${a.blocked.label}）`)
+          .join("、")}`
       // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
-      line.textContent = `登录状态：未知 · 额度：未知 · 执行中任务：${current?.activeTasks ?? 0}`;
-    }
+      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 每个账号各生成一条`;
     note.appendChild(line);
-    if (current?.blocked) {
-      const clear = document.createElement("button");
-      clear.type = "button";
-      clear.className = "text-button";
-      clear.dataset.act = "clear-block";
-      clear.textContent = "解除暂停";
-      note.appendChild(clear);
+    for (const [act, label] of [
+      ["accounts-all", "全选"],
+      ["accounts-none", "清空"],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "text-button";
+      button.dataset.act = act;
+      button.textContent = label;
+      note.appendChild(button);
     }
   }
 
@@ -579,6 +694,32 @@
       card.appendChild(error);
     }
 
+    // 驱动层逐步结果：让「点了生成没反应」变成「卡在第几步、页面上有哪些候选控件」
+    const steps = record.driver?.steps || [];
+    if (steps.length) {
+      const box = document.createElement("details");
+      box.className = "workbench-task-steps";
+      const summary = document.createElement("summary");
+      const badCount = steps.filter((s) => s.ok === false).length;
+      summary.textContent = `提交步骤（${steps.length} 步${badCount ? `，${badCount} 步未成功` : "，全部成功"}）`;
+      box.appendChild(summary);
+      for (const step of steps) {
+        const row = document.createElement("div");
+        row.className = step.ok === false ? "workbench-step-bad" : "";
+        row.textContent = `${step.ok === false ? "✕" : "✓"} ${STEP_LABEL[step.step] || step.step}${
+          step.detail ? ` · ${step.detail}` : ""
+        }`;
+        box.appendChild(row);
+      }
+      if (record.driver?.candidates?.length) {
+        const row = document.createElement("div");
+        row.className = "workbench-step-cands";
+        row.textContent = `页面候选控件：${record.driver.candidates.join(" | ")}`;
+        box.appendChild(row);
+      }
+      card.appendChild(box);
+    }
+
     // 状态变化日志：只展示本工作台记录的阶段与脱敏摘要，不含 Cookie / Token
     const log = document.createElement("details");
     log.className = "workbench-task-log";
@@ -623,15 +764,21 @@
     return card;
   }
 
-  function runPreview(host, preview) {
+  function accountName(accountId) {
+    return state.accounts.find((a) => a.id === accountId)?.name || accountId;
+  }
+
+  function runPreview(host, previews) {
     host.innerHTML = "";
+    const list = Array.isArray(previews) ? previews : [previews];
+    const first = list[0] || { params: {}, uploads: [], errors: [], limitations: [], promptPreview: "" };
     const rows = [
       ["分镜", state.project?.storyboards?.find((s) => s.id === state.run.storyboardId)?.name || ""],
-      ["模型", preview.params.model || "(未设置)"],
-      ["时长", preview.params.duration || "(未设置)"],
-      ["比例", preview.params.ratio ? `${preview.params.ratio}（平台比例能力未核实，不会提交）` : "(未设置)"],
-      ["参考图片", preview.uploads.length ? `${preview.uploads.length} 张` : "无"],
-      ["执行账号", state.accounts.find((a) => a.id === preview.accountId)?.name || preview.accountId],
+      ["模型", first.params.model || "(未设置)"],
+      ["时长", first.params.duration || "(未设置)"],
+      ["比例", first.params.ratio ? `${first.params.ratio}（平台比例能力未核实）` : "(未设置)"],
+      ["参考图片", first.uploads.length ? `${first.uploads.length} 张` : "无"],
+      ["执行账号", list.map((item) => accountName(item.accountId)).join("、")],
     ];
     for (const [name, value] of rows) {
       const row = document.createElement("div");
@@ -646,21 +793,29 @@
     }
     const prompt = document.createElement("div");
     prompt.className = "workbench-run-prompt";
-    prompt.textContent = preview.promptPreview || "(空提示词)";
+    prompt.textContent = first.promptPreview || "(空提示词)";
     host.appendChild(prompt);
 
-    if (preview.errors.length) {
+    // 逐账号说明：每个勾选的账号都会各建一条尝试，能提交的先提交，不能提交的列出来
+    const bad = list.filter((item) => !item.valid);
+    if (bad.length) {
       const box = document.createElement("div");
       box.className = "workbench-run-errors";
-      box.textContent = `无法提交：${preview.errors.join("；")}`;
+      box.textContent = `以下账号无法提交：${bad
+        .map((item) => `${accountName(item.accountId)}（${item.errors.join("；")}）`)
+        .join("；")}`;
       host.appendChild(box);
     }
-    if (preview.limitations.length) {
+    if (first.limitations.length) {
       const box = document.createElement("div");
       box.className = "workbench-run-notes";
-      box.textContent = `平台限制说明：${preview.limitations.join("；")}`;
+      box.textContent = `平台限制说明：${first.limitations.join("；")}`;
       host.appendChild(box);
     }
+    const status = document.createElement("div");
+    status.className = "workbench-run-status";
+    status.id = "workbenchRunStatus";
+    host.appendChild(status);
   }
 
   // ── 分镜 ─────────────────────────────────────────────────
@@ -825,12 +980,24 @@
     overrideBox.appendChild(field("时长", durationSelect));
 
     const ratioSelect = document.createElement("select");
-    ratioSelect.disabled = true;
-    const ratioOption = document.createElement("option");
-    ratioOption.value = storyboard.overrides?.ratio || "";
-    ratioOption.textContent = "平台比例能力未核实";
-    ratioSelect.appendChild(ratioOption);
+    ratioSelect.dataset.act = "override-ratio";
+    const inheritRatio = document.createElement("option");
+    inheritRatio.value = "";
+    inheritRatio.textContent = "继承全局";
+    ratioSelect.appendChild(inheritRatio);
+    ratioOptions(storyboard.overrides?.ratio).forEach((value) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      ratioSelect.appendChild(option);
+    });
+    ratioSelect.value = storyboard.overrides?.ratio || "";
     overrideBox.appendChild(field("比例", ratioSelect));
+
+    const ratioNote = document.createElement("span");
+    ratioNote.className = "workbench-unknown";
+    ratioNote.textContent = "比例能力未核实";
+    overrideBox.appendChild(ratioNote);
 
     card.appendChild(overrideBox);
 
@@ -940,13 +1107,22 @@
     try {
       const result = await api.storyboard.bind(projectId(), storyboardId, assetId, { prompt, caret });
       state.lastSaved = formatTime(new Date());
+      // 绑定后服务端会重写提示词（把 @图N 插到光标处）：
+      // 必须先丢掉本地未落盘的旧值与待保存定时器，否则重渲染会用旧文本覆盖，视觉上就像「没关联」
+      state.pendingValues.delete(`sb-prompt:${storyboardId}`);
+      const timer = state.saveTimers.get(`${storyboardId}:prompt`);
+      if (timer) {
+        clearTimeout(timer);
+        state.saveTimers.delete(`${storyboardId}:prompt`);
+      }
       await refresh();
       if (!result.added) return toast("该素材已经引用过了");
-      // 把光标放到 token 之后，继续输入更顺手
+      // 把 textarea 同步成服务端返回的文本，并把光标放到 token 之后，继续输入更顺手
       const node = document.querySelector(`[data-focus-key="sb-prompt:${storyboardId}"]`);
-      if (node && Number.isInteger(result.caret)) {
+      if (node) {
+        if (typeof result.storyboard?.prompt === "string") node.value = result.storyboard.prompt;
         node.focus();
-        node.setSelectionRange(result.caret, result.caret);
+        if (Number.isInteger(result.caret)) node.setSelectionRange(result.caret, result.caret);
       }
     } catch (error) {
       toast(`插入参考图片失败：${error.message}`, "error");
@@ -1086,6 +1262,19 @@
       });
     }
 
+    // 粘贴导入：工作台打开时，Ctrl+V 里有图片就存进素材库（纯文字粘贴不受影响）
+    document.addEventListener("paste", async (event) => {
+      const modal = $("workbenchModal");
+      if (!modal || modal.classList.contains("hidden")) return;
+      const files = Array.from(event.clipboardData?.items || [])
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+      if (!files.length) return;
+      event.preventDefault();
+      await importClipboardImages(files);
+    });
+
     $("workbenchAssetList")?.addEventListener("click", async (event) => {
       const button = event.target.closest("[data-act]");
       if (!button) return;
@@ -1104,7 +1293,14 @@
       if (act === "insert") {
         const target = state.focusedStoryboardId || state.project?.storyboards?.[0]?.id;
         if (!target) return toast("请先新增一个分镜", "error");
-        state.mention = { storyboardId: target, prompt: null, caret: null, search: "" };
+        // 用输入框里的实时文本与光标，而不是等防抖落盘的旧值，否则刚打的字会被丢掉
+        const node = document.querySelector(`[data-focus-key="sb-prompt:${target}"]`);
+        state.mention = {
+          storyboardId: target,
+          prompt: node ? node.value : null,
+          caret: node ? node.selectionStart : null,
+          search: "",
+        };
         await bindFromMention(assetId);
         return;
       }
@@ -1181,9 +1377,27 @@
       renderMention();
     });
 
-    $("workbenchAccountSelect")?.addEventListener("change", (event) => {
-      state.selectedAccountId = event.target.value;
+    $("workbenchAccountPicks")?.addEventListener("change", (event) => {
+      const box = event.target.closest('input[type="checkbox"][data-act="account-toggle"]');
+      if (!box) return;
+      const id = box.value;
+      const set = new Set(state.selectedAccountIds);
+      if (box.checked) set.add(id);
+      else set.delete(id);
+      state.selectedAccountIds = [...set];
       renderAccounts();
+    });
+
+    $("workbenchAccountPicks")?.addEventListener("click", async (event) => {
+      const clear = event.target.closest('[data-act="clear-block"]');
+      if (!clear) return;
+      try {
+        await api.account.clearBlock(clear.dataset.accountId);
+        await refresh();
+        toast("已解除账号暂停");
+      } catch (error) {
+        toast(`解除失败：${error.message}`, "error");
+      }
     });
 
     $("workbenchQueuePause")?.addEventListener("click", async () => {
@@ -1208,29 +1422,53 @@
 
     $("workbenchRunConfirm")?.addEventListener("click", async () => {
       const confirm = $("workbenchRunConfirm");
-      if (confirm) confirm.disabled = true;
+      const accountIds = state.run.accountIds.slice();
+      if (!accountIds.length) return toast("请先勾选执行账号", "error");
+      const original = confirm.textContent;
+      confirm.disabled = true;
+      confirm.textContent = "提交中…";
+      const failed = [];
+      let done = 0;
       try {
-        const created = await api.task.enqueue(projectId(), state.run.storyboardId, state.selectedAccountId);
+        for (const [index, accountId] of accountIds.entries()) {
+          const status = $("workbenchRunStatus");
+          if (status) {
+            status.textContent = `正在提交第 ${index + 1}/${accountIds.length} 个账号（真实提交，请勿关闭窗口）…`;
+          }
+          try {
+            const created = await api.task.enqueue(projectId(), state.run.storyboardId, accountId);
+            await refresh();
+            await api.task.execute(projectId(), created.attempt.id);
+            done++;
+          } catch (error) {
+            failed.push(`${accountName(accountId)}：${error.message}`);
+          }
+        }
+        await refresh();
         closeModal("workbenchRunModal");
-        await refresh();
-        toast(`已入队第 ${created.attempt.attempt} 次尝试，开始提交`);
-        await api.task.execute(projectId(), created.attempt.id);
-        await refresh();
+        if (failed.length) {
+          toast(`已提交 ${done} 个账号，${failed.length} 个失败`, "error");
+          for (const item of failed) toast(item, "error");
+        } else {
+          toast(`已为 ${done} 个账号提交，任务卡片里有逐步结果`, "ok");
+        }
       } catch (error) {
         toast(`提交失败：${error.message}`, "error");
       } finally {
-        if (confirm) confirm.disabled = false;
+        confirm.disabled = false;
+        confirm.textContent = original;
       }
     });
 
-    $("workbenchAccountNote")?.addEventListener("click", async (event) => {
-      if (!event.target.closest('[data-act="clear-block"]')) return;
-      try {
-        await api.account.clearBlock(state.selectedAccountId);
-        await refresh();
-        toast("已解除账号暂停");
-      } catch (error) {
-        toast(`解除失败：${error.message}`, "error");
+    $("workbenchAccountNote")?.addEventListener("click", (event) => {
+      if (event.target.closest('[data-act="accounts-all"]')) {
+        state.selectedAccountIds = (state.accounts || []).map((a) => a.id);
+        renderAccounts();
+        return;
+      }
+      if (event.target.closest('[data-act="accounts-none"]')) {
+        state.selectedAccountIds = [];
+        renderAccounts();
       }
     });
 
@@ -1295,10 +1533,12 @@
       if (!card) return;
       const storyboardId = card.dataset.sbId;
       const act = event.target.dataset.act;
-      if (act !== "override-model" && act !== "override-duration") return;
+      if (act !== "override-model" && act !== "override-duration" && act !== "override-ratio") return;
       const patch = act === "override-model"
         ? { model: event.target.value }
-        : { duration: event.target.value };
+        : act === "override-duration"
+          ? { duration: event.target.value }
+          : { ratio: event.target.value };
       try {
         await api.storyboard.update(projectId(), storyboardId, { overrides: patch });
         state.lastSaved = formatTime(new Date());
@@ -1339,12 +1579,16 @@
           return;
         }
         if (act === "run") {
-          if (!state.selectedAccountId) return toast("请先选择执行账号", "error");
-          const preview = await api.task.preview(projectId(), storyboardId, state.selectedAccountId);
-          state.run = { storyboardId, attemptId: "" };
-          runPreview($("workbenchRunPreview"), preview);
+          const accountIds = state.selectedAccountIds.slice();
+          if (!accountIds.length) return toast("请先勾选执行账号（可多选）", "error");
+          state.run = { storyboardId, accountIds };
+          const previews = [];
+          for (const accountId of accountIds) {
+            previews.push(await api.task.preview(projectId(), storyboardId, accountId));
+          }
+          runPreview($("workbenchRunPreview"), previews);
           const confirm = $("workbenchRunConfirm");
-          if (confirm) confirm.disabled = !preview.valid;
+          if (confirm) confirm.disabled = !previews.some((p) => p.valid);
           openModal("workbenchRunModal");
           return;
         }

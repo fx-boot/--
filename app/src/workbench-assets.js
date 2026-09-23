@@ -124,6 +124,45 @@ function createAssets(store) {
     }
   }
 
+  /** 落盘一张已经在内存里的图片；内容重复直接复用（assetId 由 sha256 派生） */
+  async function commitBuffer(projectId, catalog, buffer, ext, name) {
+    const { assets } = dirs(projectId);
+    const hash = sha256(buffer);
+    const existing = catalog.assets.find((a) => a.sha256 === hash);
+    if (existing) return { reused: true, view: publicView(existing) };
+
+    const id = `asset_${hash.slice(0, 12)}`;
+    const fileName = `${id}${ext}`;
+    // 先写临时文件再改名，避免出现半截素材
+    const targetTmp = safePath(assets, `${fileName}.tmp`);
+    const target = safePath(assets, fileName);
+    await fsp.writeFile(targetTmp, buffer);
+    await fsp.rename(targetTmp, target);
+
+    const asset = {
+      id,
+      name,
+      fileName,
+      ext,
+      bytes: buffer.length,
+      sha256: hash,
+      width: 0,
+      height: 0,
+      importedAt: new Date().toISOString(),
+      hasThumb: false,
+    };
+    try {
+      const { nativeImage } = require("electron");
+      const size = nativeImage.createFromPath(target).getSize();
+      asset.width = size.width || 0;
+      asset.height = size.height || 0;
+    } catch {}
+    asset.hasThumb = await buildThumb(projectId, asset);
+
+    catalog.assets.push(asset);
+    return { reused: false, view: publicView(asset) };
+  }
+
   /** 导入一批文件路径；返回 { imported, reused, failed } */
   async function importPaths(projectId, filePaths) {
     const { assets, catalog } = dirs(projectId);
@@ -141,47 +180,49 @@ function createAssets(store) {
         if (stat.size > MAX_BYTES) throw new Error(`超过 ${MAX_BYTES / 1024 / 1024}MB 上限`);
         const ext = path.extname(source).toLowerCase();
         if (!IMAGE_EXT.has(ext)) throw new Error(`不支持的图片格式 ${ext || "(无扩展名)"}`);
-
         const buffer = await fsp.readFile(source);
-        const hash = sha256(buffer);
-        const existing = current.assets.find((a) => a.sha256 === hash);
-        if (existing) {
-          reused.push(publicView(existing));
-          continue;
-        }
-
-        const id = `asset_${hash.slice(0, 12)}`;
-        const fileName = `${id}${ext}`;
-        // 先写临时文件再改名，避免出现半截素材
-        const targetTmp = safePath(assets, `${fileName}.tmp`);
-        const target = safePath(assets, fileName);
-        await fsp.writeFile(targetTmp, buffer);
-        await fsp.rename(targetTmp, target);
-
-        const asset = {
-          id,
-          name: path.basename(source, ext) || id,
-          fileName,
+        const result = await commitBuffer(
+          projectId,
+          current,
+          buffer,
           ext,
-          bytes: buffer.length,
-          sha256: hash,
-          width: 0,
-          height: 0,
-          importedAt: new Date().toISOString(),
-          hasThumb: false,
-        };
-        try {
-          const { nativeImage } = require("electron");
-          const size = nativeImage.createFromPath(target).getSize();
-          asset.width = size.width || 0;
-          asset.height = size.height || 0;
-        } catch {}
-        asset.hasThumb = await buildThumb(projectId, asset);
-
-        current.assets.push(asset);
-        imported.push(publicView(asset));
+          path.basename(source, ext) || `asset_${sha256(buffer).slice(0, 12)}`
+        );
+        (result.reused ? reused : imported).push(result.view);
       } catch (error) {
         failed.push({ file: path.basename(source), message: error.message });
+      }
+    }
+
+    if (imported.length) await writeCatalog(catalog, current);
+    return { imported, reused, failed };
+  }
+
+  /**
+   * 导入内存中的图片（例如从剪贴板粘贴）。
+   * 渲染层拿不到剪贴板图片的文件路径，所以走 base64 传输：
+   * items: [{ name, ext, base64 }]
+   */
+  async function importBuffers(projectId, items) {
+    const { assets, catalog } = dirs(projectId);
+    await fsp.mkdir(assets, { recursive: true });
+    const current = readCatalog(catalog);
+    const imported = [];
+    const reused = [];
+    const failed = [];
+
+    for (const item of items || []) {
+      const label = text(item?.name, 120) || "粘贴图片";
+      try {
+        const ext = text(item?.ext, 8).toLowerCase();
+        if (!IMAGE_EXT.has(ext)) throw new Error(`不支持的图片格式 ${ext || "(无扩展名)"}`);
+        const buffer = Buffer.from(String(item?.base64 || ""), "base64");
+        if (!buffer.length) throw new Error("图片内容为空");
+        if (buffer.length > MAX_BYTES) throw new Error(`超过 ${MAX_BYTES / 1024 / 1024}MB 上限`);
+        const result = await commitBuffer(projectId, current, buffer, ext, label);
+        (result.reused ? reused : imported).push(result.view);
+      } catch (error) {
+        failed.push({ file: label, message: error.message });
       }
     }
 
@@ -259,6 +300,7 @@ function createAssets(store) {
   return {
     IMAGE_EXT,
     findAsset,
+    importBuffers,
     importPaths,
     list,
     previewDataUrl,
