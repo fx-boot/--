@@ -28,12 +28,16 @@ const argValue = (flag, fallback = "") => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 const waitSeconds = Number(argValue("--seconds", "120"));
+const supervised = args.includes("--supervised");
 
 const ROOT = path.resolve(__dirname, "..");
 const runtimeDir = path.join(ROOT, "runtime", "dev");
 const exePath = path.join(runtimeDir, "豆包管理器.exe");
 const reportPath = path.join(runtimeDir, "boot-probe-report.json");
-const isolatedRoot = path.join(ROOT, "runtime", "isolation", `run-${Date.now()}`);
+const isolatedRoot = path.join(ROOT, "runtime", "isolation", supervised ? "stable" : `run-${Date.now()}`);
+/** 受控入口模式读 launch-record.json；探针模式读 boot-probe-report.json */
+const recordPath = supervised ? path.join(isolatedRoot, "launch-record.json") : reportPath;
+const entryFile = supervised ? "supervised-entry.cjs" : "boot-probe.cjs";
 
 /** 受监控目录：这些目录在任何情况下都不该被测试运行改动 */
 const WATCHED = [
@@ -101,7 +105,7 @@ function main() {
   }
 
   console.log("── 2/4 打包（注入隔离探针） ──");
-  const packed = spawnSync(process.execPath, [path.join(__dirname, "pack-app.cjs"), "--entry-file", path.join(__dirname, "boot-probe.cjs")], {
+  const packed = spawnSync(process.execPath, [path.join(__dirname, "pack-app.cjs"), "--entry-file", path.join(__dirname, entryFile)], {
     encoding: "utf8",
   });
   if (packed.status !== 0) throw new Error(`打包失败：${packed.stderr || packed.stdout}`);
@@ -109,42 +113,38 @@ function main() {
 
   console.log("── 3/4 以隔离参数启动 ──");
   try {
-    fs.unlinkSync(reportPath);
+    fs.unlinkSync(recordPath);
   } catch {}
-  const child = spawn(
-    exePath,
-    [`--user-data-dir=${chromiumDir}`],
-    {
-      cwd: runtimeDir,
-      env: { ...process.env, DBM_ISOLATED_ROOT: isolatedRoot },
-      stdio: "ignore",
-      detached: false,
-    }
-  );
+  const child = spawn(exePath, [`--user-data-dir=${chromiumDir}`], {
+    cwd: runtimeDir,
+    env: { ...process.env, DBM_ISOLATED_ROOT: isolatedRoot, DBM_CHROMIUM_DIR: chromiumDir },
+    stdio: "ignore",
+    detached: false,
+  });
   console.log(`  pid=${child.pid}  isolatedRoot=${isolatedRoot}`);
-  console.log("  等待探针报告…");
+  console.log(`  等待${supervised ? "受控入口记录" : "探针报告"}…`);
 
   const deadline = Date.now() + waitSeconds * 1000;
+  const settleSeconds = Number(argValue("--settle", "20"));
   const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  const waitForReport = () => {
-    if (fs.existsSync(reportPath)) return true;
-    if (Date.now() > deadline) return false;
-    sleepSync(500);
-    return null;
-  };
-  let found = null;
-  while (found === null) found = waitForReport();
-  if (!found) {
+  let record = null;
+  while (Date.now() < deadline) {
     try {
-      process.kill(child.pid);
+      const parsed = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+      // 受控入口先写一次（可能尚未 whenReady），等 mainLoaded 落定后再多留一点时间
+      if (!supervised || parsed.mainLoaded === true) {
+        record = parsed;
+        if (supervised) sleepSync(settleSeconds * 1000);
+        record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+        break;
+      }
     } catch {}
-    throw new Error(`等待 ${waitSeconds}s 未产出探针报告`);
+    sleepSync(500);
   }
-
-  const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
   try {
     process.kill(child.pid);
   } catch {}
+  if (!record) throw new Error(`等待 ${waitSeconds}s 未取得${supervised ? "受控入口记录" : "探针报告"}`);
 
   console.log("── 4/4 启动后再快照并比对 ──");
   const verdict = { watched: [], isolated: {}, probe: {} };
@@ -168,36 +168,72 @@ function main() {
     });
   }
 
-  verdict.probe = {
-    ok: report.ok,
-    mainLoaded: report.mainLoaded,
-    ready: report.ready,
-    未通过的检查: (report.checks || []).filter((c) => !c.pass).map((c) => c.name),
-    通过项数: (report.checks || []).filter((c) => c.pass).length,
-    检查项总数: (report.checks || []).length,
-    数据目录请求: (report.pathRequests || []).length,
-    userData实际落点: report.userDataAfterRedirect,
-    工作台数据目录: report.workbench?.storageRoot,
-    隔离根顶层: report.isolatedTop,
-    隔离目录文件数: (report.isolatedTree || []).length,
-    诊断: (report.diagnostics || []).slice(0, 5),
-    错误: report.error,
+  const workbenchDir = path.join(isolatedRoot, "DoubaoAccountManager", "workbench");
+  const countFiles = (dir) => {
+    let n = 0;
+    (function walk(cur) {
+      let names;
+      try {
+        names = fs.readdirSync(cur);
+      } catch {
+        return;
+      }
+      for (const name of names) {
+        const full = path.join(cur, name);
+        let stat;
+        try {
+          stat = fs.statSync(full);
+        } catch {
+          continue;
+        }
+        if (stat.isDirectory()) walk(full);
+        else n++;
+      }
+    })(dir);
+    return n;
   };
 
   verdict.isolated = {
     root: isolatedRoot,
     顶层: fs.existsSync(isolatedRoot) ? fs.readdirSync(isolatedRoot).sort() : null,
-    userData在隔离内: String(report.userDataAfterRedirect || "").startsWith(isolatedRoot),
-    工作台目录在隔离内: String(report.workbench?.storageRoot || "").startsWith(isolatedRoot),
-    electron确实写入了隔离目录: (report.isolatedTree || []).length > 0,
+    userData实际落点: supervised ? record.userDataApplied : record.userDataAfterRedirect,
+    userData在隔离内: String((supervised ? record.userDataApplied : record.userDataAfterRedirect) || "").startsWith(isolatedRoot),
+    工作台数据目录在隔离内: supervised
+      ? fs.existsSync(workbenchDir)
+      : String(record.workbench?.storageRoot || "").startsWith(isolatedRoot),
+    隔离目录文件数: countFiles(isolatedRoot),
+    electron确实写入了隔离目录: countFiles(isolatedRoot) > 0,
+    数据目录请求: (record.pathRequests || []).length,
   };
+
+  verdict.probe = supervised
+    ? {
+        mainLoaded: record.mainLoaded,
+        chromiumUserDataDir: record.chromiumUserDataDir,
+        数据目录请求: (record.pathRequests || []).length,
+        错误: record.error,
+      }
+    : {
+        ok: record.ok,
+        mainLoaded: record.mainLoaded,
+        ready: record.ready,
+        通过项数: (record.checks || []).filter((c) => c.pass).length,
+        检查项总数: (record.checks || []).length,
+        未通过的检查: (record.checks || []).filter((c) => !c.pass).map((c) => c.name),
+        工作台数据目录: record.workbench?.storageRoot,
+        诊断: (record.diagnostics || []).slice(0, 5),
+        错误: record.error,
+      };
 
   const isolatedValid =
     verdict.isolated.userData在隔离内 &&
-    verdict.isolated.工作台目录在隔离内 &&
+    verdict.isolated.工作台数据目录在隔离内 &&
     verdict.isolated.electron确实写入了隔离目录;
+  const entryOk = supervised
+    ? record.mainLoaded === true && !record.error
+    : Boolean(record.ok);
 
-  verdict.pass = clean && isolatedValid && Boolean(report.ok);
+  verdict.pass = clean && isolatedValid && entryOk;
 
   console.log("");
   console.log(JSON.stringify(verdict, null, 2));
