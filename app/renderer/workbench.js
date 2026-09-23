@@ -560,6 +560,7 @@
   const downloadLabel = (status) => state.downloadLabels?.[status] || status;
   // 驱动层步骤的中文名，与 workbench-dola-driver 里的 step 字段一一对应
   const STEP_LABEL = {
+    openPage: "打开账号页面",
     setPrompt: "写入提示词",
     chooseModel: "选择模型",
     chooseDuration: "选择时长",
@@ -638,7 +639,7 @@
           .map((a) => `${a.name}（${a.blocked.label}）`)
           .join("、")}`
       // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
-      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 每个账号各生成一条`;
+      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 每个账号各生成一条；提交前请先在应用里打开该账号的页面`;
     note.appendChild(line);
     for (const [act, label] of [
       ["accounts-all", "全选"],

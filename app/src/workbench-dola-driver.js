@@ -2,37 +2,93 @@
 /**
  * Dola 页面驱动层（Electron 依赖，无法离线验证）
  *
- * ⚠ 验证状态：本文件的传输步骤（真实页面交互）**尚未经过实机验证**。
- *   选择器与手法来自本项目内既有可读模块的实测代码：
- *     - src/webview-preload.js：编辑器选择器、\uFFFC 原子节点、TEXTAREA 原生 setter、
- *       contenteditable 走 execCommand('insertText')、菜单选择器 MENU_SELECTOR、
- *       工具栏控件 data-input-engine-actionbar-control-key
- *     - src/video-log-data.js：从响应中提取 task_id/video_id/status 的字段名
- *   但「真实点击发送、真实取回平台任务 ID、真实判定完成」必须通过一次单任务实机运行确认。
+ * 驱动目标：应用自己为每个账号挂的那个 <webview>，也就是用户已登录、且装了
+ *   应用自身 webview-preload（含 30 秒时长增强）的那个真实页面。
  *
- * 因此每个步骤都返回结构化结果；失败时把页面上实际可见的选项一并回报，
- * 便于首次实机运行时快速校准，而不是靠猜。
+ * ⚠ 为什么不再自建隐藏窗口（实测结论，2026-09-23）：
+ *   曾用 new BrowserWindow + persist:doubao-manager-<accountId> 自建隐藏窗口来驱动，
+ *   结果在隔离环境里 20 秒页面加载超时、随后 15 秒脚本执行超时，首个步骤直接失败
+ *   （任务卡片显示 02:02:25 提交 → 02:03:00 失败，恰为两个超时之和）。
+ *   隐藏窗口既加载不出页面，也拿不到真实 webview 才有的 preload 能力，故改为直接驱动真实 webview。
+ *   定位方式与应用内既有模块保持一致（account-proxy.js / hd-original-service.js）：
+ *   webContents.getAllWebContents() + getType()==='webview' + 会话分区相同。
+ *
+ * 选择器与手法来自本项目内既有可读模块的实测代码：
+ *   - src/webview-preload.js：编辑器选择器、\uFFFC 原子节点、TEXTAREA 原生 setter、
+ *     contenteditable 走 execCommand('insertText')、菜单选择器 MENU_SELECTOR、
+ *     工具栏控件 data-input-engine-actionbar-control-key
+ *   - src/video-log-data.js：从响应中提取 task_id/video_id/status 的字段名
+ * 但「真实点击发送、真实取回平台任务 ID、真实判定完成」仍必须通过单任务实机运行确认。
+ *
+ * 因此每个步骤都返回结构化结果；失败时把页面上实际可见的选项与页面地址一并回报，
+ * 便于快速校准，而不是靠猜。
  *
  * 设计约束：
- * - 页面复用账号已有的登录会话（persist:doubao-manager-<accountId>），不新建登录。
+ * - 只借用账号已有的登录会话（persist:doubao-manager-<accountId>），不新建登录。
+ * - 绝不销毁账号页面：那是应用自己的 webview，驱动层只是借用其调试通道。
  * - 拿不到平台任务 ID 时返回 outcome:"unknown"，由编排层标记「提交结果待确认」，
  *   绝不在本层重复提交。
  * - 不做任何进度百分比的编造：页面没有明确信号时返回 unknown。
  */
 
-const { BrowserWindow } = require("electron");
+const { webContents, session } = require("electron");
 const { DOLA_SELECTORS } = require("./workbench-platform");
 
-const CREATE_URL = "https://www.dola.com/";
 const PARTITION_PREFIX = "persist:doubao-manager-";
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
 const SEND_TIMEOUT_MS = 45 * 1000;
-// 每个环节都必须有上限：页面没加载完或脚本挂起时，绝不能把整个提交无限期卡住
-const LOAD_TIMEOUT_MS = 20 * 1000;
+// 每个环节都必须有上限：页面没就绪或脚本挂起时，绝不能把整个提交无限期卡住
 const EVAL_TIMEOUT_MS = 15 * 1000;
 const IMAGE_TIMEOUT_MS = 20 * 1000;
+const DOLA_HOST_RE = /(^|\.)dola\.com$/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function hostOf(url) {
+  try {
+    return new URL(String(url)).hostname;
+  } catch {
+    return "";
+  }
+}
+
+const isDolaUrl = (url) => DOLA_HOST_RE.test(hostOf(url));
+
+/**
+ * 找到账号「真实」的 webview。
+ * 找不到时返回可执行的原因（而不是含糊的失败），让用户知道该先做什么。
+ */
+function findAccountWebview(accountId) {
+  const partition = `${PARTITION_PREFIX}${accountId}`;
+  let target;
+  try {
+    target = session.fromPartition(partition);
+  } catch (error) {
+    return { ok: false, reason: `账号会话分区不可用（${partition}）：${error?.message || error}` };
+  }
+  const views = webContents
+    .getAllWebContents()
+    .filter(
+      (contents) =>
+        !contents.isDestroyed() && contents.getType() === "webview" && contents.session === target
+    );
+  if (!views.length) {
+    return {
+      ok: false,
+      reason: `账号 ${accountId} 的页面当前没有打开。请先在应用左侧选中该账号，等它的页面加载出来再提交`,
+    };
+  }
+  const onDola = views.find((contents) => isDolaUrl(contents.getURL()));
+  if (!onDola) {
+    return {
+      ok: false,
+      reason: `账号 ${accountId} 的页面当前不在 dola 上，未擅自跳转。实际地址：${views
+        .map((contents) => contents.getURL() || "(空白)")
+        .join(" | ")}`,
+    };
+  }
+  return { ok: true, contents: onDola, url: onDola.getURL() };
+}
 
 /** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
 function withTimeout(promise, ms, timeoutValue) {
@@ -59,11 +115,14 @@ const HELPERS = `
     actionbar: DOLA_SELECTORS.actionbar,
     fileInput: DOLA_SELECTORS.fileInput,
   })};
+  // 刻意不要求「有非零尺寸」：目标可能是账号非当前选中态时的 webview（被应用隐藏），
+  // 那种情况下元素 rect 恒为 0×0，但 DOM 完全可用。这里只排除真正不渲染的节点。
   const visible = (el) => {
     try {
-      const r = el?.getBoundingClientRect?.();
       const s = el && getComputedStyle(el);
-      return Boolean(el?.isConnected && r?.width > 1 && r?.height > 1 && s?.display !== 'none' && s?.visibility !== 'hidden');
+      return Boolean(
+        el?.isConnected && s?.display !== 'none' && s?.visibility !== 'hidden' && Number(s?.opacity || 1) > 0.01
+      );
     } catch { return false; }
   };
   const textOf = (el) => String(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title') || '').replace(/\\s+/g, ' ').trim();
@@ -220,33 +279,15 @@ function createDolaDriver(options = {}) {
       state.pages.set(accountId, contents);
       return contents;
     }
-    // 兜底：用账号会话分区自建一个隐藏窗口，不改动用户的可见工作区
-    const partition = `${PARTITION_PREFIX}${accountId}`;
-    const win = new BrowserWindow({
-      show: false,
-      width: 1280,
-      height: 900,
-      webPreferences: {
-        partition,
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: true,
-        // 刻意不挂 webview-preload：那是给 <webview> 用的（依赖 sendToHost），
-        // 装到普通窗口只会报「preload script must have absolute path」之类的错且无效。
-        // 驱动层只需要 DOM 与调试协议，不需要该预加载。
-      },
-    });
-    const loaded = await withTimeout(
-      win
-        .loadURL(CREATE_URL)
-        .then(() => ({ ok: true }))
-        .catch((error) => ({ ok: false, reason: `页面加载失败：${error?.message || error}` })),
-      LOAD_TIMEOUT_MS,
-      { ok: false, reason: `页面加载超时（${LOAD_TIMEOUT_MS / 1000} 秒），账号会话可能不可用` }
-    );
-    if (!loaded.ok) log("dola-page-load-failed", { accountId, partition, reason: loaded.reason });
-    state.pages.set(accountId, win.webContents);
-    return win.webContents;
+    // 直接借用应用自己为账号挂的 webview：已登录、带应用 preload，且不需要我们自己加载页面
+    const found = findAccountWebview(accountId);
+    if (!found.ok) {
+      log("dola-webview-not-found", { accountId, reason: found.reason });
+      throw new Error(found.reason);
+    }
+    log("dola-webview-resolved", { accountId, url: found.url, webContentsId: found.contents.id });
+    state.pages.set(accountId, found.contents);
+    return found.contents;
   }
 
   async function chooseOption(contents, selector, wanted) {
@@ -362,7 +403,9 @@ function createDolaDriver(options = {}) {
       try {
         contents = await pageFor(accountId);
       } catch (error) {
-        return { outcome: "failed", message: `无法打开账号页面：${error?.message || error}`, steps };
+        const reason = error?.message || String(error);
+        record("openPage", { ok: false, reason });
+        return { outcome: "failed", message: `无法打开账号页面：${reason}`, steps };
       }
       if (!plan?.valid) {
         return { outcome: "failed", message: `计划无效：${(plan?.errors || []).join("；")}`, steps };
@@ -475,15 +518,10 @@ function createDolaDriver(options = {}) {
     },
 
     dispose() {
-      for (const contents of state.pages.values()) {
-        try {
-          const win = BrowserWindow.fromWebContents(contents);
-          if (win && !win.isDestroyed()) win.destroy();
-        } catch {}
-      }
+      // 只放开引用，绝不销毁：这些是应用自己的账号 webview，不是驱动层创建的窗口
       state.pages.clear();
     },
   };
 }
 
-module.exports = { CREATE_URL, PARTITION_PREFIX, collectIds, createDolaDriver };
+module.exports = { DOLA_HOST_RE, PARTITION_PREFIX, collectIds, createDolaDriver, findAccountWebview, isDolaUrl };
