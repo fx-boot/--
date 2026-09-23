@@ -153,6 +153,11 @@
 .workbench-run-row strong { color: var(--soft); font-weight: 500; }
 .workbench-run-prompt { margin-top: 4px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0b1018; color: var(--soft); font-size: 10px; line-height: 1.7; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 .workbench-run-errors { padding: 8px 10px; border: 1px solid rgba(255,83,100,.24); border-radius: 8px; background: rgba(255,83,100,.05); color: #ff9da6; font-size: 10px; line-height: 1.7; }
+.workbench-run-modes { display: grid; gap: 5px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0b1018; }
+.workbench-run-mode { display: flex; align-items: flex-start; gap: 7px; color: var(--soft); font-size: 10px; line-height: 1.7; cursor: pointer; }
+.workbench-run-plan { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0b1018; }
+.workbench-run-plan .workbench-run-row { font-size: 10px; }
+.workbench-run-row-bad strong { color: #ff9da6; }
 .workbench-run-notes { padding: 8px 10px; border: 1px solid rgba(255,180,92,.22); border-radius: 8px; background: rgba(255,180,92,.05); color: #ffcf9a; font-size: 10px; line-height: 1.7; }
 .workbench-run-status { min-height: 14px; color: var(--accent); font-size: 10px; line-height: 1.7; }
 

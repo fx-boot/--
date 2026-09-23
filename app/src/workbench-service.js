@@ -28,7 +28,7 @@ const { createAssets, MAX_BYTES } = require("./workbench-assets");
 const { createTaskService } = require("./workbench-task-service");
 const { DOWNLOAD_LABEL, STATUS_LABEL } = require("./workbench-task-store");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
-const { RATIO_OPTIONS } = require("./workbench-platform");
+const { describeCapabilities, ratioOptionsFor } = require("./workbench-platform");
 
 const CHANGED = "workbench:changed";
 const PROJECT_DIR_NAME = "workbench";
@@ -177,8 +177,10 @@ async function snapshot() {
     project,
     assets: assetList,
     capabilities: VIDEO_CAPABILITIES,
-    // 比例候选值：平台能力表没有 ratios，这里只给常见值，界面必须标注「未核实」
-    ratioOptions: RATIO_OPTIONS,
+    // 能力视图：模型菜单文案、实测时间、哪些项仍未核实，界面直接用它渲染，避免前端自己判断
+    capabilityView: describeCapabilities(VIDEO_CAPABILITIES, "dola"),
+    // 比例候选：来自实测的 platform.ratios，不再是「常见值」
+    ratioOptions: ratioOptionsFor(VIDEO_CAPABILITIES, "dola"),
     limits: { maxAssetBytes: MAX_BYTES },
     accounts: accountList,
     tasks: taskList,

@@ -19,6 +19,7 @@
     project: null,
     assets: [],
     capabilities: null,
+    capabilityView: null,
     ratioOptions: [],
     limits: null,
     accounts: [],
@@ -26,7 +27,7 @@
     queue: null,
     // 执行账号可多选：一次为每个勾选账号各建一条尝试
     selectedAccountIds: [],
-    run: { storyboardId: "", accountIds: [], currentAttemptId: "" },
+    run: { mode: "distribute", storyboardIds: [], accountIds: [], assignments: [], currentAttemptId: "" },
     search: "",
     saveTimers: new Map(),
     // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
@@ -101,6 +102,7 @@
           project: snapshot.project,
           assets: snapshot.assets,
           capabilities: snapshot.capabilities,
+          capabilityView: snapshot.capabilityView || null,
           ratioOptions: snapshot.ratioOptions || [],
           limits: snapshot.limits,
           accounts: snapshot.accounts || [],
@@ -470,10 +472,11 @@
 
     const model = document.createElement("select");
     model.dataset.focusKey = "default:model";
+    const labelOfModel = new Map((state.capabilityView?.modelLabels || []).map((m) => [m.value, m.label]));
     for (const value of target?.models || []) {
       const option = document.createElement("option");
       option.value = value;
-      option.textContent = value;
+      option.textContent = labelOfModel.get(value) ? `${value}（菜单：${labelOfModel.get(value)}）` : value;
       model.appendChild(option);
     }
     model.value = defaults.model;
@@ -498,7 +501,7 @@
     duration.value = String(defaults.duration);
     host.appendChild(field("时长", duration));
 
-    // 比例：平台能力表里没有 ratios，所以给「常见值」供选择并明确标注未核实
+    // 比例：候选值来自平台实测的能力表，且提交前会回读核实
     const ratio = document.createElement("select");
     ratio.dataset.focusKey = "default:ratio";
     ratioOptions(defaults.ratio).forEach((value) => {
@@ -511,7 +514,9 @@
     host.appendChild(field("比例", ratio));
     const ratioNote = document.createElement("span");
     ratioNote.className = "workbench-unknown";
-    ratioNote.textContent = "平台比例能力未核实，是否生效以平台结果为准";
+    ratioNote.textContent = state.capabilityView?.measuredAt
+      ? `比例来自 ${state.capabilityView.measuredAt} 实测；设置后回读不一致会阻断提交`
+      : "比例能力来源未知";
     host.appendChild(ratioNote);
 
     const refLimit = document.createElement("span");
@@ -560,14 +565,19 @@
   const downloadLabel = (status) => state.downloadLabels?.[status] || status;
   // 驱动层步骤的中文名，与 workbench-dola-driver 里的 step 字段一一对应
   const STEP_LABEL = {
-    openPage: "打开账号页面",
+    openPage: "定位账号页面",
+    waitReady: "等待页面就绪",
+    enterVideoMode: "进入视频生成模式",
+    clearAttachments: "清空残留参考图",
     setPrompt: "写入提示词",
     chooseModel: "选择模型",
     chooseDuration: "选择时长",
     chooseRatio: "设置比例",
     attachImages: "附加参考图",
-    readState: "读取页面状态",
+    verifyRefs: "核实图片引用",
+    readState: "回读参数与发送按钮",
     send: "点击发送",
+    sendReaction: "确认平台已开始处理",
     awaitResponse: "等待平台响应",
   };
   const ACTIVE_STATUSES = ["pending", "submitting", "queued", "generating"];
@@ -639,7 +649,7 @@
           .map((a) => `${a.name}（${a.blocked.label}）`)
           .join("、")}`
       // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
-      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 每个账号各生成一条；提交前请先在应用里打开该账号的页面`;
+      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 默认「分配执行」：多条分镜分配给这些账号，每条分镜只执行一次；提交前请先在应用里打开对应账号的页面`;
     note.appendChild(line);
     for (const [act, label] of [
       ["accounts-all", "全选"],
@@ -809,17 +819,45 @@
     return state.accounts.find((a) => a.id === accountId)?.name || accountId;
   }
 
-  function runPreview(host, previews) {
+  /**
+ * 提交确认框
+ * 默认模式是「分配执行」：多条分镜分配给多个所选账号，每条分镜只执行一次。
+ * 「对比模式」是独立选项，必须用户显式选择 —— 同一分镜才会在每个账号各生成一次。
+ */
+  function runPreview(host, previews, context = {}) {
     host.innerHTML = "";
     const list = Array.isArray(previews) ? previews : [previews];
     const first = list[0] || { params: {}, uploads: [], errors: [], limitations: [], promptPreview: "" };
+    const mode = context.mode || "distribute";
+
+    const modes = document.createElement("div");
+    modes.className = "workbench-run-modes";
+    modes.id = "workbenchRunModes";
+    for (const [value, label, hint] of [
+      ["distribute", "分配执行（默认）", "多条分镜按顺序分配给所选账号，每条分镜只执行一次"],
+      ["compare", "对比模式", "同一条分镜在每个所选账号各生成一次（会按账号数成倍消耗额度）"],
+    ]) {
+      const wrap = document.createElement("label");
+      wrap.className = "workbench-run-mode";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "workbenchRunMode";
+      radio.value = value;
+      radio.checked = mode === value;
+      radio.dataset.act = "run-mode";
+      wrap.appendChild(radio);
+      const text = document.createElement("span");
+      text.textContent = `${label} · ${hint}`;
+      wrap.appendChild(text);
+      modes.appendChild(wrap);
+    }
+    host.appendChild(modes);
+
     const rows = [
-      ["分镜", state.project?.storyboards?.find((s) => s.id === state.run.storyboardId)?.name || ""],
       ["模型", first.params.model || "(未设置)"],
-      ["时长", first.params.duration || "(未设置)"],
-      ["比例", first.params.ratio ? `${first.params.ratio}（平台比例能力未核实）` : "(未设置)"],
+      ["时长", first.params.duration ? `${first.params.duration} 秒` : "(未设置)"],
+      ["比例", first.params.ratio || "(未设置，用平台默认)"],
       ["参考图片", first.uploads.length ? `${first.uploads.length} 张` : "无"],
-      ["执行账号", list.map((item) => accountName(item.accountId)).join("、")],
     ];
     for (const [name, value] of rows) {
       const row = document.createElement("div");
@@ -832,21 +870,39 @@
       row.appendChild(text);
       host.appendChild(row);
     }
+
+    const assignments = context.assignments || [];
+    const plan = document.createElement("div");
+    plan.className = "workbench-run-plan";
+    const head = document.createElement("div");
+    head.className = "workbench-run-row";
+    const headLabel = document.createElement("span");
+    headLabel.textContent = "本次提交";
+    head.appendChild(headLabel);
+    const headValue = document.createElement("strong");
+    headValue.textContent = `共 ${assignments.length} 条尝试（${assignments.filter((a) => a.valid).length} 条可提交）`;
+    head.appendChild(headValue);
+    plan.appendChild(head);
+    for (const item of assignments) {
+      const row = document.createElement("div");
+      row.className = `workbench-run-row${item.valid ? "" : " workbench-run-row-bad"}`;
+      const label = document.createElement("span");
+      label.textContent = item.storyboardName || item.storyboardId;
+      row.appendChild(label);
+      const text = document.createElement("strong");
+      text.textContent = item.valid
+        ? `→ ${accountName(item.accountId)}`
+        : `✕ 不可提交：${(item.errors || []).join("；") || "参数未通过校验"}`;
+      row.appendChild(text);
+      plan.appendChild(row);
+    }
+    host.appendChild(plan);
+
     const prompt = document.createElement("div");
     prompt.className = "workbench-run-prompt";
     prompt.textContent = first.promptPreview || "(空提示词)";
     host.appendChild(prompt);
 
-    // 逐账号说明：每个勾选的账号都会各建一条尝试，能提交的先提交，不能提交的列出来
-    const bad = list.filter((item) => !item.valid);
-    if (bad.length) {
-      const box = document.createElement("div");
-      box.className = "workbench-run-errors";
-      box.textContent = `以下账号无法提交：${bad
-        .map((item) => `${accountName(item.accountId)}（${item.errors.join("；")}）`)
-        .join("；")}`;
-      host.appendChild(box);
-    }
     if (first.limitations.length) {
       const box = document.createElement("div");
       box.className = "workbench-run-notes";
@@ -857,6 +913,51 @@
     status.className = "workbench-run-status";
     status.id = "workbenchRunStatus";
     host.appendChild(status);
+  }
+
+  /**
+   * 打开提交确认框：先按模式算出「分镜 → 账号」的分配，再逐条做提交前预览。
+   * 分配结果同时留在 state.run.assignments，确认时只提交校验通过的条目。
+   */
+  async function openRunModal(storyboardIds, mode = "distribute") {
+    const accountIds = state.selectedAccountIds.slice();
+    if (!accountIds.length) {
+      toast("请先勾选执行账号（可多选）", "error");
+      return;
+    }
+    const boards = (storyboardIds || []).filter(Boolean);
+    if (!boards.length) {
+      toast("当前没有可提交的分镜", "error");
+      return;
+    }
+    const assignments = await api.task.assignments(boards, accountIds, mode);
+    const names = new Map((state.project?.storyboards || []).map((s) => [s.id, s.name || s.id]));
+    const cache = new Map();
+    const rows = [];
+    for (const item of assignments) {
+      const key = `${item.storyboardId}|${item.accountId}`;
+      let preview = cache.get(key);
+      if (!preview) {
+        try {
+          preview = await api.task.preview(projectId(), item.storyboardId, item.accountId);
+        } catch (error) {
+          preview = { valid: false, errors: [error.message], warnings: [], limitations: [], uploads: [], params: {}, promptPreview: "" };
+        }
+        cache.set(key, preview);
+      }
+      rows.push({
+        ...item,
+        storyboardName: names.get(item.storyboardId) || item.storyboardId,
+        valid: Boolean(preview.valid),
+        errors: preview.errors || [],
+        preview,
+      });
+    }
+    state.run = { mode, storyboardIds: boards, accountIds, assignments: rows, currentAttemptId: "" };
+    runPreview($("workbenchRunPreview"), rows.map((row) => row.preview), { mode, assignments: rows });
+    const confirm = $("workbenchRunConfirm");
+    if (confirm) confirm.disabled = !rows.some((row) => row.valid);
+    openModal("workbenchRunModal");
   }
 
   // ── 分镜 ─────────────────────────────────────────────────
@@ -1463,43 +1564,64 @@
 
     $("workbenchRunConfirm")?.addEventListener("click", async () => {
       const confirm = $("workbenchRunConfirm");
-      const accountIds = state.run.accountIds.slice();
-      if (!accountIds.length) return toast("请先勾选执行账号", "error");
+      const assignments = (state.run.assignments || []).filter((item) => item.valid);
+      if (!assignments.length) return toast("没有校验通过的尝试可提交", "error");
       const original = confirm.textContent;
       confirm.disabled = true;
       confirm.textContent = "提交中…";
       const failed = [];
       let done = 0;
       try {
-        for (const [index, accountId] of accountIds.entries()) {
+        for (const [index, item] of assignments.entries()) {
           const status = $("workbenchRunStatus");
           if (status) {
-            status.textContent = `正在提交第 ${index + 1}/${accountIds.length} 个账号（真实提交，请勿关闭窗口）…`;
+            status.textContent = `正在提交第 ${index + 1}/${assignments.length} 条：${item.storyboardName} → ${accountName(
+              item.accountId
+            )}（真实提交，请勿关闭窗口）…`;
           }
           try {
-            const created = await api.task.enqueue(projectId(), state.run.storyboardId, accountId);
+            const created = await api.task.enqueue(projectId(), item.storyboardId, item.accountId);
             state.run.currentAttemptId = created.attempt.id;
             await refresh();
             await api.task.execute(projectId(), created.attempt.id);
             done++;
           } catch (error) {
-            failed.push(`${accountName(accountId)}：${error.message}`);
+            failed.push(`${item.storyboardName} → ${accountName(item.accountId)}：${error.message}`);
           }
         }
         state.run.currentAttemptId = "";
         await refresh();
         closeModal("workbenchRunModal");
         if (failed.length) {
-          toast(`已提交 ${done} 个账号，${failed.length} 个失败`, "error");
-          for (const item of failed) toast(item, "error");
+          toast(`已提交 ${done} 条，${failed.length} 条失败`, "error");
+          for (const text of failed) toast(text, "error");
         } else {
-          toast(`已为 ${done} 个账号提交，任务卡片里有逐步结果`, "ok");
+          toast(`已提交 ${done} 条尝试，任务卡片里有逐步结果`, "ok");
         }
       } catch (error) {
         toast(`提交失败：${error.message}`, "error");
       } finally {
         confirm.disabled = false;
         confirm.textContent = original;
+      }
+    });
+
+    // 模式切换：切换后重新算分配（默认分配执行，对比模式必须显式选择）
+    $("workbenchRunPreview")?.addEventListener("change", async (event) => {
+      const radio = event.target.closest('input[name="workbenchRunMode"]');
+      if (!radio) return;
+      try {
+        await openRunModal(state.run.storyboardIds, radio.value);
+      } catch (error) {
+        toast(`重新计算分配失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchRunBatch")?.addEventListener("click", async () => {
+      try {
+        await openRunModal((state.project?.storyboards || []).map((s) => s.id), "distribute");
+      } catch (error) {
+        toast(`无法准备批量提交：${error.message}`, "error");
       }
     });
 
@@ -1622,17 +1744,7 @@
           return;
         }
         if (act === "run") {
-          const accountIds = state.selectedAccountIds.slice();
-          if (!accountIds.length) return toast("请先勾选执行账号（可多选）", "error");
-          state.run = { storyboardId, accountIds };
-          const previews = [];
-          for (const accountId of accountIds) {
-            previews.push(await api.task.preview(projectId(), storyboardId, accountId));
-          }
-          runPreview($("workbenchRunPreview"), previews);
-          const confirm = $("workbenchRunConfirm");
-          if (confirm) confirm.disabled = !previews.some((p) => p.valid);
-          openModal("workbenchRunModal");
+          await openRunModal([storyboardId], "distribute");
           return;
         }
         if (act === "up" || act === "down") {

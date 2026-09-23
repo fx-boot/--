@@ -228,8 +228,9 @@ async function main() {
       .includes("缺少本地文件")
   );
   const ratioWarn = platform.validateParams({ params: { ...okParams, ratio: "16:9" }, capabilities: CAPS });
-  check("比例给出警告而非伪造能力", ratioWarn.warnings.join().includes("未提供比例能力表"));
-  const refWarn = platform.validateParams({
+check("已核实的比例不再产生任何比例告警", !/比例/.test(ratioWarn.warnings.join("；")), ratioWarn.warnings);
+check("已核实的比例通过校验", ratioWarn.ok, ratioWarn.errors);
+const refWarn = platform.validateParams({
     params: okParams,
     refs: [{ token: "@图1", filePath: "x.png" }],
     capabilities: CAPS,
@@ -237,10 +238,12 @@ async function main() {
   check("参考图上限未知时给出警告", refWarn.warnings.join().includes("未声明参考图数量上限"));
 
   const described = platform.describeCapabilities(CAPS, "dola");
-  eq("比例标记为未知", described.unknown.ratio, true);
+  eq("比例已核实（不再标记为未知）", described.unknown.ratio, false);
+  eq("比例候选来自能力表", described.ratios.length, 6);
   eq("参考图上限标记为未知", described.unknown.maxReferenceImages, true);
   eq("额度标记为未知", described.unknown.quota, true);
   check("模型来自真实能力表", described.models.includes("seedance2.5"));
+  check("模型带平台菜单文案", described.modelLabels.some((m) => m.value === "seedance2.5" && m.label === "Seedance 2.5"), described.modelLabels);
 
   // ══ 7. 结构化引用 → 分段（位置与顺序） ══
   console.log("── 引用分段 ──");
@@ -781,15 +784,12 @@ async function main() {
   eq("落库后候选控件仍在", driverReloaded.driver.candidates[0], "label:发送");
   eq("驱动总体结果已落库", driverReloaded.driver.outcome, "failed");
 
-  // 12.3 比例：给出常见候选值，且继续标注「平台能力未核实」
-  check("比例候选值非空", platform.RATIO_OPTIONS.length >= 4, platform.RATIO_OPTIONS);
+  // 12.3 比例：候选值来自平台实测能力表，且不再声称「未核实」
+  const ratios = platform.ratioOptionsFor(VIDEO_CAPABILITIES, "dola");
+  check("比例候选非空", ratios.length >= 4, ratios);
+  check("比例候选含 16:9 与 9:16", ratios.includes("16:9") && ratios.includes("9:16"), ratios);
   check(
-    "比例候选含 16:9 与 9:16",
-    platform.RATIO_OPTIONS.includes("16:9") && platform.RATIO_OPTIONS.includes("9:16"),
-    platform.RATIO_OPTIONS
-  );
-  check(
-    "比例控件选择器已登记（探测不到会如实回报而不是猜）",
+    "比例控件选择器已登记",
     typeof platform.DOLA_SELECTORS.ratioControl === "string" && platform.DOLA_SELECTORS.ratioControl.length > 0,
     platform.DOLA_SELECTORS.ratioControl
   );
@@ -801,8 +801,35 @@ async function main() {
       capabilities: VIDEO_CAPABILITIES,
     })
     .warnings.join("；");
-  check("比例仍被标注为未核实", /未核实|以平台实际结果为准/.test(ratioWarning), ratioWarning);
-  check("比例不再声称「不会被提交」", !/不会被提交/.test(ratioWarning), ratioWarning);
+  check("已核实比例不再写「未核实」", !/未核实/.test(ratioWarning), ratioWarning);
+  // 关键：比例不在能力表里时必须拒绝提交，而不是「尝试设置、设不上也继续」
+  const badRatio = platform.validateParams({
+    target: "dola",
+    params: { model: "seedance2.5", duration: "10", prompt: "x", ratio: "4:5" },
+    refs: [],
+    capabilities: VIDEO_CAPABILITIES,
+  });
+  check("不在能力表里的比例被拒绝提交", badRatio.ok === false && badRatio.errors.join().includes("比例 4:5"), badRatio);
+  const noRatio = platform.validateParams({
+    target: "dola",
+    params: { model: "seedance2.5", duration: "10", prompt: "x", ratio: "" },
+    refs: [],
+    capabilities: VIDEO_CAPABILITIES,
+  });
+  check("未设置比例时说明会用平台默认（不假装核实）", noRatio.warnings.join().includes("平台默认比例"), noRatio.warnings);
+
+  // 12.3b 能力表必须是实测值：此前写着平台并不存在的 seedance2.0mini 与 15/30 秒
+  check("模型不含平台上并不存在的 mini", !platform.modelOptionsFor(VIDEO_CAPABILITIES, "dola").includes("seedance2.0mini"), platform.modelOptionsFor(VIDEO_CAPABILITIES, "dola"));
+  eq("时长只有实测的 5s / 10s", platform.durationOptionsFor(VIDEO_CAPABILITIES, "dola"), ["5", "10"]);
+  check("30 秒不在默认能力表中（需应用自带增强才可能出现）", !platform.durationOptionsFor(VIDEO_CAPABILITIES, "dola").includes("30"));
+  eq("模型菜单文案取自实测", platform.menuLabelForModel("seedance2.0fast"), "Seedance 2.0 Fast");
+  const thirty = platform.validateParams({
+    target: "dola",
+    params: { model: "seedance2.5", duration: "30", prompt: "x", ratio: "9:16" },
+    refs: [],
+    capabilities: VIDEO_CAPABILITIES,
+  });
+  check("时长 30 会被拒绝提交（不再静默用平台默认值生成）", thirty.ok === false && thirty.errors.join().includes("时长 30"), thirty);
 
   // 12.4 粘贴导入：剪贴板图片走 base64 落盘，并沿用内容哈希去重
   const pasteRoot = path.join(root, "pasteproj");
@@ -882,6 +909,138 @@ async function main() {
   eq("最终候选控件清单被保留", finalState.driver.candidates[0], "label:发送");
   eq("失败步骤原因可读", finalState.driver.steps[2].detail, "页面上找不到发送按钮，无法提交生成");
   eq("失败后状态仍为生成失败", finalState.status, "failed");
+
+  // ══ 13. 回归：上一轮真实失败暴露的缺陷（这些用例在旧实现上会失败） ══
+  // 背景：隔离版任务日志 att_1bea070d7ef0 显示 openPage/setPrompt 成功，
+  // 但 chooseModel/chooseDuration/chooseRatio/send 全部失败，页面地址是 /chat/ ——
+  // 也就是「没进入视频生成模式」；而更早两次失败是「页面没加载完就操作」。
+  console.log("── 回归：真实页面接入链路 ──");
+  const driverSrc = fs.readFileSync(path.join(SRC, "workbench-dola-driver.js"), "utf8");
+  const rendererSrc = fs.readFileSync(path.join(__dirname, "..", "app", "renderer", "workbench.js"), "utf8");
+  const indexSrc = fs.readFileSync(path.join(__dirname, "..", "app", "renderer", "index.html"), "utf8");
+
+  check("驱动层有「等页面就绪」步骤", /waitForPageReady/.test(driverSrc) && driverSrc.includes('record("waitReady"'));
+  check("驱动层会进入视频生成模式（聊天模式下控件根本不存在）", /STEP_ENTER_VIDEO/.test(driverSrc) && driverSrc.includes('record("enterVideoMode"'));
+  check(
+    "「视频生成」入口用实测的 skill 按钮",
+    platform.DOLA_SELECTORS.videoModeButton.includes("skill_bar_button_17"),
+    platform.DOLA_SELECTORS.videoModeButton
+  );
+  check(
+    "打开菜单用真实指针事件（radix 不认 element.click）",
+    /pointerdown/.test(driverSrc) && /PointerEvent/.test(driverSrc)
+  );
+  check("不再用 element.click() 打开菜单", !/control\.click\(\)/.test(driverSrc));
+  check("发送按钮用实测 id", platform.DOLA_SELECTORS.sendButton === "#flow-end-msg-send", platform.DOLA_SELECTORS.sendButton);
+  check("不再猜「工具栏最后一个按钮」当发送按钮", !/toolbar-tail/.test(driverSrc));
+  check(
+    "参数控件选择器不再保留猜测的兜底键名",
+    platform.DOLA_SELECTORS.modelControl === '[data-input-engine-actionbar-control-key="video-model"]' &&
+      platform.DOLA_SELECTORS.durationControl === '[data-input-engine-actionbar-control-key="video-duration"]',
+    [platform.DOLA_SELECTORS.modelControl, platform.DOLA_SELECTORS.durationControl]
+  );
+  check("编辑器优先用实测的 tiptap 编辑器", platform.DOLA_SELECTORS.editor.startsWith("div.tiptap.ProseMirror"), platform.DOLA_SELECTORS.editor);
+
+  // 参数设不上必须阻断：旧实现把「参数设置失败」当非致命继续，于是用平台默认值白白生成
+  const sendAt = driverSrc.indexOf('record("send"');
+  const blocksBeforeSend = (marker) => {
+    const at = driverSrc.indexOf(marker);
+    return at > 0 && at < sendAt && /return fail\(/.test(driverSrc.slice(at, at + 400));
+  };
+  check("模型失败即阻断（且在发送之前）", blocksBeforeSend("if (!modelStep?.ok)"));
+  check("时长失败即阻断（且在发送之前）", blocksBeforeSend("if (!durationStep?.ok)"));
+  check("比例失败即阻断（且在发送之前）", blocksBeforeSend("if (!ratioStep?.ok)"));
+  check("已删除「找不到比例控件也继续生成」的旧处理", !/不阻塞提交/.test(driverSrc));
+  check("参数必须回读一致（回读不一致视为未生效）", /回读不一致/.test(driverSrc));
+
+  // 图片引用必须核实，不能只因为「工作台写了 @图1」就认为平台收到了引用
+  check("提交前核实编辑器内联引用", /STEP_VERIFY_REFS/.test(driverSrc) && driverSrc.includes('record("verifyRefs"'));
+  check("引用未核实通过就阻断提交（且在发送之前）", blocksBeforeSend("if (!refsStep?.ok)"));
+
+  // 归属：定位页面时必须能证明「本进程 + 该账号隔离会话」
+  check("驱动层带会话归属证据", /sessionEvidence/.test(driverSrc) && /sessionMatched/.test(driverSrc));
+  check("分区无法核实时停止操作该页面", /已停止操作该页面/.test(driverSrc));
+  // 实测：Electron 的 Session 不暴露 getPartition()，旧实现据此判断会永远「未取到」而误报失败
+  check("不再依赖 Electron 不存在的 Session.getPartition", !/\.getPartition\?\.\(\)/.test(driverSrc) && !/\.getPartition\(\)/.test(driverSrc));
+  check("会话存储路径不在本实例数据目录时也停手", /storageUnderUserData/.test(driverSrc));
+
+  // 实测缺陷（2026-09-23 真实提交 att_5344bc651f4b / att_a3ccf555afb4）：
+  // 点击确实命中了 #flow-end-msg-send，但平台毫无反应，事后会话页是空的。
+  // 旧实现只在「点击成功」后干等任务 ID，把「点击没生效」误当成「响应来得慢」。
+  check("发送后有「页面是否真的起反应」的判定", /STEP_SEND_REACTION/.test(driverSrc) && /waitForSendReaction/.test(driverSrc));
+  check("页面没反应时明确失败而不是干等", /没有任何反应/.test(driverSrc) && /没有真正提交/.test(driverSrc));
+  check("记录生成类网络请求（区分点击没生效与拿不到任务 ID）", /requestWillBeSent/.test(driverSrc) && /observedRequests/.test(driverSrc));
+  check("记录请求时丢弃查询串（避免把敏感参数落库）", /parsed\.pathname/.test(driverSrc));
+  check("参考图数量必须与本次一致（残图会让附件对不上）", /cards\.length === expected/.test(driverSrc));
+
+  // 步骤顺序：等就绪 → 进视频模式 → 清残留图 → 写提示词 → 选参数 → 传图 → 核实 → 发送
+  const order = [
+    'record("waitReady"',
+    'record("enterVideoMode"',
+    'record("clearAttachments"',
+    'record("setPrompt"',
+    'record("chooseModel"',
+    'record("chooseDuration"',
+    'record("attachImages"',
+    'record("verifyRefs"',
+    'record("send"',
+  ].map((marker) => driverSrc.indexOf(marker));
+  check(
+    "步骤顺序固定为：就绪 → 视频模式 → 清残留图 → 提示词 → 参数 → 图片 → 核实 → 发送",
+    order.every((index, i) => index > 0 && (i === 0 || index > order[i - 1])),
+    order
+  );
+  check("上传前先清空页面上残留的参考图（否则会把上次的图一起发出去）", /STEP_CLEAR_ATTACHMENTS/.test(driverSrc) && driverSrc.indexOf('record("clearAttachments"') < driverSrc.indexOf('record("attachImages"'));
+  check("按文件名核对平台附件是否就是本次要传的图片", /__NAMES__/.test(driverSrc) && /missingNames/.test(driverSrc));
+
+  // 实测缺陷（2026-09-23）：平台处理完上传后不会清空 input.value，
+  // 再次上传同一批图片时 FileList 没变化、change 不触发 → 页面上没有缩略图，等于发了个没有参考图的请求
+  check("上传前先清空 file input 的 value", /STEP_RESET_FILE_INPUT/.test(driverSrc));
+  check(
+    "清空 file input 发生在设置文件之前",
+    driverSrc.indexOf("STEP_RESET_FILE_INPUT") > 0 &&
+      driverSrc.indexOf("const reset = await evaluate") < driverSrc.indexOf("DOM.setFileInputFiles"),
+    [driverSrc.indexOf("const reset = await evaluate"), driverSrc.indexOf("DOM.setFileInputFiles")]
+  );
+  check("清空失败（没有文件入口）即阻断上传", /没有可用的文件上传入口/.test(driverSrc));
+
+  // 实测缺陷（2026-09-23 真实提交）：刚点开账号时 getURL() 短暂为空，
+  // 旧实现立刻判定「页面不在 dola 上」直接失败（提交记录 att_01c7f8fc56d8，31ms 就失败）
+  check("定位页面会等到真正落到 dola 上（不是立刻放弃）", /for \(;;\)/.test(driverSrc) && /deadline/.test(driverSrc));
+  check("等页面就绪有明确上限", /READY_TIMEOUT_MS/.test(driverSrc));
+  check("失败时给出实测状态而不是含糊报错", /秒内没有就绪/.test(driverSrc) && /实测状态/.test(driverSrc));
+
+  // 多账号默认语义：默认「分配执行」，对比模式必须显式选择
+  console.log("── 回归：多账号默认语义 ──");
+  const boards = ["sb_1", "sb_2", "sb_3"];
+  const accounts = ["acc_a", "acc_b"];
+  const distributed = platform.assignStoryboards({ storyboardIds: boards, accountIds: accounts });
+  eq("默认模式每条分镜只执行一次", distributed.length, 3);
+  eq("默认模式分镜不重复", [...new Set(distributed.map((a) => a.storyboardId))].length, 3);
+  eq("默认模式按顺序轮转账号", distributed.map((a) => a.accountId), ["acc_a", "acc_b", "acc_a"]);
+  eq("默认模式标记为 distribute", distributed[0].mode, "distribute");
+  const compared = platform.assignStoryboards({ storyboardIds: boards, accountIds: accounts, mode: "compare" });
+  eq("对比模式才在每个账号各生成一次", compared.length, 6);
+  eq("对比模式标记为 compare", compared[0].mode, "compare");
+  eq("单分镜单账号默认只产生一条（本轮真实验证的路径）", platform.assignStoryboards({ storyboardIds: ["sb_1"], accountIds: ["acc_a"] }).length, 1);
+  eq("单分镜多账号在默认模式下仍只有一条", platform.assignStoryboards({ storyboardIds: ["sb_1"], accountIds: accounts }).length, 1);
+  eq("对比模式下单分镜多账号成倍", platform.assignStoryboards({ storyboardIds: ["sb_1"], accountIds: accounts, mode: "compare" }).length, 2);
+  eq("空输入返回空计划", platform.assignStoryboards({ storyboardIds: [], accountIds: accounts }).length, 0);
+
+  check("渲染层默认模式是分配执行", /run: \{ mode: "distribute"/.test(rendererSrc), "state.run 初始化");
+  check("打开确认框的默认模式是分配执行", /async function openRunModal\(storyboardIds, mode = "distribute"\)/.test(rendererSrc));
+  check("确认框提供模式选择", /workbenchRunMode/.test(rendererSrc));
+  check("分镜卡片按钮走分配模式", /openRunModal\(\[storyboardId\], "distribute"\)/.test(rendererSrc));
+  check("工具栏有「生成整批（分配执行）」入口", /id="workbenchRunBatch"/.test(indexSrc) && /workbenchRunBatch/.test(rendererSrc));
+
+  check("界面不再写「每个账号各生成一条」当作默认", !/每个账号各生成一条/.test(rendererSrc));
+
+  const labelSrc = rendererSrc;
+  check(
+    "步骤中文名包含新步骤",
+    ["waitReady", "enterVideoMode", "verifyRefs"].every((key) => labelSrc.includes(`${key}:`)),
+    ["waitReady", "enterVideoMode", "verifyRefs"].filter((key) => !labelSrc.includes(`${key}:`))
+  );
 
   fs.rmSync(root, { recursive: true, force: true });
 

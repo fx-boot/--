@@ -157,6 +157,8 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     enqueue: (projectId, storyboardId, accountId) =>
       ipcRenderer.invoke("workbench:task-enqueue", projectId, storyboardId, accountId),
     list: (projectId) => ipcRenderer.invoke("workbench:tasks", projectId),
+    assignments: (storyboardIds, accountIds, mode) =>
+      ipcRenderer.invoke("workbench:task-assignments", storyboardIds, accountIds, mode),
     execute: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-execute", projectId, attemptId),
     cancel: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-cancel", projectId, attemptId),
     retry: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-retry", projectId, attemptId),

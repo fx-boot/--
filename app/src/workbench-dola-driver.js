@@ -10,22 +10,32 @@
  *   结果在隔离环境里 20 秒页面加载超时、随后 15 秒脚本执行超时，首个步骤直接失败
  *   （任务卡片显示 02:02:25 提交 → 02:03:00 失败，恰为两个超时之和）。
  *   隐藏窗口既加载不出页面，也拿不到真实 webview 才有的 preload 能力，故改为直接驱动真实 webview。
- *   定位方式与应用内既有模块保持一致（account-proxy.js / hd-original-service.js）：
- *   webContents.getAllWebContents() + getType()==='webview' + 会话分区相同。
  *
- * 选择器与手法来自本项目内既有可读模块的实测代码：
- *   - src/webview-preload.js：编辑器选择器、\uFFFC 原子节点、TEXTAREA 原生 setter、
- *     contenteditable 走 execCommand('insertText')、菜单选择器 MENU_SELECTOR、
- *     工具栏控件 data-input-engine-actionbar-control-key
- *   - src/video-log-data.js：从响应中提取 task_id/video_id/status 的字段名
- * 但「真实点击发送、真实取回平台任务 ID、真实判定完成」仍必须通过单任务实机运行确认。
+ * ⚠ 上一轮失败的真正原因（隔离版任务日志 att_1bea070d7ef0，2026-09-23 12:29:56 → 12:30:09）：
+ *   openPage / setPrompt 成功，但 chooseModel / chooseDuration / chooseRatio / send 全部失败，
+ *   页面地址是 https://www.dola.com/chat/ —— 也就是「聊天模式」。
+ *   实测结论：聊天模式下 data-input-engine-actionbar 与三个控件计数均为 0，
+ *   提示词被写进了聊天输入框，模型/时长/比例控件根本不存在，发送按钮也不是 #flow-end-msg-send。
+ *   因此进入视频生成模式是提交前的必要前置步骤，不能靠「页面上恰好是什么模式」。
+ *   早前两次失败（12:15 / 12:20）则是「页面还没加载完就去操作」，现在改为等主进程的就绪事件。
  *
- * 因此每个步骤都返回结构化结果；失败时把页面上实际可见的选项与页面地址一并回报，
- * 便于快速校准，而不是靠猜。
+ * 实测得到的页面事实（2026-09-23，DevTools 直连真实 webview）：
+ *   - 页面就绪后脚本通道 1ms 返回；readyState=complete
+ *   - 「视频生成」入口：button[data-skill-id="skill_bar_button_17"]
+ *   - 视频模式控件：[data-input-engine-actionbar-control-key="video-model"|"video-duration"|"video-ratio"]
+ *     三者都是 radix trigger（aria-haspopup=menu / data-state=closed / data-slot=dropdown-menu-trigger）
+ *   - radix 只监听真实指针事件：element.click() 打不开菜单（三轮实测确认）
+ *   - 编辑器是 div.tiptap.ProseMirror[contenteditable=true]，不是 textarea
+ *   - 发送按钮 #flow-end-msg-send，编辑器为空时 disabled + aria-disabled=true
  *
  * 设计约束：
  * - 只借用账号已有的登录会话（persist:doubao-manager-<accountId>），不新建登录。
  * - 绝不销毁账号页面：那是应用自己的 webview，驱动层只是借用其调试通道。
+ * - 账号页面归属必须可证明：webContents 来自本进程 getAllWebContents()，
+ *   且 contents.session 必须与 persist:doubao-manager-<accountId> 是同一个会话对象；
+ *   能读到会话存储路径时一并回报。证明不了就不操作该页面。
+ * - 参数（模型/时长/比例）必须设置成功并回读一致才继续；任何一项无法生效都阻断提交，
+ *   绝不用平台默认值继续生成。
  * - 拿不到平台任务 ID 时返回 outcome:"unknown"，由编排层标记「提交结果待确认」，
  *   绝不在本层重复提交。
  * - 不做任何进度百分比的编造：页面没有明确信号时返回 unknown。
@@ -43,6 +53,8 @@ const IMAGE_TIMEOUT_MS = 20 * 1000;
 // 选页前先做一次极轻量的脚本探测：同一个账号分区下可能有多个 webview，
 // 必须挑出脚本通道真正可用的那个，否则后面每步都会白白超时。
 const PROBE_TIMEOUT_MS = 5 * 1000;
+// 等页面就绪：完全由主进程事件与 is-loading 事实判定，不靠脚本探测
+const READY_TIMEOUT_MS = 25 * 1000;
 const DOLA_HOST_RE = /(^|\.)dola\.com$/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -57,25 +69,59 @@ function hostOf(url) {
 
 const isDolaUrl = (url) => DOLA_HOST_RE.test(hostOf(url));
 
+const readSafe = (fn) => {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * 页面事实：全部来自主进程 API，不依赖脚本通道，因此永远不会挂起。
  * 用于在「脚本超时」时给出可判断的信息，而不是只留一句超时。
  */
 function describeView(contents) {
   const facts = { webContentsId: contents?.id };
-  const read = (fn) => {
-    try {
-      return fn();
-    } catch {
-      return undefined;
-    }
-  };
-  facts.url = read(() => contents.getURL()) || "";
-  facts.type = read(() => contents.getType());
-  facts.loading = Boolean(read(() => contents.isLoading()));
-  facts.crashed = Boolean(read(() => contents.isCrashed()));
-  facts.rendererPid = read(() => contents.getOSProcessId());
+  facts.url = readSafe(() => contents.getURL()) || "";
+  facts.type = readSafe(() => contents.getType());
+  facts.loading = Boolean(readSafe(() => contents.isLoading()));
+  facts.crashed = Boolean(readSafe(() => contents.isCrashed()));
+  facts.rendererPid = readSafe(() => contents.getOSProcessId());
   return facts;
+}
+
+/**
+ * 归属证据：证明这个页面确实属于「本开发进程 + 该账号的隔离会话」。
+ *   - 进程归属：getAllWebContents() 只返回本进程创建的 webContents，findAccountWebview 已按此过滤；
+ *   - 会话归属：contents.session 必须与 session.fromPartition('persist:doubao-manager-<accountId>')
+ *     是同一个会话对象（Electron 的 Session 不暴露 getPartition，因此用对象同一性来证明）；
+ *   - 存储归属：能读到会话存储路径时，核实它落在本进程的 userData 目录下（读不到就如实标未知）。
+ */
+function sessionEvidence(contents, accountId) {
+  const expectedPartition = `${PARTITION_PREFIX}${accountId}`;
+  let expected = null;
+  try {
+    expected = session.fromPartition(expectedPartition);
+  } catch {}
+  const sessionMatched = Boolean(expected) && contents?.session === expected;
+  const storagePath =
+    readSafe(() => contents?.session?.getStoragePath?.()) ||
+    String(readSafe(() => contents?.session?.storagePath) || "");
+  let userData = "";
+  try {
+    userData = require("electron").app.getPath("userData");
+  } catch {}
+  return {
+    expectedPartition,
+    sessionMatched,
+    partitionMatches: sessionMatched, // 会话对象同一性 = 分区归属成立
+    storagePath,
+    userData,
+    // null 表示读不到，不当作失败；false 表示读到了但不在本实例数据目录下（必须停手）
+    storageUnderUserData: storagePath && userData ? storagePath.startsWith(userData) : null,
+    processOwned: true,
+  };
 }
 
 /**
@@ -90,6 +136,8 @@ function findAccountWebview(accountId) {
   } catch (error) {
     return { ok: false, reason: `账号会话分区不可用（${partition}）：${error?.message || error}` };
   }
+  // 分区必须是本应用自己的账号分区：只取「会话对象完全一致」的 webview，
+// 前缀不符时 session.fromPartition 拿到的就是另一个会话对象，天然不会误选别人的页面。
   const views = webContents
     .getAllWebContents()
     .filter(
@@ -111,7 +159,12 @@ function findAccountWebview(accountId) {
         .join(" | ")}`,
     };
   }
-  return { ok: true, candidates: onDola, all: views.map(describeView) };
+  return {
+    ok: true,
+    candidates: onDola,
+    all: views.map(describeView),
+    evidence: onDola.map((contents) => ({ ...describeView(contents), ...sessionEvidence(contents, accountId) })),
+  };
 }
 
 /** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
@@ -133,11 +186,17 @@ function pageScript(source) {
 const HELPERS = `
   const SEL = ${JSON.stringify({
     editor: DOLA_SELECTORS.editor,
+    videoModeButton: DOLA_SELECTORS.videoModeButton,
     model: DOLA_SELECTORS.modelControl,
     duration: DOLA_SELECTORS.durationControl,
     ratio: DOLA_SELECTORS.ratioControl,
     actionbar: DOLA_SELECTORS.actionbar,
+    sendButton: DOLA_SELECTORS.sendButton,
+    menu: DOLA_SELECTORS.menu,
+    menuItem: DOLA_SELECTORS.menuItem,
+    option: DOLA_SELECTORS.option,
     fileInput: DOLA_SELECTORS.fileInput,
+    atomicMark: DOLA_SELECTORS.atomicMark,
   })};
   // 刻意不要求「有非零尺寸」：目标可能是账号非当前选中态时的 webview（被应用隐藏），
   // 那种情况下元素 rect 恒为 0×0，但 DOM 完全可用。这里只排除真正不渲染的节点。
@@ -150,14 +209,76 @@ const HELPERS = `
     } catch { return false; }
   };
   const textOf = (el) => String(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title') || '').replace(/\\s+/g, ' ').trim();
-  const editors = () => [...document.querySelectorAll(SEL.editor)].filter(e => visible(e) && !e.disabled && !e.readOnly);
   const attr = (el, name) => { try { return String(el?.getAttribute?.(name) || ''); } catch { return ''; } };
+  const norm = (s) => String(s || '').toLowerCase().replace(/[\\s_\\-]/g, '');
+  const compact = (s) => String(s || '').replace(/\\s+/g, '').replace(/[\\u2713\\u2714\\u221a]/g, '');
+  const controlFor = (key) => document.querySelector('[data-input-engine-actionbar-control-key="' + key + '"]');
+  const controlText = (key) => textOf(controlFor(key));
+  const editors = () => [...document.querySelectorAll(SEL.editor)].filter(e => visible(e) && !e.disabled && !e.readOnly);
+
+  // radix 只监听真实指针事件：element.click() 打不开菜单（实测）。
+  // 依次派发 pointerdown / pointerup / click，并带上真实坐标。
+  const pointerClick = (el) => {
+    if (!el) return false;
+    try { el.scrollIntoView?.({ block: 'nearest' }); } catch {}
+    let x = 0, y = 0;
+    try {
+      const rect = el.getBoundingClientRect();
+      x = rect.left + Math.max(1, rect.width) / 2;
+      y = rect.top + Math.max(1, rect.height) / 2;
+    } catch {}
+    const base = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, buttons: 1, view: window };
+    try {
+      el.dispatchEvent(new PointerEvent('pointerdown', { ...base, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      el.dispatchEvent(new PointerEvent('pointerup', { ...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      el.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0, detail: 1 }));
+      try { el.click(); } catch {}
+      return true;
+    } catch {
+      try { el.click(); return true; } catch { return false; }
+    }
+  };
+
+  // radix 菜单容器只认 role：触发器是 button[data-slot="dropdown-menu-trigger"]，
+// 它自身也带 data-slot*="dropdown-menu"，若按属性匹配会把触发器当成菜单（实测踩过）。
+  const menuRoots = () => [...document.querySelectorAll(SEL.menu)].filter(visible);
+  const isOpenMenu = (el) => attr(el, 'data-state') === 'open' || attr(el, 'data-slot') === 'dropdown-menu-content';
+  // 选项优先取 role=menuitem/option：菜单项内部还有嵌套 div，用泛化选择器会重复计数
+  const menuOptions = (root) => {
+    const items = [...root.querySelectorAll(SEL.menuItem)].filter(el => visible(el) && textOf(el));
+    if (items.length) return items;
+    return [...root.querySelectorAll(SEL.option)].filter(el => el !== root && visible(el) && textOf(el));
+  };
+  const menuTexts = () => menuRoots().map(r => textOf(r).slice(0, 80)).slice(0, 3);
+  // 打开后挑出真正的菜单内容：优先 data-state=open，其次点击后新出现的，最后取最内层
+  const pickMenu = (beforeSet) => {
+    const all = menuRoots();
+    const rank = (list) => {
+      const good = list.filter(el => menuOptions(el).length >= 1);
+      const inner = good.filter(el => !good.some(o => o !== el && el.contains(o)));
+      return inner.sort((a, b) => menuOptions(a).length - menuOptions(b).length)[0] || null;
+    };
+    return rank(all.filter(isOpenMenu)) || rank(all.filter(el => beforeSet && !beforeSet.has(el))) || rank(all) || null;
+  };
+  // 触发器文本就是当前值，用它做回读（模型只显示「2.5 / 2.0 Fast」这类短名）
+  const triggerState = (key) => {
+    const control = controlFor(key);
+    return control ? { text: textOf(control), open: attr(control, 'data-state') === 'open' } : { text: '', open: false };
+  };
   // 失败时把「页面在哪、页面上写着什么」一并回报，便于判断是不是撞了登录墙
   const pageInfo = () => {
     try {
       return { pageUrl: String(location.href), pageExcerpt: String(document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 300) };
     } catch { return { pageUrl: '', pageExcerpt: '' }; }
   };
+  const toolbarState = () => ({
+    inVideoMode: Boolean(controlFor('video-model') && controlFor('video-duration')),
+    model: controlText('video-model'),
+    duration: controlText('video-duration'),
+    ratio: controlText('video-ratio'),
+    editorCount: editors().length,
+    sendDisabled: (() => { const b = document.querySelector(SEL.sendButton); return b ? Boolean(b.disabled) || attr(b,'aria-disabled') === 'true' : null; })(),
+  });
 `;
 
 async function evaluate(contents, source) {
@@ -189,98 +310,310 @@ async function probeView(contents) {
   return result;
 }
 
-/** 点击某个控件并从中选择匹配项；失败时回报实际可见选项 */
-const STEP_CHOOSE = `
-  const controlSelector = __SELECTOR__;
-  const wanted = __WANTED__;
-  const control = document.querySelector(controlSelector);
-  if (!control) return { ok: false, reason: '页面上找不到该控件', wanted, available: [], ...pageInfo() };
-  control.click();
-  await new Promise(r => setTimeout(r, 600));
-  const menus = [...document.querySelectorAll('[role="menu"],[role="listbox"],[data-slot*="dropdown-menu"],[class*="popover"],[class*="dropdown"]')].filter(visible);
-  const options = menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"],[role="option"],li,button,div')]).filter(visible);
-  const labels = [...new Set(options.map(textOf).filter(Boolean))].slice(0, 40);
-  const norm = (s) => s.toLowerCase().replace(/[\\s_\\-]/g, '');
-  const target = options.find(o => norm(textOf(o)).includes(norm(wanted)));
-  if (!target) return { ok: false, reason: '菜单里没有匹配项', wanted, available: labels, ...pageInfo() };
-  target.click();
-  await new Promise(r => setTimeout(r, 400));
-  return { ok: true, picked: textOf(target), available: labels };
+/**
+ * 等页面就绪：只看主进程事实（isLoading / did-fail-load / 崩溃），不靠脚本探测，
+ * 因为「脚本超时」本身就是页面没加载完的症状（实测 1ms 即可返回的前提是页面已就绪）。
+ */
+async function waitForPageReady(contents, timeoutMs = READY_TIMEOUT_MS) {
+  const started = Date.now();
+  let loadError = null;
+  const onFail = (_event, code, desc, url) => {
+    // -3 是主动中止，不算失败
+    if (Number(code) !== -3) loadError = { code, desc, url };
+  };
+  const onGone = () => {
+    loadError = { code: "render-process-gone", desc: "渲染进程已退出" };
+  };
+  try {
+    contents.on("did-fail-load", onFail);
+    contents.on("render-process-gone", onGone);
+  } catch {}
+  try {
+    for (;;) {
+      const facts = describeView(contents);
+      if (facts.crashed) return { ok: false, reason: "渲染进程已崩溃", ...facts };
+      if (loadError) {
+        return { ok: false, reason: `页面加载失败：${loadError.code} ${loadError.desc}`, ...facts };
+      }
+      if (!facts.loading && isDolaUrl(facts.url)) return { ok: true, ...facts };
+      if (Date.now() - started >= timeoutMs) {
+        return { ok: false, reason: `等待页面就绪超时（${Math.round(timeoutMs / 1000)} 秒）`, ...facts };
+      }
+      await sleep(200);
+    }
+  } finally {
+    try {
+      contents.removeListener("did-fail-load", onFail);
+      contents.removeListener("render-process-gone", onGone);
+    } catch {}
+  }
+}
+
+/**
+ * 幂等进入视频生成模式。
+ * 聊天模式下工具栏控件计数为 0，必须先点「视频生成」再操作参数控件。
+ */
+const STEP_ENTER_VIDEO = `
+  const before = toolbarState();
+  if (before.inVideoMode) return { ok: true, skipped: true, picked: '已在视频生成模式', ...before };
+  let button = document.querySelector(SEL.videoModeButton);
+  if (!button) {
+    // 兜底：按可见文案找「视频生成」，同时把实际存在的技能入口回报出来供校准
+    button = [...document.querySelectorAll('button,[role="button"]')].find(el => /视频生成|视频$/.test(textOf(el)) && visible(el));
+  }
+  if (!button) {
+    const skills = [...document.querySelectorAll('[data-skill-id]')]
+      .map(el => ({ id: attr(el, 'data-skill-id'), text: textOf(el) }))
+      .slice(0, 20);
+    return { ok: false, reason: '找不到「视频生成」入口，无法切换到视频模式', skills, ...pageInfo() };
+  }
+  pointerClick(button);
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 200));
+    if (toolbarState().inVideoMode) return { ok: true, picked: textOf(button) || attr(button, 'data-skill-id'), ...toolbarState() };
+  }
+  return { ok: false, reason: '已经点击「视频生成」，但模型/时长控件始终没有出现', ...toolbarState(), ...pageInfo() };
 `;
 
+/**
+ * 打开某个 radix 下拉并选择目标项，随后回读控件文本。
+ * 回读不一致即视为「参数未生效」，交由调用方阻断提交。
+ */
+const STEP_CHOOSE = `
+  const controlSelector = __SELECTOR__;
+  const wantKey = __KEY__;
+  const wanted = __WANTED__;     // 菜单项里要匹配的文案
+  const readback = __READBACK__; // 选完后触发器上应能看到的文本（模型只显示短名）
+  const control = document.querySelector(controlSelector);
+  if (!control) return { ok: false, reason: '页面上找不到该控件（可能未进入视频模式）', wanted, ...toolbarState(), ...pageInfo() };
+  const before = triggerState(wantKey);
+  const beforeSet = new Set(menuRoots());
+  pointerClick(control);
+  let root = null;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    root = pickMenu(beforeSet);
+    if (root) break;
+    await new Promise(r => setTimeout(r, 120));
+  }
+  if (!root) {
+    return {
+      ok: false,
+      reason: '点击控件后没有出现菜单（radix 只认真实指针事件）',
+      wanted, before: before.text, triggerOpen: triggerState(wantKey).open,
+      openedMenuTexts: menuTexts(), ...pageInfo(),
+    };
+  }
+  const options = menuOptions(root);
+  const labels = [...new Set(options.map(textOf).filter(Boolean))].slice(0, 40);
+  const exact = options.find(o => compact(textOf(o)) === compact(wanted));
+  const target = exact || options.find(o => norm(textOf(o)).includes(norm(wanted)));
+  if (!target) {
+    pointerClick(control);
+    return { ok: false, reason: '菜单里没有匹配项', wanted, available: labels, ...pageInfo() };
+  }
+  const picked = textOf(target);
+  pointerClick(target);
+  await new Promise(r => setTimeout(r, 600));
+  const after = triggerState(wantKey);
+  const applied = norm(after.text).includes(norm(readback));
+  return {
+    ok: applied,
+    picked,
+    before: before.text,
+    after: after.text,
+    available: labels,
+    reason: applied ? undefined : '已点选菜单项，但触发器回读不一致，参数可能没有真正生效',
+  };
+`;
+
+/** 写入提示词：按分段顺序插入，图片位置写入原子占位符（与既有模块同一套约定） */
 const STEP_SET_TEXT = `
   const list = editors();
   if (!list.length) return { ok: false, reason: '找不到提示词输入框（可能未登录、页面未加载完成或页面结构已变化）', ...pageInfo() };
   const editor = list[0];
-  const value = __VALUE__;
+  const segments = __SEGMENTS__;
   editor.focus();
-  if (editor.tagName === 'TEXTAREA') {
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-    setter.call(editor, value);
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-  } else {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    const selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    document.execCommand('delete');
-    if (!document.execCommand('insertText', false, value)) return { ok: false, reason: '输入框拒绝写入文本' };
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  const selection = getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  document.execCommand('delete');
+  let failed = 0;
+  for (const segment of segments) {
+    const value = segment.kind === 'image' ? SEL.atomicMark : String(segment.value || '');
+    if (!value) continue;
+    if (!document.execCommand('insertText', false, value)) failed++;
   }
-  await new Promise(r => setTimeout(r, 200));
-  const readback = editor.tagName === 'TEXTAREA' ? editor.value : editor.innerText;
-  return { ok: readback.includes(value.slice(0, Math.min(12, value.length))), readback: String(readback).slice(0, 200) };
+  await new Promise(r => setTimeout(r, 300));
+  const readback = String(editor.innerText || editor.textContent || '');
+  const atomicCount = (editor.textContent || '').split(SEL.atomicMark).length - 1;
+  const plain = segments.map(s => s.kind === 'image' ? '' : String(s.value || '')).join('');
+  const actual = readback.replace(/\\s+/g, '').replace(/\\uFFFC/g, '');
+  const expected = plain.replace(/\\s+/g, '');
+  return {
+    ok: failed === 0 && Boolean(expected) && actual === expected,
+    failed,
+    atomicCount,
+    expectedImages: segments.filter(s => s.kind === 'image').length,
+    // 不一致时同时给出两边的开头，便于实机校准（不是猜）
+    actualText: actual.slice(0, 120),
+    expectedText: expected.slice(0, 120),
+    reason: failed === 0 ? undefined : String(failed) + ' 个分段没有被编辑器接受',
+    ...toolbarState(),
+    ...pageInfo(),
+  };
 `;
 
+/** 读取页面状态（含工具栏与发送按钮可用性），供提交前核实用 */
 const STEP_READ_STATE = `
   const body = document.body ? document.body.innerText : '';
-  return { ok: true, text: String(body).replace(/\\s+/g, ' ').slice(0, 800), url: location.href };
+  return { ok: true, text: String(body).replace(/\\s+/g, ' ').slice(0, 800), url: location.href, ...toolbarState() };
+`;
+
+/**
+ * 上传前把 file input 的 value 清空。
+ * 实测（2026-09-23）：平台处理完上传后并不会清空 input.value，
+ * 于是再次上传同一批图片时 FileList 没变化、change 事件不触发，
+ * 结果是「输入框里还留着旧文件、页面上却没有缩略图」——会发出不带参考图的请求。
+ */
+const STEP_RESET_FILE_INPUT = `
+  const input = document.querySelector(SEL.fileInput);
+  if (!input) return { ok: true, found: false };
+  const before = input.files ? input.files.length : 0;
+  try { input.value = ''; } catch {}
+  return { ok: true, found: true, clearedFrom: before, after: input.files ? input.files.length : 0 };
+`;
+
+/**
+ * 清空编辑器里已有的参考图缩略卡（实测：div[class*="thumb-card"] 内含 img[src^=blob:] 与 button[class*="delete-btn"]）。
+ * 不清空就会把上一次残留的图片一起发出去，导致「工作台 assetId 与平台实际附件」对不上。
+ */
+const STEP_CLEAR_ATTACHMENTS = `
+  const cards = () => [...document.querySelectorAll('[class*="thumb-card"], [data-kind="image"]')]
+    .filter(el => el.querySelector('img[src^="blob:"]'));
+  const before = cards().length;
+  if (!before) return { ok: true, skipped: true, removed: 0, remaining: 0 };
+  let guard = 0;
+  while (cards().length && guard < 20) {
+    const card = cards()[0];
+    const button = card.querySelector('button[class*="delete-btn"]') || card.querySelector('button');
+    if (!button) break;
+    pointerClick(button);
+    await new Promise(r => setTimeout(r, 250));
+    guard++;
+  }
+  const remaining = cards().length;
+  return {
+    ok: remaining === 0,
+    removed: before - remaining,
+    remaining,
+    reason: remaining === 0 ? undefined : '无法清空已有的参考图缩略图，为避免带上不属于本次的图片而停止提交',
+  };
+`;
+
+/** 上传后核实编辑器里真的出现了内联引用节点，以及平台收到的附件是否就是本次的图片 */
+const STEP_VERIFY_REFS = `
+  const list = editors();
+  const editor = list[0] || null;
+  const names = __NAMES__;      // 本次要上传的文件名，用于和平台附件逐一对应
+  const expected = names.length;
+  const text = editor ? String(editor.textContent || '') : '';
+  const atomicCount = editor ? text.split(SEL.atomicMark).length - 1 : 0;
+  // 实测：每个参考图缩略卡里有两个 img（明/暗主题各一），按父节点去重才是真实张数；
+  // alt 就是上传时的原始文件名，用它核对「平台收到的附件 = 本次要传的图片」
+  const blobImgs = [...document.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const cards = [...new Set(blobImgs.map(img => img.parentElement))];
+  const altNames = cards.map(card => { const img = card.querySelector('img[alt]'); return img ? String(img.getAttribute('alt')) : ''; });
+  const matched = names.filter(name => altNames.includes(name));
+  const missingNames = names.filter(name => !altNames.includes(name));
+  const enoughAttachments = expected === 0 || cards.length === expected;
+  const enoughInline = expected === 0 || atomicCount >= expected;
+  return {
+    ok: enoughAttachments && enoughInline,
+    expected,
+    attachmentCards: cards.length,
+    matched: matched.length,
+    missingNames,
+    atomicCount,
+    blobImages: blobImgs.length,
+    editorText: text.slice(0, 200),
+    reason: expected === 0
+      ? '本次没有参考图'
+      : !enoughAttachments
+        ? '平台上的参考图数量与本次要传的不一致（本次 ' + expected + ' 张，平台上 ' + cards.length + ' 张；缺 ' + (missingNames.join('、') || '无') + '）'
+        : !enoughInline
+          ? '编辑器里的内联原子节点数少于参考图数量，平台可能没有建立内联引用'
+          : undefined,
+  };
+`;
+
+/**
+ * 点击发送后的「页面反应」观测。
+ * 实测（2026-09-23 真实提交 att_5344bc651f4b / att_a3ccf555afb4）：
+ * 点击确实命中了 #flow-end-msg-send，但 45 秒内既没拿到任务 ID，
+ * 事后会话页也是空的（URL 变成新会话、没有任何消息）。
+ * 也就是说「点了发送」不等于「平台开始生成」——必须能观察到页面真的起了反应。
+ */
+const STEP_SEND_REACTION = `
+  const list = editors();
+  const editor = list[0] || null;
+  const text = editor ? String(editor.textContent || '') : '';
+  const messages = document.querySelectorAll('[data-message-id]').length;
+  const bodyText = String(document.body?.innerText || '');
+  return {
+    ok: true,
+    editorEmpty: text.trim().length === 0,
+    editorText: text.slice(0, 60),
+    messages,
+    url: location.href,
+    // 页面上是否出现与生成相关的字眼（排队/生成中/失败/额度等）
+    hints: (bodyText.match(/生成中|排队|生成失败|额度不足|次数不足|敏感|违规|不支持/g) || []).slice(0, 5),
+  };
 `;
 
 /**
  * 点击发送。
- * 既有可读模块里没有留下发送按钮的实测选择器，所以这里不写死，
- * 而是按「无障碍标签 → 输入区工具栏尾部」的顺序探测候选控件，
- * 无论成功失败都把候选清单回报出来，首次实机运行即可据此校准。
+ * 发送按钮 id 已实测为 #flow-end-msg-send（聊天模式下不存在，故必须先进入视频模式）。
+ * 按钮不可用时明确报错，绝不盲点。
  */
 const STEP_SEND = `
-  const cands = [];
-  const add = (el, why) => {
-    if (!el || !visible(el)) return;
-    if (cands.some((c) => c.el === el)) return;
-    if (el.matches(SEL.model) || el.closest(SEL.model)) return;
-    if (el.matches(SEL.duration) || el.closest(SEL.duration)) return;
-    if (el.matches(SEL.ratio) || el.closest(SEL.ratio)) return;
-    cands.push({ el, why });
-  };
-  const describe = (el) => {
-    const label = [textOf(el), attr(el, 'aria-label'), attr(el, 'title'), attr(el, 'class')].filter(Boolean).join(' ');
-    return String(label).replace(/\\s+/g, ' ').trim().slice(0, 60);
-  };
-
-  // 1) 按文字/无障碍标签命中「发送 / 生成 / 提交」
-  const wanted = /发送|生成|提交|立即|send|generate|submit/i;
-  for (const el of [...document.querySelectorAll('button,[role="button"],[tabindex="0"]')]) {
-    if (wanted.test(describe(el))) add(el, 'label:' + describe(el));
+  const button = document.querySelector(SEL.sendButton);
+  const state = toolbarState();
+  if (!button) {
+    const cands = [...document.querySelectorAll('button,[role="button"]')]
+      .filter(el => visible(el) && /发送|生成|提交/i.test(textOf(el) + attr(el, 'aria-label')))
+      .map(el => textOf(el) || attr(el, 'aria-label') || attr(el, 'id'))
+      .slice(0, 12);
+    return { ok: false, reason: '页面上找不到发送按钮 #flow-end-msg-send（可能未进入视频模式）', candidates: cands, ...state, ...pageInfo() };
   }
-
-  // 2) 输入区工具栏里最后一个可点元素通常就是发送
-  if (cands.length < 2) {
-    const bar = document.querySelector(SEL.actionbar)
-      || document.querySelector(SEL.model)?.parentElement
-      || document.querySelector(SEL.editor)?.parentElement;
-    if (bar) {
-      const inside = [...bar.querySelectorAll('button,[role="button"],[tabindex="0"]')].filter(visible).reverse();
-      for (const el of inside.slice(0, 6)) add(el, 'toolbar-tail:' + describe(el));
-    }
+  const disabled = Boolean(button.disabled) || attr(button, 'aria-disabled') === 'true' || attr(button, 'data-disabled') === 'true';
+  if (disabled) {
+    return {
+      ok: false,
+      reason: '发送按钮处于禁用状态（提示词为空或参数未就绪），未点击',
+      candidates: [attr(button, 'id')],
+      ...state,
+      ...pageInfo(),
+    };
   }
-
-  const candidates = cands.slice(0, 12).map((c) => c.why);
-  const target = cands[0];
-  if (!target) return { ok: false, reason: '页面上找不到发送按钮，无法提交生成', candidates, ...pageInfo() };
-  target.el.click();
-  await new Promise((r) => setTimeout(r, 600));
-  return { ok: true, clicked: target.why, candidates };
+  pointerClick(button);
+  await new Promise(r => setTimeout(r, 800));
+  const after = toolbarState();
+  const editorsNow = editors();
+  return {
+    ok: true,
+    clicked: attr(button, 'id') || 'flow-end-msg-send',
+    candidates: [attr(button, 'id')],
+    sendDisabledAfter: after.sendDisabled,
+    editorText: (() => { const list = editorsNow; return list[0] ? String(list[0].textContent || '').slice(0, 120) : ''; })(),
+    // 点击前的指纹：用于判断点击后页面到底有没有起反应
+    beforeLength: (() => { const list = editorsNow; return list[0] ? String(list[0].textContent || '').length : 0; })(),
+    beforeMessages: document.querySelectorAll('[data-message-id]').length,
+    beforeUrl: String(location.href),
+  };
 `;
 
 /** 从响应体中收集任务类 ID：只认既有模块已确认的字段名，不猜 */
@@ -305,8 +638,6 @@ function collectIds(value, out = [], depth = 0) {
 function createDolaDriver(options = {}) {
   const resolveContents = options.resolveContents;
   const log = options.log || (() => {});
-  const modelLabel = options.modelLabel || ((model) =>
-    ({ "seedance2.5": "2.5", "seedance2.0fast": "2.0", "seedance2.0mini": "Mini" }[model] || model));
 
   const state = {
     verified: false, // 实机验证前一律为 false
@@ -322,49 +653,98 @@ function createDolaDriver(options = {}) {
       return contents;
     }
     // 直接借用应用自己为账号挂的 webview：已登录、带应用 preload，且不需要我们自己加载页面。
-    // 同一分区下可能有多个候选，必须逐个探测脚本通道，挑出真正可用的那个。
-    const found = findAccountWebview(accountId);
-    if (!found.ok) {
-      log("dola-webview-not-found", { accountId, reason: found.reason });
-      throw new Error(found.reason);
-    }
-    const tried = [];
-    for (const candidate of found.candidates) {
-      const probe = await probeView(candidate);
-      tried.push({ ...describeView(candidate), probe });
-      if (probe.ok) {
-        // 关掉后台节流：账号不是当前标签页时，页面才不会停摆
-        try {
-          if (typeof candidate.setBackgroundThrottling === "function") {
-            candidate.setBackgroundThrottling(false);
+    // 实测（2026-09-23）：刚点开账号时 webContents.getURL() 会短暂为空，
+    // 必须等它真正落到 dola 上再操作，否则会误判成「页面不在 dola 上」。
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    let lastReason = "";
+    for (;;) {
+      const found = findAccountWebview(accountId);
+      if (found.ok) {
+        for (const candidate of found.candidates) {
+          const remaining = Math.max(1000, deadline - Date.now());
+          const ready = await waitForPageReady(candidate, Math.min(READY_TIMEOUT_MS, remaining));
+          if (!ready.ok) {
+            lastReason = `${ready.reason}（${ready.url || "(空白)"}）`;
+            continue;
           }
-        } catch {}
-        log("dola-webview-resolved", { accountId, ...describeView(candidate) });
-        state.pages.set(accountId, candidate);
-        return candidate;
+          const probe = await probeView(candidate);
+          if (probe.ok) {
+            // 关掉后台节流：账号不是当前标签页时，页面才不会停摆
+            try {
+              if (typeof candidate.setBackgroundThrottling === "function") {
+                candidate.setBackgroundThrottling(false);
+              }
+            } catch {}
+            log("dola-webview-resolved", { accountId, ...describeView(candidate), ...sessionEvidence(candidate, accountId) });
+            state.pages.set(accountId, candidate);
+            return candidate;
+          }
+          lastReason = `脚本通道无响应：${probe.reason || "无响应"}（${ready.url || "(空白)"}）`;
+        }
+      } else {
+        lastReason = found.reason;
+        log("dola-webview-not-found", { accountId, reason: found.reason });
       }
+      if (Date.now() >= deadline) break;
+      await sleep(500);
     }
-    const detail = tried
+    const evidence = (findAccountWebview(accountId).evidence || [])
       .map(
         (item) =>
           `#${item.webContentsId} ${item.url || "(空白)"}${item.loading ? " [仍在加载]" : ""}${
             item.crashed ? " [渲染进程已崩溃]" : ""
-          } 探测：${item.probe.reason || "无响应"}`
+          } 分区：${item.partition || "(未知)"}${item.partitionMatches ? "(匹配)" : "(不匹配)"}`
       )
       .join("；");
-    log("dola-webview-unusable", { accountId, tried });
     throw new Error(
-      `账号 ${accountId} 有 ${tried.length} 个页面，但脚本通道都无响应。${detail}。请确认该账号页面已完全加载（必要时点开该账号页面再提交）`
+      `账号 ${accountId} 的页面在 ${Math.round(READY_TIMEOUT_MS / 1000)} 秒内没有就绪：${lastReason}${
+        evidence ? `。实测状态：${evidence}` : ""
+      }`
     );
   }
 
-  async function chooseOption(contents, selector, wanted) {
-    const code = STEP_CHOOSE.replace("__SELECTOR__", JSON.stringify(selector)).replace("__WANTED__", JSON.stringify(wanted));
+  /** 观察点击发送后页面有没有真的起反应（不编造，只比对前后事实） */
+  async function waitForSendReaction(contents, sendStep, timeoutMs = 12000) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    for (;;) {
+      const now = await evaluate(contents, STEP_SEND_REACTION).catch(() => null);
+      if (now?.ok) {
+        last = now;
+        const changedUrl = String(now.url || "") !== String(sendStep?.beforeUrl || "");
+        const shorter = Number(sendStep?.beforeLength) > 0 && String(now.editorText || "").length < Number(sendStep.beforeLength);
+        const moreMessages = Number(now.messages) > Number(sendStep?.beforeMessages || 0);
+        if (now.editorEmpty || changedUrl || moreMessages || shorter || (now.hints || []).length) {
+          return { ...now, started: true, changedUrl, moreMessages, editorEmptied: Boolean(now.editorEmpty) };
+        }
+      }
+      if (Date.now() >= deadline) {
+        return { ...(last || {}), started: false, reason: "页面没有反应" };
+      }
+      await sleep(600);
+    }
+  }
+
+  async function chooseOption(contents, selector, key, wanted, readback) {
+    const code = STEP_CHOOSE.replace("__SELECTOR__", JSON.stringify(selector))
+      .replace("__KEY__", JSON.stringify(key))
+      .replace("__WANTED__", JSON.stringify(wanted))
+      .replace("__READBACK__", JSON.stringify(readback));
     return evaluate(contents, code);
   }
 
   async function attachImages(contents, uploads) {
     if (!uploads?.length) return { ok: true, skipped: true, reason: "没有参考图片" };
+    // 先清空 file input，否则重复上传同一批图片不会触发平台的 change 事件
+    const reset = await evaluate(contents, STEP_RESET_FILE_INPUT);
+    if (!reset?.found) {
+      return {
+        ok: false,
+        reason: "当前页面没有可用的文件上传入口，无法附加参考图片",
+        limitation: "平台未提供图片上传入口时，参考图引用无法提交",
+        uploads,
+      };
+    }
     const dbg = contents.debugger;
     const owned = !dbg.isAttached();
     try {
@@ -384,8 +764,8 @@ function createDolaDriver(options = {}) {
         };
       }
       await dbg.sendCommand("DOM.setFileInputFiles", { nodeId, files: uploads });
-      await sleep(1500);
-      return { ok: true, count: uploads.length };
+      await sleep(2500);
+      return { ok: true, count: uploads.length, resetFrom: reset.clearedFrom };
     } catch (error) {
       return { ok: false, reason: error?.message || String(error) };
     } finally {
@@ -397,39 +777,61 @@ function createDolaDriver(options = {}) {
     }
   }
 
-  /** 等待页面发出视频生成请求并回读其中的任务 ID（不猜字段，取不到就报 unknown） */
+  /**
+   * 等待页面发出视频生成请求并回读其中的任务 ID（不猜字段，取不到就报 unknown）。
+   * 同时记录「有没有发出生成类请求、平台回了什么状态码」——
+   * 这是区分「点击没生效」和「点了但拿不到任务 ID」的关键证据（URL 只保留 host+path，丢弃查询串）。
+   */
   async function watchForTaskId(contents, timeoutMs) {
     const dbg = contents.debugger;
     const owned = !dbg.isAttached();
-    const seen = { taskId: "", ids: [], error: "" };
+    const seen = { taskId: "", ids: [], error: "", requests: [] };
     let resolveDone;
     const done = new Promise((resolve) => {
       resolveDone = resolve;
     });
+    const noteRequest = (method, url, status) => {
+      try {
+        const parsed = new URL(String(url));
+        if (!/(^|\.)dola\.com$|(^|\.)doubao\.com$/i.test(parsed.hostname)) return;
+        // 上传/素材类请求不算生成请求
+        if (/(upload|material|attachment|storage|bytevcloud|vod|tos)([/?#_.-]|$)/i.test(parsed.pathname)) return;
+        const key = `${method} ${parsed.pathname}`;
+        if (seen.requests.some((item) => item.key === key)) return;
+        if (seen.requests.length >= 12) return;
+        seen.requests.push({ key, method, path: parsed.pathname.slice(0, 120), status: status ?? null });
+      } catch {}
+    };
     const onMessage = (_event, method, params) => {
       try {
-        if (method !== "Network.responseReceived") return;
-        const mime = params?.response?.mimeType || "";
-        if (!/json/i.test(mime)) return;
-        contents.debugger
-          .sendCommand("Network.getResponseBody", { requestId: params.requestId })
-          .then(({ body }) => {
-            const parsed = (() => {
-              try {
-                return JSON.parse(body);
-              } catch {
-                return null;
+        if (method === "Network.responseReceived") {
+          noteRequest("RESP", params?.response?.url, params?.response?.status);
+          const mime = params?.response?.mimeType || "";
+          if (!/json/i.test(mime)) return;
+          contents.debugger
+            .sendCommand("Network.getResponseBody", { requestId: params.requestId })
+            .then(({ body }) => {
+              const parsed = (() => {
+                try {
+                  return JSON.parse(body);
+                } catch {
+                  return null;
+                }
+              })();
+              if (!parsed) return;
+              const found = collectIds(parsed);
+              if (found.length) {
+                seen.ids = [...new Set([...seen.ids, ...found])];
+                if (!seen.taskId) seen.taskId = found[0];
+                resolveDone();
               }
-            })();
-            if (!parsed) return;
-            const found = collectIds(parsed);
-            if (found.length) {
-              seen.ids = [...new Set([...seen.ids, ...found])];
-              if (!seen.taskId) seen.taskId = found[0];
-              resolveDone();
-            }
-          })
-          .catch(() => {});
+            })
+            .catch(() => {});
+          return;
+        }
+        if (method === "Network.requestWillBeSent") {
+          noteRequest(String(params?.request?.method || "GET"), params?.request?.url, null);
+        }
       } catch {}
     };
     try {
@@ -467,62 +869,158 @@ function createDolaDriver(options = {}) {
           } catch {}
         }
       };
+      const fail = (message, extra = {}) => ({ outcome: "failed", message, steps, ...extra });
+
       let contents;
       try {
         contents = await pageFor(accountId);
       } catch (error) {
         const reason = error?.message || String(error);
         record("openPage", { ok: false, reason });
-        return { outcome: "failed", message: `无法打开账号页面：${reason}`, steps };
+        return fail(`无法打开账号页面：${reason}`);
       }
       if (!plan?.valid) {
-        return { outcome: "failed", message: `计划无效：${(plan?.errors || []).join("；")}`, steps };
+        return fail(`计划无效：${(plan?.errors || []).join("；")}`);
       }
-      record("openPage", { ok: true, ...describeView(contents) });
 
-      const textStep = await evaluate(
-        contents,
-        STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.plainText))
+      // 归属证据：只有能证明「本进程 + 该账号隔离会话」时才继续操作
+      const evidence = sessionEvidence(contents, accountId);
+      record("openPage", { ok: evidence.partitionMatches, ...describeView(contents), ...evidence });
+      if (!evidence.partitionMatches) {
+        return fail(
+          `账号页面的会话归属无法核实（期望 ${evidence.expectedPartition}），已停止操作该页面`
+        );
+      }
+      if (evidence.storageUnderUserData === false) {
+        return fail(
+          `账号会话的存储路径不在本实例数据目录下（会话存储：${evidence.storagePath || "未知"}），已停止操作该页面`
+        );
+      }
+
+      // 1) 等页面就绪：先前「脚本执行超时」就是因为页面没加载完就操作
+      const ready = await waitForPageReady(contents);
+      record("waitReady", ready);
+      if (!ready.ok) return fail(`页面未就绪：${ready.reason}`);
+
+      // 2) 进入视频生成模式（聊天模式下三个参数控件根本不存在）
+      const mode = await evaluate(contents, STEP_ENTER_VIDEO);
+      record("enterVideoMode", mode);
+      if (!mode?.ok) {
+        return fail(`无法进入视频生成模式：${mode?.reason || "未知原因"}`);
+      }
+
+      // 3) 清掉页面上残留的参考图，避免把不属于本次的图片发出去
+      const clearStep = await evaluate(contents, STEP_CLEAR_ATTACHMENTS);
+      record("clearAttachments", clearStep);
+      if (!clearStep?.ok) return fail(`无法清空已有的参考图：${clearStep?.reason || "未知原因"}`);
+
+      // 4) 写入提示词（图片位置写入原子占位符）
+      // 只把「类型 + 文本」送进页面，本地文件路径等敏感信息留在主进程
+      const segments = (plan.segments?.length ? plan.segments : [{ kind: "text", value: plan.plainText }]).map(
+        (segment) => ({ kind: segment.kind === "image" ? "image" : "text", value: segment.kind === "image" ? "" : segment.value })
       );
+      const textStep = await evaluate(contents, STEP_SET_TEXT.replace("__SEGMENTS__", JSON.stringify(segments)));
       record("setPrompt", textStep);
       if (!textStep?.ok) {
-        return { outcome: "failed", message: `写入提示词失败：${textStep?.reason || "内容未被接受"}`, steps };
+        return fail(`写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`);
       }
 
-      record("chooseModel", await chooseOption(contents, DOLA_SELECTORS.modelControl, modelLabel(plan.params.model)));
-      record("chooseDuration", await chooseOption(contents, DOLA_SELECTORS.durationControl, String(plan.params.duration)));
-      // 比例：平台能力表里没有这一项，控件是否存在需要实测；找不到就如实记录，不阻塞提交
-      record(
-        "chooseRatio",
-        plan.params.ratio
-          ? await chooseOption(contents, DOLA_SELECTORS.ratioControl, plan.params.ratio)
-          : { ok: true, skipped: true, reason: "未设置比例" }
+      // 5) 参数必须在平台上真正生效：任何一项设不上就阻断，绝不用平台默认值继续
+      const target = plan.params;
+      const modelStep = await chooseOption(
+        contents,
+        DOLA_SELECTORS.modelControl,
+        "video-model",
+        target.modelLabel,
+        target.modelTrigger
       );
+      record("chooseModel", modelStep);
+      if (!modelStep?.ok) return fail(`模型未生效：${modelStep?.reason || "选择失败"}（期望 ${target.modelLabel}）`);
 
-      const uploadStep = await withTimeout(
-        attachImages(contents, plan.uploads),
-        IMAGE_TIMEOUT_MS,
-        { ok: false, reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）` }
+      const durationStep = await chooseOption(
+        contents,
+        DOLA_SELECTORS.durationControl,
+        "video-duration",
+        `${target.duration}s`,
+        `${target.duration}s`
       );
+      record("chooseDuration", durationStep);
+      if (!durationStep?.ok) {
+        return fail(
+          `时长未生效：${durationStep?.reason || "选择失败"}（期望 ${target.duration}s；若模型为 2.5 且开启了 30 秒增强，工具栏文案会被应用改写，需先关闭该增强）`
+        );
+      }
+
+      if (target.ratio) {
+        const ratioStep = await chooseOption(
+          contents,
+          DOLA_SELECTORS.ratioControl,
+          "video-ratio",
+          target.ratio,
+          target.ratio
+        );
+        record("chooseRatio", ratioStep);
+        if (!ratioStep?.ok) return fail(`比例未生效：${ratioStep?.reason || "选择失败"}（期望 ${target.ratio}）`);
+      } else {
+        record("chooseRatio", { ok: true, skipped: true, reason: "未设置比例，使用平台默认比例（无法回读核实）" });
+      }
+
+      // 6) 上传参考图，并核实编辑器里真的出现了内联引用
+      const uploadStep = await withTimeout(attachImages(contents, plan.uploads), IMAGE_TIMEOUT_MS, {
+        ok: false,
+        reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
+      });
       record("attachImages", uploadStep);
       if (!uploadStep.ok) {
-        return { outcome: "failed", message: uploadStep.reason, steps, limitation: uploadStep.limitation };
+        return fail(uploadStep.reason, { limitation: uploadStep.limitation });
       }
 
-      record("readState", await evaluate(contents, STEP_READ_STATE));
+      // 核实「平台收到的附件」就是本次要传的图片，而不是只看编辑器里有没有 @图 标记
+      const uploadNames = (plan.uploads || []).map((filePath) =>
+        String(filePath).split(/[\\/]/).pop()
+      );
+      const refsStep = await evaluate(
+        contents,
+        STEP_VERIFY_REFS.replace("__NAMES__", JSON.stringify(uploadNames))
+      );
+      record("verifyRefs", refsStep);
+      if (!refsStep?.ok) {
+        // 引用没建立起来就提交，等于白白消耗额度：这里阻断并说明能力差异
+        return fail(
+          `参考图引用未核实通过：${refsStep?.reason || "附件与本次图片不一致"}（已上传 ${uploadStep.count || 0} 张，平台附件 ${
+            refsStep?.attachmentCards ?? 0
+          } 张，名称命中 ${refsStep?.matched ?? 0} 张，编辑器内联节点 ${refsStep?.atomicCount ?? 0} 个）`
+        );
+      }
+
+      // 7) 发送前回读：三个参数 + 发送按钮可用性
+      const preflight = await evaluate(contents, STEP_READ_STATE);
+      record("readState", preflight);
+      if (!preflight?.ok) return fail("提交前无法读取页面状态");
 
       // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
       const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
 
-      // 关键补漏：此前只写入了内容却没有真正点击发送，因此永远等不到任务 ID
       const sendStep = await evaluate(contents, STEP_SEND);
       record("send", sendStep);
       if (!sendStep?.ok) {
-        return {
-          outcome: "failed",
-          message: `${sendStep?.reason || "点击发送失败"}；页面候选控件：${(sendStep?.candidates || []).join(" | ") || "无"}`,
-          steps,
-        };
+        return fail(
+          `${sendStep?.reason || "点击发送失败"}；页面候选控件：${(sendStep?.candidates || []).join(" | ") || "无"}`
+        );
+      }
+
+      // 点击成功 ≠ 平台开始生成：先确认页面真的起了反应（编辑器被清空 / 出现新消息 / 地址变化）
+      const reaction = await withTimeout(waitForSendReaction(contents, sendStep), 12000, {
+        ok: false,
+        reason: "等待页面反应超时",
+      });
+      record("sendReaction", reaction);
+      if (!reaction?.started) {
+        return fail(
+          `已点击发送按钮，但 ${12} 秒内页面没有任何反应（编辑器内容未被消费、没有新消息、地址未变化），说明这次点击没有真正提交${
+            reaction?.hints?.length ? `；页面提示：${reaction.hints.join("、")}` : ""
+          }`
+        );
       }
 
       if (typeof onStep === "function") {
@@ -545,12 +1043,14 @@ function createDolaDriver(options = {}) {
         };
       }
       // 关键：没有确认到任务 ID 就绝不当作已提交，交由编排层标记「提交结果待确认」
+      const observed = (watched.requests || []).map((item) => `${item.method} ${item.path}${item.status ? `→${item.status}` : ""}`);
       return {
         outcome: "unknown",
         message: `${watched.error || "已点击发送，但未在超时时间内确认平台任务 ID"}，未重复提交；发送按钮命中：${
           sendStep?.clicked || "未知"
-        }`,
+        }${observed.length ? `；观察到的网络请求：${observed.join(" | ")}` : "；超时窗口内没有观察到任何生成类网络请求"}`,
         observedIds: watched.ids,
+        observedRequests: watched.requests || [],
         steps,
       };
     },
@@ -593,4 +1093,13 @@ function createDolaDriver(options = {}) {
   };
 }
 
-module.exports = { DOLA_HOST_RE, PARTITION_PREFIX, collectIds, createDolaDriver, findAccountWebview, isDolaUrl };
+module.exports = {
+  DOLA_HOST_RE,
+  PARTITION_PREFIX,
+  collectIds,
+  createDolaDriver,
+  findAccountWebview,
+  isDolaUrl,
+  sessionEvidence,
+  waitForPageReady,
+};

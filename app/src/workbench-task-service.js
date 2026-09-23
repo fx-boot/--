@@ -18,6 +18,7 @@ const { createTaskStore, isActive } = require("./workbench-task-store");
 const { createRunner } = require("./workbench-runner");
 const { createDownloader } = require("./workbench-download");
 const { createDolaDriver, PARTITION_PREFIX } = require("./workbench-dola-driver");
+const { assignStoryboards } = require("./workbench-platform");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
 
 const ACCOUNTS_FILE = "accounts.json";
@@ -239,6 +240,13 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
       },
 
       "workbench:tasks": (_e, projectId) => tasksFor(projectId),
+      /** 分镜 × 账号的分配计划（纯逻辑，纯函数在 workbench-platform 里） */
+      "workbench:task-assignments": (_e, storyboardIds, accountIds, mode) =>
+        assignStoryboards({
+          storyboardIds: Array.isArray(storyboardIds) ? storyboardIds : [],
+          accountIds: Array.isArray(accountIds) ? accountIds : [],
+          mode: String(mode || "distribute"),
+        }),
       "workbench:task-execute": async (_e, projectId, attemptId) => {
         await runner.execute(projectId, attemptId);
         return { ok: true };

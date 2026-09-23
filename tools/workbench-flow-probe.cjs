@@ -253,7 +253,8 @@ function makeFixture(file) {
   };
   check("预览通过了参数校验", previewPlan.valid === true, previewPlan.errors);
   check("预览带上了真实上传文件路径", previewPlan.uploads.length === 1 && fs.existsSync(previewPlan.uploads[0]), previewPlan.uploads);
-  check("比例与参考图上限被明确标注为平台未提供", previewPlan.warnings.length >= 1, previewPlan.warnings);
+  check("参考图数量上限仍被标注为平台未声明", previewPlan.warnings.some((w) => w.includes("参考图数量上限")), previewPlan.warnings);
+  check("比例已实测核实（预览里带上了比例值）", Boolean(previewPlan.params.ratio), previewPlan.params);
   check("提示词预览里引用位置以原子占位符呈现", String(previewPlan.promptPreview).includes("\uFFFC"), previewPlan.promptPreview);
 
   // ── 6. 任务入队（占位账号，不执行、不消耗额度） ──
@@ -381,10 +382,15 @@ function makeFixture(file) {
   report.steps.fixes.defaults = defaultsInfo;
   check("全局默认参数含比例下拉", defaultsInfo.count >= 3, defaultsInfo);
   check("比例下拉可选（不再被禁用）", defaultsInfo.ratioDisabled === false, defaultsInfo);
-  check("比例下拉提供多个常见候选值", (defaultsInfo.ratioOptions || []).length >= 4, defaultsInfo.ratioOptions);
+  check("比例下拉候选来自平台实测能力表", (defaultsInfo.ratioOptions || []).length === 6, defaultsInfo.ratioOptions);
   check(
-    "比例旁仍标注平台能力未核实",
-    (defaultsInfo.notes || []).some((t) => String(t).includes("未核实")),
+    "比例候选是实测的那 6 档",
+    ["1:1", "3:4", "4:3", "9:16", "16:9", "21:9"].every((v) => (defaultsInfo.ratioOptions || []).includes(v)),
+    defaultsInfo.ratioOptions
+  );
+  check(
+    "比例旁标明来源是实测且会回读核实",
+    (defaultsInfo.notes || []).some((t) => String(t).includes("实测")),
     defaultsInfo.notes
   );
 
@@ -480,7 +486,7 @@ function makeFixture(file) {
     pasted
   );
 
-  // ── 14. 批量账号提交预览（只预览，绝不点确认，不消耗额度） ──
+  // ── 14. 提交确认框：默认「分配执行」，对比模式必须显式选择（只预览，绝不点确认） ──
   await js(`(() => { document.querySelector('#workbenchAccountNote [data-act="accounts-all"]')?.click(); })()`);
   await delay(250);
   const allChecked = await js(
@@ -488,24 +494,44 @@ function makeFixture(file) {
   );
   check("「全选」勾上了全部账号", allChecked === 3, allChecked);
 
+  check("工具栏存在「生成整批（分配执行）」入口", (await js(`Boolean(document.getElementById('workbenchRunBatch'))`)) === true);
+
   await js(`(() => { document.querySelector('.workbench-sb .workbench-run-button')?.click(); })()`);
   await delay(1800);
-  const runModal = await js(`(() => {
+  const readRunModal = () => js(`(() => {
     const modal = document.getElementById('workbenchRunModal');
+    const checked = document.querySelector('#workbenchRunPreview input[name="workbenchRunMode"]:checked');
     return {
       visible: !modal.classList.contains('hidden'),
       status: document.getElementById('workbenchRunStatus')?.textContent ?? null,
+      mode: checked ? checked.value : null,
+      modeLabels: [...document.querySelectorAll('#workbenchRunPreview .workbench-run-mode span')].map((s) => s.textContent),
       rows: [...document.querySelectorAll('#workbenchRunPreview .workbench-run-row')].map((r) => r.textContent),
+      assignments: [...document.querySelectorAll('#workbenchRunPreview .workbench-run-plan .workbench-run-row')].length - 1,
+      confirmDisabled: Boolean(document.getElementById('workbenchRunConfirm')?.disabled),
     };
   })()`);
+
+  const runModal = await readRunModal();
   report.steps.fixes.runModal = runModal;
   check("点「生成这一条」会打开提交确认，而不是毫无反应", runModal.visible === true, runModal);
-  check(
-    "确认框列出了被勾选的全部账号（一账号一条尝试）",
-    (runModal.rows || []).some((t) => t.includes("探针账号A") && t.includes("探针账号C")),
-    runModal.rows
-  );
+  check("确认框默认模式是「分配执行」", runModal.mode === "distribute", runModal.mode);
+  check("默认模式下列出了模式选择", (runModal.modeLabels || []).some((t) => t.includes("对比模式")), runModal.modeLabels);
+  check("默认模式标明「分配执行」是默认项", (runModal.modeLabels || []).some((t) => t.includes("分配执行") && t.includes("默认")), runModal.modeLabels);
+  check("对比模式说明了会成倍消耗额度", (runModal.modeLabels || []).some((t) => t.includes("每个所选账号各生成一次")), runModal.modeLabels);
+  check("单条分镜 + 3 个账号在默认模式下只产生 1 条尝试", runModal.assignments === 1, runModal.assignments);
   check("确认框内有可见的状态位，提交时不再静默", runModal.status !== null, runModal.status);
+
+  // 切成对比模式后，同一分镜才会在每个账号各生成一次
+  await js(`(() => {
+    const radio = document.querySelector('#workbenchRunPreview input[name="workbenchRunMode"][value="compare"]');
+    if (radio) { radio.click(); radio.dispatchEvent(new Event('change', { bubbles: true })); }
+  })()`);
+  await delay(1500);
+  const compareModal = await readRunModal();
+  report.steps.fixes.compareModal = compareModal;
+  check("对比模式需显式选择后才生效", compareModal.mode === "compare", compareModal.mode);
+  check("对比模式下同一条分镜在每个账号各一条", compareModal.assignments === 3, compareModal.assignments);
   await js(`(() => { document.querySelector('#workbenchRunModal [data-close]')?.click(); })()`);
   await delay(300);
 

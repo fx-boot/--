@@ -40,17 +40,33 @@ function classifyBlock(message) {
 function stepDetail(s) {
   const bits = [];
   if (s?.reason) bits.push(String(s.reason));
-  else if (s?.picked) bits.push(`已选择 ${s.picked}`);
-  else if (s?.clicked) bits.push(`命中控件：${s.clicked}`);
-  else if (Number(s?.count)) bits.push(`已上传 ${s.count} 张参考图`);
   else if (s?.skipped) bits.push("已跳过");
+  else if (s?.clicked) bits.push(`命中控件：${s.clicked}`);
+  else if (s?.picked && s?.after) bits.push(`已选择 ${s.picked}（回读 ${s.after}）`);
+  else if (s?.picked) bits.push(`已选择 ${s.picked}`);
+  else if (s?.step === "enterVideoMode") bits.push("已进入视频生成模式");
+  else if (s?.step === "waitReady") bits.push("页面已就绪");
+  else if (s?.step === "clearAttachments") bits.push(`已清空 ${Number(s?.removed) || 0} 张残留参考图`);
+  else if (Number(s?.count)) bits.push(`已上传 ${s.count} 张参考图`);
+  else if (s?.step === "verifyRefs")
+    bits.push(`参考图缩略图 ${Number(s?.attachmentCards) || 0}/${Number(s?.expected) || 0}，编辑器内联节点 ${Number(s?.atomicCount) || 0}`);
   else if (s?.step === "openPage") bits.push("已找到账号页面");
   else if (s?.step === "setPrompt") bits.push("已写入提示词");
+  else if (s?.step === "sendReaction")
+    bits.push(
+      s?.started
+        ? `页面已起反应（${[s.editorEmptied ? "编辑器已清空" : "", s.changedUrl ? "地址已变化" : "", s.moreMessages ? "出现新消息" : ""].filter(Boolean).join("、") || "有生成相关提示"}）`
+        : `点击后页面没有任何反应${s?.hints?.length ? `（页面提示：${s.hints.join("、")}）` : ""}`
+    );
   else if (s?.step === "readState") bits.push("已读取页面状态");
 
   // 页面地址 / 加载中 / 渲染进程崩溃：这些是判断「是不是撞了登录墙或页面没加载完」的依据
   const url = String(s?.pageUrl || s?.url || "");
   if (url && !bits.some((bit) => bit.includes(url))) bits.push(`页面：${url}`);
+  if (s?.sessionMatched === false) bits.push("会话归属无法核实");
+  else if (s?.storageUnderUserData === false) bits.push("会话存储不在本实例数据目录");
+  else if (s?.storagePath) bits.push(`会话存储：${String(s.storagePath).slice(0, 80)}`);
+  if (s?.inVideoMode === false) bits.push("不在视频生成模式");
   if (s?.loading) bits.push("页面仍在加载");
   if (s?.crashed) bits.push("渲染进程已崩溃");
   if (Number(s?.webContentsId)) bits.push(`webContents #${s.webContentsId}`);
