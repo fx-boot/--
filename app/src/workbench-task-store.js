@@ -342,28 +342,50 @@ function createTaskStore(dirFor) {
     return doc;
   }
 
+  /**
+   * 同一项目串行化「读-改-写」。
+   * 多账号并行时会有多个任务同时更新同一个 tasks.json，
+   * 不做串行化会出现「后写覆盖前写」，导致有条任务状态凭空消失。
+   */
+  const queues = new Map();
+  function serialized(projectId, task) {
+    const previous = queues.get(projectId) || Promise.resolve();
+    const next = previous.then(task, task);
+    queues.set(
+      projectId,
+      next.catch(() => {})
+    );
+    return next;
+  }
+
   return {
     read,
     async list(projectId) {
       return read(projectId).tasks;
     },
     async append(projectId, attempt) {
-      const doc = read(projectId);
-      doc.tasks.push(normalizeAttempt(attempt));
-      await write(projectId, doc);
-      return attempt;
+      return serialized(projectId, async () => {
+        const doc = read(projectId);
+        doc.tasks.push(normalizeAttempt(attempt));
+        await write(projectId, doc);
+        return attempt;
+      });
     },
     /** 就地更新：mutator 返回 false 表示放弃写入 */
     async update(projectId, attemptId, mutator) {
-      const doc = read(projectId);
-      const index = doc.tasks.findIndex((t) => t.id === attemptId);
-      if (index < 0) throw new Error("任务记录不存在");
-      const kept = mutator(doc.tasks[index]);
-      if (kept !== false) await write(projectId, doc);
-      return doc.tasks[index];
+      return serialized(projectId, async () => {
+        const doc = read(projectId);
+        const index = doc.tasks.findIndex((t) => t.id === attemptId);
+        if (index < 0) throw new Error("任务记录不存在");
+        const kept = mutator(doc.tasks[index]);
+        if (kept !== false) await write(projectId, doc);
+        return doc.tasks[index];
+      });
     },
     async replaceAll(projectId, tasks) {
-      return write(projectId, { schemaVersion: SCHEMA_VERSION, tasks: (tasks || []).map(normalizeAttempt) });
+      return serialized(projectId, () =>
+        write(projectId, { schemaVersion: SCHEMA_VERSION, tasks: (tasks || []).map(normalizeAttempt) })
+      );
     },
     nextAttemptNumber,
   };

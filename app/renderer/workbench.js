@@ -722,9 +722,16 @@
     if (!effective.model || !effective.duration || !effective.ratio) reasons.push("参数未就绪");
     summary.textContent = `模型 ${effective.model || "-"} · 时长 ${effective.duration || "-"} 秒 · 比例 ${
       effective.ratio || "-"
-    } · 已选账号 ${accountCount} 个（本条只提交 1 个账号）`;
+    } · 已选 ${accountCount} 个账号，将创建 ${accountCount} 条生成任务，分别消耗对应账号额度`;
     button.disabled = Boolean(busy) || reasons.length > 0;
-    button.textContent = busy === "checking" ? "正在检查…" : busy === "submitting" ? "正在提交…" : "生成视频";
+    button.textContent =
+      busy === "checking"
+        ? "正在检查…"
+        : busy === "submitting"
+          ? "正在提交…"
+          : accountCount > 1
+            ? `多账号生成（${accountCount}）`
+            : "生成视频";
     button.title = reasons.length ? `不可提交：${reasons.join("；")}` : "向平台提交这一条（真实提交）";
     if (reasons.length && !busy) {
       setMainStatus(`暂不可提交：${reasons.join("；")}`, "warn");
@@ -832,7 +839,7 @@
           .map((a) => `${a.name}（${a.blocked.label}）`)
           .join("、")}`
       // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
-      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 默认「分配执行」：多条分镜分配给这些账号，每条分镜只执行一次；提交前请先在应用里打开对应账号的页面`;
+      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 当前创作区＝「多账号同稿生成」：同一份内容在每个所选账号各生成一次（共 ${picked.size} 条任务，分别消耗对应账号额度）；「分镜列表 / 批量」里是「多分镜分配执行」：不同分镜分配给账号，每条分镜只执行一次`;
     note.appendChild(line);
     for (const [act, label] of [
       ["accounts-all", "全选"],
@@ -1192,65 +1199,147 @@
   }
 
   // ── 单条创作区交互 ───────────────────────────────────────
+  /** 某个账号的页面是否已打开且落在 dola 上 */
+  function accountPageState(accountId) {
+    const node = document.querySelector(`webview[partition="persist:doubao-manager-${accountId}"]`);
+    if (!node) return { open: false, url: "" };
+    let url = "";
+    try {
+      url = node.getURL ? String(node.getURL()) : "";
+    } catch {
+      url = "";
+    }
+    return { open: true, url };
+  }
+
   /**
-   * 主按钮：提交「当前这一条」。
-   * 默认只交给一个账号执行（避免同一条分镜因为多选账号被重复生成）；
-   * 需要多账号对比时走「分镜列表 / 批量」里的对比模式。
+   * 自动准备所选账号的页面：缺页面就点开它，并等到真正落在 dola 上。
+   * 逐个准备（点击切换标签页），页面打开后并行提交互不影响。
+   */
+  async function ensureAccountPages(accountIds) {
+    const pending = [];
+    for (const accountId of accountIds) {
+      const state0 = accountPageState(accountId);
+      if (state0.open && /dola\.com/i.test(state0.url)) continue;
+      const clicked = document.querySelector(`.account-card[data-id="${accountId}"] .account-info`);
+      if (!clicked) {
+        pending.push({ accountId, reason: "账号卡片不存在，无法自动打开页面" });
+        continue;
+      }
+      clicked.click();
+      let ok = false;
+      for (let i = 0; i < 60; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const now = accountPageState(accountId);
+        if (now.open && /dola\.com/i.test(now.url)) {
+          ok = true;
+          break;
+        }
+      }
+      if (!ok) pending.push({ accountId, reason: "页面在 30 秒内没有就绪（可能需要重新登录）" });
+    }
+    return pending;
+  }
+
+  /**
+   * 主按钮：把「当前这一条」提交给每个所选账号。
+   * 同一份提示词/参考图/参数 → 每个账号各创建 1 条任务（内容快照相同，上传与提交各自独立），
+   * 由队列按并发上限（默认 3）同时执行，不同账号互不阻塞。
    */
   async function generateCurrent() {
     if (state.compose.busy) return; // 提交期间防重复点击
     const storyboard = currentStoryboard();
     if (!storyboard) return setMainStatus("还没有分镜，先新增一条", "warn");
-    const accountIds = (state.selectedAccountIds || []).slice();
+    const accountIds = [...new Set((state.selectedAccountIds || []).slice())];
     if (!accountIds.length) return setMainStatus("请先在右侧勾选执行账号", "warn");
-    const accountId = accountIds[0];
 
     state.compose.busy = "checking";
     renderCompose();
-    setMainStatus("正在检查提交条件…");
-    let preview = null;
-    try {
-      preview = await api.task.preview(projectId(), storyboard.id, accountId);
-    } catch (error) {
+    setMainStatus(`正在检查 ${accountIds.length} 个账号的提交条件…`);
+    const previews = await Promise.all(
+      accountIds.map((accountId) =>
+        api.task
+          .preview(projectId(), storyboard.id, accountId)
+          .then((preview) => ({ accountId, preview }))
+          .catch((error) => ({ accountId, preview: { valid: false, errors: [error.message] } }))
+      )
+    );
+    const ready = previews.filter((item) => item.preview?.valid).map((item) => item.accountId);
+    const blocked = previews.filter((item) => !item.preview?.valid);
+    if (!ready.length) {
       state.compose.busy = "";
       renderCompose();
-      return setMainStatus(`检查失败：${error.message}`, "error");
+      return setMainStatus(`暂不可提交：${blocked.map((b) => `${accountName(b.accountId)}（${b.preview.errors.join("；")}）`).join("；")}`, "error");
     }
-    if (!preview?.valid) {
+
+    // 自动准备页面，避免要求用户逐个手动点开
+    setMainStatus(`正在准备 ${ready.length} 个账号的页面…`);
+    const notReady = await ensureAccountPages(ready);
+    const usable = ready.filter((id) => !notReady.some((item) => item.accountId === id));
+    if (!usable.length) {
       state.compose.busy = "";
       renderCompose();
-      return setMainStatus(`暂不可提交：${(preview?.errors || ["参数未通过校验"]).join("；")}`, "error");
+      return setMainStatus(`账号页面未就绪：${notReady.map((n) => `${accountName(n.accountId)}（${n.reason}）`).join("；")}`, "error");
     }
 
     state.compose.busy = "submitting";
     renderCompose();
-    setMainStatus(`正在提交…（真实提交 · 账号 ${accountName(accountId)} · 请勿关闭窗口）`);
-    let attemptId = "";
-    try {
-      const created = await api.task.enqueue(projectId(), storyboard.id, accountId);
-      attemptId = created.attempt.id;
-      await refresh();
-      await api.task.execute(projectId(), attemptId);
-    } catch (error) {
-      state.compose.busy = "";
-      renderCompose();
-      return setMainStatus(`提交失败：${error.message}`, "error");
+    setMainStatus(`正在创建 ${usable.length} 条任务…（每个账号 1 条，分别消耗对应账号额度）`);
+    const created = [];
+    for (const accountId of usable) {
+      try {
+        const record = await api.task.enqueue(projectId(), storyboard.id, accountId);
+        created.push({ accountId, attemptId: record.attempt.id });
+      } catch (error) {
+        toast(`${accountName(accountId)} 入队失败：${error.message}`, "error");
+      }
     }
     await refresh();
-    state.compose.busy = "";
-    const record = (state.tasks || []).find((t) => t.id === attemptId);
-    renderCompose();
-    if (!record) return setMainStatus("已提交，但读不到任务记录，请到右侧任务列表核对", "warn");
-    if (record.status === "queued" || record.status === "generating") {
-      return setMainStatus(`已提交：平台已受理（${statusLabel(record.status)}）`, "ok");
+    if (!created.length) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus("没有创建任何任务", "error");
     }
-    if (record.status === "unconfirmed") {
-      return setMainStatus(`提交结果待确认：${record.poll?.message || record.error?.message || "未取得平台任务 ID"}`, "warn");
-    }
-    return setMainStatus(
-      `未提交成功：${statusLabel(record.status)} · ${record.error?.message || record.driver?.message || "见任务卡片"}`,
-      "error"
+    // 交给队列按并发上限调度：不是逐个 await，而是同时跑（上限内）
+    await api.queue.run();
+    await refresh();
+    setMainStatus(
+      `已创建 ${created.length} 条任务，正在并发执行（上限 ${state.queue?.limits?.globalConcurrency ?? 3} 个账号，其余排队）…`
     );
+
+    // 跟踪到「全部离开待执行/提交中」或超时，状态文案随任务变化
+    const deadline = Date.now() + 180000;
+    let lastLine = "";
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await refresh();
+      const records = created
+        .map((item) => (state.tasks || []).find((task) => task.id === item.attemptId))
+        .filter(Boolean);
+      const counts = {};
+      for (const record of records) counts[record.status] = (counts[record.status] || 0) + 1;
+      const running = records.filter((r) => ["pending", "submitting"].includes(r.status)).length;
+      lastLine = `共 ${records.length} 条：${Object.entries(counts)
+        .map(([status, count]) => `${statusLabel(status)} ${count}`)
+        .join(" · ")}`;
+      setMainStatus(running ? `${lastLine}（进行中）` : lastLine, running ? "" : "ok");
+      if (!running || Date.now() > deadline) break;
+    }
+    state.compose.busy = "";
+    renderCompose();
+    const failures = created
+      .map((item) => (state.tasks || []).find((task) => task.id === item.attemptId))
+      .filter((record) => record && !["queued", "generating", "succeeded"].includes(record.status));
+    if (failures.length) {
+      setMainStatus(
+        `${lastLine}；${failures.length} 条未成功：${failures
+          .map((r) => `${accountName(r.accountId)}（${r.error?.message || r.driver?.message || statusLabel(r.status)}）`)
+          .join("；")}`,
+        "error"
+      );
+    } else {
+      setMainStatus(`${lastLine}；平台已受理，转入监控`, "ok");
+    }
   }
 
   /** 创作区的 @ 提及、粘贴与拖拽：与素材库行为保持一致 */

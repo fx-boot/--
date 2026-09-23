@@ -168,6 +168,7 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   },
   queue: {
     status: () => ipcRenderer.invoke("workbench:queue-status"),
+    run: () => ipcRenderer.invoke("workbench:queue-run"),
     pause: () => ipcRenderer.invoke("workbench:queue-pause"),
     resume: () => ipcRenderer.invoke("workbench:queue-resume"),
   },

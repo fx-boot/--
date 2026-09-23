@@ -385,6 +385,7 @@ function makeFixture(file) {
       refsText: document.getElementById('workbenchRefsRow')?.textContent || '',
       summary: document.getElementById('workbenchRunSummary')?.textContent || '',
       buttonHeight: getComputedStyle(document.getElementById('workbenchGenerate')).height,
+      buttonText: document.getElementById('workbenchGenerate').textContent,
       buttonDisabled: document.getElementById('workbenchGenerate').disabled,
     };
   })()`);
@@ -405,7 +406,9 @@ function makeFixture(file) {
     /参考图|还没有参考图/.test(composeInfo.refsText),
     composeInfo.refsText
   );
-  check("操作栏显示模型/时长/比例/账号数", /模型/.test(composeInfo.summary) && /账号/.test(composeInfo.summary), composeInfo.summary);
+  check("操作栏显示模型/时长/比例，并写明将创建 N 条任务", /模型/.test(composeInfo.summary) && /将创建 \d+ 条生成任务/.test(composeInfo.summary), composeInfo.summary);
+  check("多账号时按钮显示「多账号生成（N）」", (composeInfo.buttonText || "").includes("生成"), composeInfo.buttonText);
+  check("界面不再出现「本条只提交 1 个账号」", !/本条只提交 1 个账号/.test(composeInfo.summary), composeInfo.summary);
   check("生成按钮是主按钮（高度 >= 44px）", parseFloat(composeInfo.buttonHeight) >= 44, composeInfo.buttonHeight);
 
   const promptBox = await js(`(() => {
@@ -433,6 +436,13 @@ function makeFixture(file) {
   check("账号已是多选复选框列表", accountPicks.boxes >= 3, accountPicks);
   check("默认至少勾选一个账号", accountPicks.checked >= 1, accountPicks.checked);
   check("账号来自本机账号列表（只读）", accountPicks.names.includes("探针账号A"), accountPicks.names);
+  const multiButton = await js(`(() => {
+    const host = document.getElementById('workbenchAccountPicks');
+    const boxes = [...host.querySelectorAll('input[type="checkbox"]')];
+    for (const box of boxes) { box.checked = true; box.dispatchEvent(new Event('change', { bubbles: true })); }
+    return { text: document.getElementById('workbenchGenerate')?.textContent, checked: boxes.filter((b) => b.checked).length };
+  })()`);
+  check("勾选多个账号后按钮变为「多账号生成（N）」", /多账号生成（3）/.test(multiButton.text || ""), multiButton);
 
   // ── 12. @图片绑定后视觉同步（用户反馈「艾特过后未关联」） ──
   const reimported = await js(

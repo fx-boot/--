@@ -354,8 +354,10 @@ const refWarn = platform.validateParams({
   console.log("── 编排：提交结果不确定 ──");
   calls.submit = 0;
   calls.verify = 0;
+  const unknownStore = task.createTaskStore((id) => path.join(root, "unknown-" + id));
+  const unknownSched = createFakeScheduler();
   const unknownDriver = createRunner({
-    taskStore,
+    taskStore: unknownStore,
     driver: {
       async submit() {
         calls.submit++;
@@ -370,24 +372,24 @@ const refWarn = platform.validateParams({
       },
     },
     capabilities: CAPS,
-    schedule: sched.schedule,
-    cancelSchedule: sched.cancel,
+    schedule: unknownSched.schedule,
+    cancelSchedule: unknownSched.cancel,
     resolveAssets: async () => assetsById,
-    listProjectIds: async () => [projectId],
+    listProjectIds: async () => ["prj_unknown"],
   });
   const unconfirmed = await unknownDriver.enqueue({
-    projectId,
+    projectId: "prj_unknown",
     storyboardId: "sb_unknown",
     accountId: "acc_1",
     params: goodParams,
     refs: goodRefs,
   });
-  await unknownDriver.execute(projectId, unconfirmed.id);
-  const unconfirmedNow = (await taskStore.list(projectId)).find((t) => t.id === unconfirmed.id);
+  await unknownDriver.execute("prj_unknown", unconfirmed.id);
+  const unconfirmedNow = (await unknownStore.list("prj_unknown")).find((t) => t.id === unconfirmed.id);
   eq("核实不到时标记提交结果待确认", unconfirmedNow.status, "unconfirmed");
   eq("提交只发生一次（未盲目重复提交）", calls.submit, 1);
   eq("确实做了核实", calls.verify, 1);
-  check("没有安排轮询", sched.size === 0);
+  check("没有安排轮询", unknownSched.size === 0, { size: unknownSched.size });
 
   console.log("── 编排：提交超时但核实到成功 ──");
   const verifyRunner = createRunner({
@@ -959,10 +961,7 @@ const refWarn = platform.validateParams({
     platform.DOLA_SELECTORS.videoModeButton.includes("skill_bar_button_17"),
     platform.DOLA_SELECTORS.videoModeButton
   );
-  check(
-    "打开菜单用真实指针事件（radix 不认 element.click）",
-    /pointerdown/.test(driverSrc) && /PointerEvent/.test(driverSrc)
-  );
+  check("打开菜单用真实指针事件（radix 不认 element.click）", driverSrc.includes("pointerdown") && driverSrc.includes("PointerEvent") && !/control\.click\(\)/.test(driverSrc));
   check("不再用 element.click() 打开菜单", !/control\.click\(\)/.test(driverSrc));
   check("发送按钮用实测 id", platform.DOLA_SELECTORS.sendButton === "#flow-end-msg-send", platform.DOLA_SELECTORS.sendButton);
   check("不再猜「工具栏最后一个按钮」当发送按钮", !/toolbar-tail/.test(driverSrc));
@@ -1004,7 +1003,7 @@ const refWarn = platform.validateParams({
   check("页面没反应时明确失败而不是干等", /没有任何反应/.test(driverSrc) && /没有真正提交/.test(driverSrc));
   check("记录生成类网络请求（区分点击没生效与拿不到任务 ID）", /requestWillBeSent/.test(driverSrc) && /observedRequests/.test(driverSrc));
   check("记录请求时丢弃查询串（避免把敏感参数落库）", /parsed\.pathname/.test(driverSrc));
-  check("参考图数量必须与本次一致（残图会让附件对不上）", /cards\.length === expected/.test(driverSrc));
+  check("参考图数量必须与本次一致（按附件标识核对，不靠文件名）", /countOk/.test(driverSrc) && /state\.attachments\.set/.test(driverSrc));
 
   // 实测证据（会话 38417881046054929）：平台拒绝时不会给任务 ID，而是在会话里回一条说明
   // 「出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频」。
@@ -1034,7 +1033,7 @@ const refWarn = platform.validateParams({
   const order = [
     'record("waitReady"',
     'record("enterVideoMode"',
-    'record("clearAttachments"',
+    'record("attachmentsPre"',
     'record("setPrompt"',
     'record("chooseModel"',
     'record("chooseDuration"',
@@ -1043,12 +1042,24 @@ const refWarn = platform.validateParams({
     'record("send"',
   ].map((marker) => driverSrc.indexOf(marker));
   check(
-    "步骤顺序固定为：就绪 → 视频模式 → 清残留图 → 提示词 → 参数 → 图片 → 核实 → 发送",
+    "步骤顺序固定为：就绪 → 视频模式 → 附件来源审查 → 提示词 → 参数 → 图片 → 核实 → 发送",
     order.every((index, i) => index > 0 && (i === 0 || index > order[i - 1])),
     order
   );
-  check("上传前先清空页面上残留的参考图（否则会把上次的图一起发出去）", /STEP_CLEAR_ATTACHMENTS/.test(driverSrc) && driverSrc.indexOf('record("clearAttachments"') < driverSrc.indexOf('record("attachImages"'));
-  check("按文件名核对平台附件是否就是本次要传的图片", /__NAMES__/.test(driverSrc) && /missingNames/.test(driverSrc));
+  check(
+    "上传前审查附件来源：本工具传过的复用，来源不明的停下报告冲突",
+    /STEP_ATTACHMENTS_STATE/.test(driverSrc) &&
+      /ATTACHMENT_CONFLICT/.test(driverSrc) &&
+      /reused: true/.test(driverSrc) &&
+      !/STEP_CLEAR_ATTACHMENTS/.test(driverSrc)
+  );
+  check(
+    "附件查询限定在输入容器内（不再整页统计 img）",
+    /guidance-input/.test(driverSrc) && /image-wrapper/.test(driverSrc) && !/document\.querySelectorAll\('img'\)/.test(driverSrc)
+  );
+  check("逐张上传并等待每张完成，失败只补传缺失的那张", /files: \[item\.filePath\]/.test(driverSrc) && /failed\.push\(item\)/.test(driverSrc));
+  check("同一账号的上传与提交有互斥锁（不同账号可并发）", /withAccountLock/.test(driverSrc));
+  check("提交前复核附件数量/顺序/编号标注", /missingCount/.test(driverSrc) && /extraCount/.test(driverSrc) && /orderMatched/.test(driverSrc));
 
   // 实测缺陷（2026-09-23）：平台处理完上传后不会清空 input.value，
   // 再次上传同一批图片时 FileList 没变化、change 不触发 → 页面上没有缩略图，等于发了个没有参考图的请求
@@ -1207,7 +1218,7 @@ const refWarn = platform.validateParams({
   const firstRetry = (await retryStore.list("prj_retry")).find((t) => t.id === transientAttempt.id);
   eq("安排第 1 次自动重试", firstRetry.autoRetry?.count, 1);
   check("重试信息里有原因与下次时间", Boolean(firstRetry.autoRetry?.reason) && Boolean(firstRetry.autoRetry?.nextAt), firstRetry.autoRetry);
-  check("重试等待期间锁住这条分镜", transientRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_transient"), transientRunner.status().locks);
+  check("重试等待期间锁住这条分镜（按账号加锁）", transientRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_transient:acc_1"), transientRunner.status().locks);
   await retrySched.flush();
   await retrySched.flush();
   await retrySched.flush();
@@ -1248,7 +1259,7 @@ const refWarn = platform.validateParams({
   eq("明确拒绝标记为生成失败（非待确认）", rejectNow.status, "failed");
   eq("明确拒绝不带自动重试", rejectNow.autoRetry?.count, undefined);
   check("拒绝原因可读", /未认证人脸/.test(rejectNow.error?.message || ""), rejectNow.error);
-  check("释放提交锁（可人工处理后重试）", !rejectRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_reject"));
+  check("释放提交锁（可人工处理后重试）", !rejectRunner.status().locks.some((lock) => lock.key.startsWith("prj_retry:sb_reject")));
 
   // 14.6 提交锁：等待自动重试期间，手动再点同一条分镜会被拒绝
   let lockCalls = 0;
@@ -1272,7 +1283,7 @@ const refWarn = platform.validateParams({
   }
   check("重试等待期间手点会被拒绝并说明原因", /正在提交中/.test(lockError), lockError);
   await lockRunner.stopAutoRetry("prj_retry", lockedFirst.id);
-  check("停止重试后释放锁", !lockRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_lock"));
+  check("停止重试后释放锁", !lockRunner.status().locks.some((lock) => lock.key.startsWith("prj_retry:sb_lock")));
   eq("停止重试后不再继续提交", lockCalls, 1);
 
   // 14.7 受理信号识别：不硬编码整句，靠结构特征（使用+生成 / 消耗+额度）
@@ -1282,6 +1293,122 @@ const refWarn = platform.validateParams({
   eq("只出现“消耗额度”时算弱信号", platform.classifyAcceptance("本次将消耗 1 个额度")?.strength, "hint");
   eq("普通回复不会被当成受理", platform.classifyAcceptance("有什么我可以帮你的吗"), null);
   eq("生成中字样被识别为强受理信号", platform.classifyAcceptance("正在生成视频，请稍候")?.strength, "accepted");
+
+  // ══ 15. 多账号并行（第二/三项验收重点） ══
+  console.log("── 多账号并行与账号隔离 ──");
+  const concStoreFor = (tag) => task.createTaskStore((id) => path.join(root, "conc-" + tag + "-" + id));
+  const concStore = concStoreFor("main");
+  const concSched = createFakeScheduler();
+  const timeline = [];
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const makeConcRunner = (submitImpl, store, projectId, extra = {}) =>
+    createRunner({
+      taskStore: store,
+      driver: {
+        async submit(args) {
+          return submitImpl(args);
+        },
+        async poll() {
+          return { state: "generating" };
+        },
+      },
+      capabilities: CAPS,
+      schedule: concSched.schedule,
+      cancelSchedule: concSched.cancel,
+      resolveAssets: async () => new Map(),
+      listProjectIds: async () => [projectId],
+      pollBaseMs: 100000,
+      globalConcurrency: 3,
+      ...extra,
+    });
+
+  const track = (label) => async ({ accountId }) => {
+    const startedAt = Date.now();
+    await sleep(150);
+    timeline.push({ label, accountId, startedAt, endedAt: Date.now() });
+    return { outcome: "ok", platformTaskId: `pt_${accountId}`, accepted: true, state: "queued", message: "已提交" };
+  };
+  const concRunner = makeConcRunner(track("ok"), concStoreFor("a"), "prj_conc_a");
+  for (const accountId of ["acc_a", "acc_b", "acc_c", "acc_d"]) {
+    await concRunner.enqueue({ projectId: "prj_conc_a", storyboardId: "sb_multi", accountId, params: RETRY_PARAMS, refs: [] });
+  }
+  await concRunner.tick();
+  await sleep(80);
+  eq("并发上限 3：先启动 3 条", concRunner.status().running.length, 3);
+  for (let i = 0; i < 40 && concRunner.status().running.length; i++) await sleep(50);
+  await sleep(120);
+  for (let i = 0; i < 40 && timeline.length < 4; i++) await sleep(50);
+
+  const overlap = timeline.length >= 3 && Math.max(...timeline.slice(0, 3).map((t) => t.startedAt)) < Math.min(...timeline.slice(0, 3).map((t) => t.endedAt));
+  check("前 3 个账号的执行时间确实重叠（真并发，不是串行）", overlap === true, timeline);
+  eq("第 4 个账号在前 3 个让出槽位后才执行", timeline.length, 4);
+  const allQueued = (await concStoreFor("a").list("prj_conc_a")).filter((t) => t.status === "queued");
+  eq("4 条任务分别属于 4 个账号", allQueued.length, 4);
+  eq(
+    "每条任务的平台任务 ID 与账号一一对应（不串号）",
+    allQueued.map((t) => t.platformTaskId).sort().join(","),
+    "pt_acc_a,pt_acc_b,pt_acc_c,pt_acc_d"
+  );
+
+  // 15.2 同一账号不并发（每账号最多 1 条）
+  timeline.length = 0;
+  const sameAccountRunner = makeConcRunner(track("same"), concStoreFor("b"), "prj_conc_b", { globalConcurrency: 3 });
+  await sameAccountRunner.enqueue({ projectId: "prj_conc_b", storyboardId: "sb_s1", accountId: "acc_x", params: RETRY_PARAMS, refs: [] });
+  await sameAccountRunner.enqueue({ projectId: "prj_conc_b", storyboardId: "sb_s2", accountId: "acc_x", params: RETRY_PARAMS, refs: [] });
+  await sameAccountRunner.tick();
+  for (let i = 0; i < 60 && timeline.length < 2; i++) await sleep(50);
+  const sameOverlap = timeline.length >= 2 && timeline[1].startedAt < timeline[0].endedAt;
+  check("同一账号不会同时执行两条任务", sameOverlap === false, timeline);
+
+  // 15.3 一个账号失败不阻塞其他账号
+  timeline.length = 0;
+  const mixedRunner = makeConcRunner(async ({ accountId }) => {
+    const startedAt = Date.now();
+    await sleep(120);
+    timeline.push({ accountId, startedAt, endedAt: Date.now() });
+    if (accountId === "acc_bad") {
+      return { outcome: "failed", retryable: false, needsUser: true, message: "平台拒绝：未认证人脸不支持该模型" };
+    }
+    return { outcome: "ok", platformTaskId: `pt_${accountId}`, accepted: true, state: "queued", message: "已提交" };
+  }, concStoreFor("c"), "prj_conc_c");
+  for (const accountId of ["acc_good1", "acc_bad", "acc_good2"]) {
+    await mixedRunner.enqueue({ projectId: "prj_conc_c", storyboardId: "sb_mix", accountId, params: RETRY_PARAMS, refs: [] });
+  }
+  await mixedRunner.tick();
+  for (let i = 0; i < 60 && mixedRunner.status().running.length; i++) await sleep(50);
+  const mixed = await concStoreFor("c").list("prj_conc_c");
+  const good1 = mixed.find((t) => t.accountId === "acc_good1");
+  const good2 = mixed.find((t) => t.accountId === "acc_good2");
+  const bad = mixed.find((t) => t.accountId === "acc_bad");
+  eq("一个账号失败不影响其他账号提交", [good1?.status, good2?.status].join(","), "queued,queued");
+  eq("失败账号单独标记失败（人脸未认证不是账号阻塞）", bad?.status, "failed");
+  check("并提示需要人工处理", bad?.driver?.needsUser === true, bad?.driver);
+
+  // 15.5 暂停队列：不再启动新任务，但已提交的继续监控
+  timeline.length = 0;
+  const pauseSched = createFakeScheduler();
+  const pauseRunner = makeConcRunner(track("pause"), concStoreFor("d"), "prj_conc_d", {
+    schedule: pauseSched.schedule,
+    cancelSchedule: pauseSched.cancel,
+  });
+  const submitFirst = await pauseRunner.enqueue({
+    projectId: "prj_conc_d",
+    storyboardId: "sb_pause",
+    accountId: "acc_p1",
+    params: RETRY_PARAMS,
+    refs: [],
+  });
+  await pauseRunner.tick();
+  for (let i = 0; i < 40 && pauseRunner.status().running.length; i++) await sleep(50);
+  const polledBefore = (await concStoreFor("d").list("prj_conc_d")).find((t) => t.id === submitFirst.id)?.poll?.count || 0;
+  pauseRunner.pause();
+  await pauseRunner.enqueue({ projectId: "prj_conc_d", storyboardId: "sb_pause2", accountId: "acc_p2", params: RETRY_PARAMS, refs: [] });
+  const pausedTick = await pauseRunner.tick();
+  eq("暂停后不再启动新任务", pausedTick.started.length, 0);
+  await pauseSched.flush(10);
+  const polledAfter = (await concStoreFor("d").list("prj_conc_d")).find((t) => t.id === submitFirst.id)?.poll?.count || 0;
+  check("暂停期间已提交任务仍在监控（轮询继续）", polledAfter > polledBefore, { polledBefore, polledAfter, scheduled: pauseSched.size });
+  pauseRunner.resume();
 
   fs.rmSync(root, { recursive: true, force: true });
 

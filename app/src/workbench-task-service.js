@@ -266,6 +266,11 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
         return downloader.download({ projectId, attemptId, projectName: project.name, storyboardIndex: index });
       },
       "workbench:queue-status": () => runner.status(),
+      /** 交给队列按并发上限调度（多账号并行生成走这里，避免逐个 await 串行执行） */
+      "workbench:queue-run": async () => {
+        const result = await runner.tick();
+        return { ok: true, started: result?.started || [] };
+      },
       "workbench:queue-pause": () => runner.pause(),
       "workbench:queue-resume": () => runner.resume(),
       "workbench:account-clear-block": (_e, accountId) => runner.clearAccountBlock(String(accountId)),

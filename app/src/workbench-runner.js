@@ -5,7 +5,7 @@
  * 设计要点：
  * - 驱动层（driver）由外部注入，本模块不直接接触平台。因此可以用假驱动
  *   在离线环境下完整验证状态机、快照不可变、重试新尝试、下载独立状态等行为。
- * - 单账号单任务优先：默认全局并发 1、每账号并发 1。
+ * - 并发：默认全局并发 3（可配置）、每账号并发 1；不同账号的上传/提交/监控可重叠。
  * - 提交结果不确定时，先核实（verifySubmission），核实不到就标记
  *   「提交结果待确认」，绝不盲目重复提交。
  * - 登录失效 / 验证码 / 限额 一律把该账号加入暂停并标记「需人工处理」。
@@ -131,7 +131,7 @@ function createRunner(options = {}) {
   const cancelSchedule = options.cancelSchedule || ((handle) => clearTimeout(handle));
   const onChanged = options.onChanged || (() => {});
   const log = options.log || (() => {});
-  const globalConcurrency = options.globalConcurrency ?? 1;
+  const globalConcurrency = options.globalConcurrency ?? 3;
   const perAccountConcurrency = options.perAccountConcurrency ?? 1;
   const pollBaseMs = options.pollBaseMs ?? 3000;
   const pollMaxMs = options.pollMaxMs ?? 30000;
@@ -146,32 +146,35 @@ function createRunner(options = {}) {
     running: new Map(), // attemptId -> {projectId, accountId, startedAt}
     timers: new Map(), // attemptId -> handle
     blockedAccounts: new Map(), // accountId -> {code,label,message,at}
-    // 提交锁：同一条分镜在「提交中 / 等待自动重试」期间不允许再次提交
-    locks: new Map(), // `${projectId}:${storyboardId}` -> {at, attemptId, reason, until}
+    // 提交锁：按「项目 + 分镜 + 账号」加锁 —— 同一分镜发给不同账号必须能并行，
+    // 只有同一账号的同一条分镜才互斥（防止重复点击或自动重试与手动点击并发）
+    locks: new Map(),
     autoRetries: new Map(), // attemptId -> {count, reason, nextAt, handle}
     lastTick: "",
   };
 
-  const lockKey = (projectId, storyboardId) => `${projectId}:${storyboardId}`;
+  const lockKey = (projectId, storyboardId, accountId) => `${projectId}:${storyboardId}:${accountId || "*"}`;
 
-  function lockOf(projectId, storyboardId) {
-    const lock = state.locks.get(lockKey(projectId, storyboardId));
+  function lockOf(projectId, storyboardId, accountId) {
+    const lock = state.locks.get(lockKey(projectId, storyboardId, accountId));
     if (!lock) return null;
     return lock;
   }
 
-  function takeLock(projectId, storyboardId, attemptId, reason) {
-    state.locks.set(lockKey(projectId, storyboardId), {
+  function takeLock(projectId, storyboardId, accountId, attemptId, reason) {
+    state.locks.set(lockKey(projectId, storyboardId, accountId), {
       at: new Date().toISOString(),
       attemptId,
+      accountId,
+      storyboardId,
       reason,
       until: "",
     });
     notify();
   }
 
-  function releaseLock(projectId, storyboardId) {
-    state.locks.delete(lockKey(projectId, storyboardId));
+  function releaseLock(projectId, storyboardId, accountId) {
+    state.locks.delete(lockKey(projectId, storyboardId, accountId));
     notify();
   }
 
@@ -243,30 +246,52 @@ function createRunner(options = {}) {
 
   // ── 单次执行 ───────────────────────────────────────────────
   async function execute(projectId, attemptId) {
+    // 立刻占住并发槽位：tick 是按 state.running 判断上限的，
+    // 若等到函数内部若干 await 之后才登记，多账号并发时会一次性超出上限。
+    // 直接调用（不是从 tick 派发）时这里补登记；从 tick 派发时保留它已经写好的账号信息。
+    if (!state.running.has(attemptId)) {
+      state.running.set(attemptId, { projectId, accountId: "", startedAt: Date.now() });
+    }
+    notify();
+    let reserved = true;
+    const releaseSlot = () => {
+      if (reserved) {
+        reserved = false;
+        state.running.delete(attemptId);
+      }
+    };
     clearTimer(attemptId);
     const record = await loadRecord(projectId, attemptId);
-    if (!record) throw new Error("任务不存在");
-    if (isTerminal(record.status)) return record;
+    if (!record) {
+      releaseSlot();
+      throw new Error("任务不存在");
+    }
+    if (isTerminal(record.status)) {
+      releaseSlot();
+      return record;
+    }
     const blocked = state.blockedAccounts.get(record.accountId);
     if (blocked) {
-      return patch(projectId, attemptId, (r) => {
+      const blockedRecord = await patch(projectId, attemptId, (r) => {
         setError(r, blocked.code, `${blocked.label}：${blocked.message}`);
         if (r.status !== STATUS.MANUAL) applyStatus(r, STATUS.MANUAL, "账号处于暂停状态，已停止执行");
         return r;
       });
+      releaseSlot();
+      return blockedRecord;
     }
 
     state.running.set(attemptId, { projectId, accountId: record.accountId, startedAt: Date.now() });
     notify();
 
     // 提交锁：同一条分镜在同一时刻只能有一次提交（手动点击与自动重试不能并发）
-    const held = lockOf(projectId, record.storyboardId);
+    const held = lockOf(projectId, record.storyboardId, record.accountId);
     if (held && held.attemptId !== attemptId) {
-      state.running.delete(attemptId);
+      releaseSlot();
       notify();
       throw new Error(`这条分镜正在提交中（${held.reason}），已跳过重复提交，避免重复消耗额度`);
     }
-    takeLock(projectId, record.storyboardId, attemptId, "正在提交");
+    takeLock(projectId, record.storyboardId, record.accountId, attemptId, "正在提交");
     let keepLock = false;
 
     // 中途步骤与最终结果都会写同一个 tasks.json：串行化写入，保证最终结果最后落盘。
@@ -329,7 +354,7 @@ function createRunner(options = {}) {
         if (rule) blockAccount(record.accountId, rule, submitted?.message);
         // 平台明确拒绝（人脸未认证/内容规则/要求确认）：不自动重试，也不换素材换模型
         if (submitted?.needsUser || !submitted?.retryable) {
-          releaseLock(projectId, record.storyboardId);
+          releaseLock(projectId, record.storyboardId, record.accountId);
           return;
         }
         // 明确「没有受理 + 临时可恢复」：按上限自动重试
@@ -346,7 +371,7 @@ function createRunner(options = {}) {
           applyStatus(r, STATUS.QUEUED, submitted?.message || "平台已受理，等待任务 ID");
           return r;
         });
-        releaseLock(projectId, record.storyboardId);
+        releaseLock(projectId, record.storyboardId, record.accountId);
         schedulePoll(projectId, attemptId, pollBaseMs);
         return;
       }
@@ -399,10 +424,14 @@ function createRunner(options = {}) {
       });
       if (rule) blockAccount(record.accountId, rule, error?.message);
     } finally {
-      state.running.delete(attemptId);
+      releaseSlot();
       // 有自动重试在排队时保留提交锁，避免手动再点一次造成并发提交
-      if (!keepLock) releaseLock(projectId, record.storyboardId);
+      if (!keepLock) releaseLock(projectId, record.storyboardId, record.accountId);
       notify();
+      // 让出并发槽位后立刻补派本项目的排队任务：多账号并行时其余账号不必等下一次手动触发
+      Promise.resolve()
+        .then(() => tick(projectId))
+        .catch(() => {});
     }
   }
 
@@ -437,7 +466,7 @@ function createRunner(options = {}) {
     const handle = schedule(() => {
       state.autoRetries.delete(attemptId);
       // 交给尝试链上的新记录重新加锁，避免锁卡在旧尝试上
-      releaseLock(projectId, record.storyboardId);
+      releaseLock(projectId, record.storyboardId, record.accountId);
       return retry(projectId, attemptId).catch((error) => log("auto-retry-error", { attemptId, message: error?.message }));
     }, backoff);
     state.autoRetries.set(attemptId, { count, reason, nextAt, handle, projectId });
@@ -473,7 +502,7 @@ function createRunner(options = {}) {
       state.autoRetries.delete(attemptId);
     }
     const record = await loadRecord(projectId, attemptId);
-    if (record) releaseLock(projectId, record.storyboardId);
+    if (record) releaseLock(projectId, record.storyboardId, record.accountId);
     return patch(projectId, attemptId, (r) => {
       r.autoRetry = { ...(r.autoRetry || {}), stopped: true, reason: "已手动停止自动重试" };
       // 已经是终态就只更新说明，不做状态迁移（避免非法迁移）
@@ -496,10 +525,6 @@ function createRunner(options = {}) {
   async function pollOnce(projectId, attemptId) {
     const record = await loadRecord(projectId, attemptId);
     if (!record || isTerminal(record.status)) return;
-    if (state.paused) {
-      schedulePoll(projectId, attemptId, pollBaseMs);
-      return;
-    }
     if (!record.platformTaskId) return;
 
     const startedAt = Date.parse(record.submittedAt || record.createdAt) || Date.now();
@@ -561,16 +586,23 @@ function createRunner(options = {}) {
   }
 
   // ── 队列调度 ──────────────────────────────────────────────
-  async function tick() {
+  /** scopeProjectId 只在补派槽位时传入：只扫本项目，避免连带启动其他项目的任务 */
+  async function tick(scopeProjectId = "") {
     state.lastTick = new Date().toISOString();
     if (state.paused) return { started: [] };
     const started = [];
-    const projects = options.listProjectIds ? await options.listProjectIds() : [];
+    const projects = scopeProjectId
+      ? [scopeProjectId]
+      : options.listProjectIds
+        ? await options.listProjectIds()
+        : [];
     for (const projectId of projects) {
       const tasks = await taskStore.list(projectId);
       for (const task of tasks.filter((t) => t.status === STATUS.PENDING)) {
         if (state.running.size >= globalConcurrency) return { started };
         if (runningCountFor(task.accountId) >= perAccountConcurrency) continue;
+        // 派发前就把账号信息写进运行表：否则同一账号的并发判断拿不到账号，会同时启动两条
+        state.running.set(task.id, { projectId, accountId: task.accountId, startedAt: Date.now() });
         started.push(task.id);
         execute(projectId, task.id).catch(() => {});
       }

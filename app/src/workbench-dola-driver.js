@@ -524,34 +524,44 @@ const STEP_RESET_FILE_INPUT = `
 `;
 
 /**
- * 清空编辑器里已有的参考图缩略卡（实测：div[class*="thumb-card"] 内含 img[src^=blob:] 与 button[class*="delete-btn"]）。
- * 不清空就会把上一次残留的图片一起发出去，导致「工作台 assetId 与平台实际附件」对不上。
+ * 参考图查询：限定在「当前会话的消息编辑器」容器内。
+ * 实测（2026-09-23）：整页扫 img 会把历史消息、平台恢复的草稿附件、UI 装饰图都算进来，
+ * 于是出现「本次 3 张、平台 6 张」；而这里的附件卡片类名是 image-wrapper-*（不是 thumb-card）、
+ * 也没有 alt 文件名。因此容器从「文件输入 + 发送按钮的共同祖先」推导，
+ * 身份用 blob URL（附件标识），顺序用 DOM 顺序。
  */
-const STEP_CLEAR_ATTACHMENTS = `
-  const cards = () => [...document.querySelectorAll('[class*="thumb-card"], [data-kind="image"]')]
-    .filter(el => el.querySelector('img[src^="blob:"]'));
-  // 参考图区域可能是懒渲染的：先给它几秒时间冒出来，否则会把残留图片当成「没有」
-  const waitDeadline = Date.now() + 4000;
-  while (!cards().length && Date.now() < waitDeadline) {
-    await new Promise(r => setTimeout(r, 300));
-  }
-  const before = cards().length;
-  if (!before) return { ok: true, skipped: true, removed: 0, remaining: 0 };
-  let guard = 0;
-  while (cards().length && guard < 20) {
-    const card = cards()[0];
-    const button = card.querySelector('button[class*="delete-btn"]') || card.querySelector('button');
-    if (!button) break;
-    pointerClick(button);
-    await new Promise(r => setTimeout(r, 250));
-    guard++;
-  }
-  const remaining = cards().length;
+const STEP_ATTACHMENTS_STATE = `
+  const input = document.querySelector(SEL.fileInput);
+  const send = document.querySelector(SEL.sendButton);
+  const editor = document.querySelector(SEL.editor);
+  // 容器：在「编辑器/发送按钮的 guidance-input-* 祖先」里，选真正包含参考图缩略图的那一层。
+  // 实测（2026-09-23）：附件缩略图不在工具栏那一行、也不一定在编辑器的直接祖先里，
+  // 因此用「含 blob 图片的最内层 composer 祖先」自校准；没有任何附件时退回到最近的一层。
+  const climb = (start) => {
+    const list = [];
+    let node = start;
+    let guard = 0;
+    while (node && guard < 40) {
+      const cls = String(node.className || '');
+      if (/guidance-input/.test(cls) && node.contains(input) && node.contains(send)) list.push(node);
+      node = node.parentElement;
+      guard++;
+    }
+    return list;
+  };
+  const hasBlob = (node) => [...node.querySelectorAll('img')].some(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const candidates = climb(editor || send || input);
+  const root = candidates.find(hasBlob) || candidates[0] || input;
+  if (!root) return { ok: false, reason: '无法定位当前会话的输入容器', ...pageInfo() };
+  const blobs = [...root.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const cards = [...new Set(blobs.map(img => img.closest('[class*="image-wrapper"]') || img.parentElement))];
+  const urls = cards.map(card => String(card.querySelector('img[src^="blob:"]')?.getAttribute('src') || ''));
   return {
-    ok: remaining === 0,
-    removed: before - remaining,
-    remaining,
-    reason: remaining === 0 ? undefined : '无法清空已有的参考图缩略图，为避免带上不属于本次的图片而停止提交',
+    ok: true,
+    rootCls: String(root.className || '').slice(0, 60),
+    count: cards.length,
+    urls,
+    pageUrl: String(location.href),
   };
 `;
 
@@ -561,43 +571,54 @@ const STEP_CLEAR_ATTACHMENTS = `
  * 平台不提供内联图片节点，所以这里的「绑定正确」= 数量一致 + 顺序一致 + 文本标注一致。
  */
 const STEP_VERIFY_REFS = `
-  const list = editors();
-  const editor = list[0] || null;
-  const names = __NAMES__;      // 本次要上传的文件名（按 参考图1..N 的顺序）
-  const labels = __LABELS__;    // 文本里应出现的 参考图N
-  const expected = names.length;
-  const text = editor ? String(editor.textContent || '') : '';
-  // 实测：每个参考图缩略卡里有两个 img（明/暗主题各一），按父节点去重才是真实张数；
-  // alt 就是上传时的原始文件名
-  const blobImgs = [...document.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
-  const cards = [...new Set(blobImgs.map(img => img.parentElement))];
-  const altNames = cards.map(card => { const img = card.querySelector('img[alt]'); return img ? String(img.getAttribute('alt')) : ''; });
-  const orderMatched = expected === 0 || names.every((name, i) => altNames[i] === name);
-  const missingNames = names.filter(name => !altNames.includes(name));
-  const labelsInText = labels.filter(label => text.includes(label));
-  const missingLabels = labels.filter(label => !text.includes(label));
-  const enoughAttachments = expected === 0 || (cards.length === expected && missingNames.length === 0);
-  const labelsOk = labels.length === 0 || missingLabels.length === 0;
+  const expectedUrls = __URLS__;   // 本次上传得到的附件标识，按 参考图1..N 的顺序
+  const labels = __LABELS__;
+  const input = document.querySelector(SEL.fileInput);
+  const send = document.querySelector(SEL.sendButton);
+  const editorNode = document.querySelector(SEL.editor);
+  const climb = (start) => {
+    const list = [];
+    let node = start;
+    let guard = 0;
+    while (node && guard < 40) {
+      const cls = String(node.className || '');
+      if (/guidance-input/.test(cls) && node.contains(input) && node.contains(send)) list.push(node);
+      node = node.parentElement;
+      guard++;
+    }
+    return list;
+  };
+  const hasBlob = (node) => [...node.querySelectorAll('img')].some(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const candidates = climb(editorNode || send || input);
+  const root = candidates.find(hasBlob) || candidates[0] || input;
+  if (!root) return { ok: false, reason: '无法定位当前会话的输入容器', ...pageInfo() };
+  const blobs = [...root.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
+  const cards = [...new Set(blobs.map(img => img.closest('[class*="image-wrapper"]') || img.parentElement))];
+  const urls = cards.map(card => String(card.querySelector('img[src^="blob:"]')?.getAttribute('src') || ''));
+  const text = (() => { const list = editors(); return list[0] ? String(list[0].textContent || '') : ''; })();
+  const countOk = urls.length === expectedUrls.length;
+  const orderMatched = countOk && expectedUrls.every((u, i) => urls[i] === u);
+  const missing = expectedUrls.filter(u => !urls.includes(u));
+  const extra = urls.filter(u => !expectedUrls.includes(u));
+  const missingLabels = labels.filter(l => !text.includes(l));
   return {
-    ok: enoughAttachments && orderMatched && labelsOk,
-    expected,
-    attachmentCards: cards.length,
+    ok: countOk && orderMatched && missingLabels.length === 0,
+    expected: expectedUrls.length,
+    attachmentCards: urls.length,
     orderMatched,
-    altNames,
-    missingNames,
-    labelsInText,
+    missingCount: missing.length,
+    extraCount: extra.length,
+    labelsInText: labels.filter(l => text.includes(l)),
     missingLabels,
     hasAtomicMark: text.includes(SEL.atomicMark),
     editorText: text.slice(0, 200),
-    reason: expected === 0
-      ? '本次没有参考图'
-      : !enoughAttachments
-        ? '平台上的参考图数量/名称与本次要传的不一致（本次 ' + expected + ' 张，平台上 ' + cards.length + ' 张；缺 ' + (missingNames.join('、') || '无') + '）'
-        : !orderMatched
-          ? '平台附件的顺序与「参考图1..N」不一致，编号会对应错图片'
-          : !labelsOk
-            ? '文本里缺少参考图编号标注：' + missingLabels.join('、')
-            : undefined,
+    reason: !countOk
+      ? '输入区里的附件数量与本次不一致（本次 ' + expectedUrls.length + ' 张，输入区 ' + urls.length + ' 张，多出 ' + extra.length + ' 张、缺 ' + missing.length + ' 张）'
+      : !orderMatched
+        ? '输入区里附件顺序与「参考图1..N」不一致（按实际附件映射判断，不靠改编号掩盖）'
+        : missingLabels.length
+          ? '文本里缺少参考图编号标注：' + missingLabels.join('、')
+          : undefined,
   };
 `;
 
@@ -742,7 +763,30 @@ function createDolaDriver(options = {}) {
   const state = {
     verified: false, // 实机验证前一律为 false
     pages: new Map(),
+    // 本工具在「某账号 + 某分镜」输入区上传过的附件：assetId ↔ 平台附件标识（blob URL）
+    attachments: new Map(),
+    // 每账号的上传/提交互斥锁：同一账号同时只跑一次，防止重复点击造成附件叠加
+    locks: new Map(),
   };
+
+  /** 同一账号的上传与提交串行化（不同账号互不阻塞） */
+  async function withAccountLock(accountId, task) {
+    const previous = state.locks.get(accountId) || Promise.resolve();
+    let release = () => {};
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    state.locks.set(
+      accountId,
+      previous.then(() => gate)
+    );
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+    }
+  }
 
   async function pageFor(accountId) {
     const existing = state.pages.get(accountId);
@@ -833,41 +877,67 @@ function createDolaDriver(options = {}) {
     return evaluate(contents, code);
   }
 
-  async function attachImages(contents, uploads) {
-    if (!uploads?.length) return { ok: true, skipped: true, reason: "没有参考图片" };
-    // 先清空 file input，否则重复上传同一批图片不会触发平台的 change 事件
-    const reset = await evaluate(contents, STEP_RESET_FILE_INPUT);
-    if (!reset?.found) {
-      return {
-        ok: false,
-        reason: "当前页面没有可用的文件上传入口，无法附加参考图片",
-        limitation: "平台未提供图片上传入口时，参考图引用无法提交",
-        uploads,
-      };
-    }
+  /**
+   * 逐张上传并建立「assetId → 平台附件标识（blob URL）」映射。
+   * 逐张上传：能确认每一张是否真的完成；拿不到新附件就是这张失败，只补传它，绝不整批重传。
+   * 已在输入区且属于本工具上传过的，直接复用。
+   */
+  async function attachImages(contents, uploads, knownUrls = []) {
+    const wanted = (uploads || []).filter((item) => item?.filePath);
+    if (!wanted.length) return { ok: true, skipped: true, reason: "没有参考图片", mapping: [] };
     const dbg = contents.debugger;
     const owned = !dbg.isAttached();
+    const mapping = [];
+    const failed = [];
     try {
       if (owned) dbg.attach("1.3");
       await dbg.sendCommand("DOM.enable", {});
-      const { root } = await dbg.sendCommand("DOM.getDocument", { depth: 1 });
-      const { nodeId } = await dbg.sendCommand("DOM.querySelector", {
-        nodeId: root.nodeId,
-        selector: DOLA_SELECTORS.fileInput,
-      });
-      if (!nodeId) {
-        return {
-          ok: false,
-          reason: "当前页面没有可用的文件上传入口，无法附加参考图片",
-          limitation: "平台未提供图片上传入口时，参考图引用无法提交",
-          uploads,
-        };
+      const before = (await evaluate(contents, STEP_ATTACHMENTS_STATE)).urls || [];
+      for (const item of wanted) {
+        const recorded = knownUrls.find((entry) => entry.assetId === item.assetId);
+        if (recorded && before.includes(recorded.url)) {
+          mapping.push({ ...recorded, reused: true });
+          continue;
+        }
+        const seen = new Set([...(await evaluate(contents, STEP_ATTACHMENTS_STATE)).urls, ...mapping.map((m) => m.url)]);
+        await evaluate(contents, STEP_RESET_FILE_INPUT);
+        const { root } = await dbg.sendCommand("DOM.getDocument", { depth: 1 });
+        const { nodeId } = await dbg.sendCommand("DOM.querySelector", {
+          nodeId: root.nodeId,
+          selector: DOLA_SELECTORS.fileInput,
+        });
+        if (!nodeId) {
+          return { ok: false, reason: "当前页面没有可用的文件上传入口，无法附加参考图片", mapping };
+        }
+        await dbg.sendCommand("DOM.setFileInputFiles", { nodeId, files: [item.filePath] });
+        // 等这一张真的进入输入区（最多 8 秒），拿到它的附件标识
+        let url = "";
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          await sleep(300);
+          const now = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+          const fresh = (now.urls || []).find((value) => value && !seen.has(value));
+          if (fresh) {
+            url = fresh;
+            break;
+          }
+        }
+        if (!url) {
+          failed.push(item);
+          continue;
+        }
+        mapping.push({ assetId: item.assetId, token: item.token, label: item.label, name: item.name, url });
       }
-      await dbg.sendCommand("DOM.setFileInputFiles", { nodeId, files: uploads });
-      await sleep(2500);
-      return { ok: true, count: uploads.length, resetFrom: reset.clearedFrom };
+      return {
+        ok: failed.length === 0 && mapping.length === wanted.length,
+        count: mapping.length,
+        expected: wanted.length,
+        mapping,
+        failedNames: failed.map((item) => String(item.filePath).split(/[\\/]/).pop()),
+        reason: failed.length ? `有 ${failed.length} 张参考图上传后没有出现在输入区` : undefined,
+      };
     } catch (error) {
-      return { ok: false, reason: error?.message || String(error) };
+      return { ok: false, reason: error?.message || String(error), mapping };
     } finally {
       if (owned && dbg.isAttached()) {
         try {
@@ -962,11 +1032,16 @@ function createDolaDriver(options = {}) {
     return seen;
   }
 
-  return {
+  const api = {
     id: "dola",
     verified: state.verified,
 
-    async submit({ accountId, plan, onStep }) {
+    /** 对外入口：同一账号串行（互斥锁），不同账号可并发 */
+    async submit(args) {
+      return withAccountLock(args?.accountId, () => api._submit(args));
+    },
+
+    async _submit({ accountId, plan, onStep }) {
       const steps = [];
       // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果
       const record = (step, result) => {
@@ -1017,10 +1092,25 @@ function createDolaDriver(options = {}) {
         return fail(`无法进入视频生成模式：${mode?.reason || "未知原因"}`);
       }
 
-      // 3) 清掉页面上残留的参考图，避免把不属于本次的图片发出去
-      const clearStep = await evaluate(contents, STEP_CLEAR_ATTACHMENTS);
-      record("clearAttachments", clearStep);
-      if (!clearStep?.ok) return fail(`无法清空已有的参考图：${clearStep?.reason || "未知原因"}`);
+      // 3) 先读输入区已有附件：属于本工具上传过的会被复用；来源不明的停下报告冲突（绝不擅自清空）
+      const attachKey = `${accountId}|${plan.storyboardId}`;
+      const knownAttachments = state.attachments.get(attachKey) || [];
+      const preAttach = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+      record("attachmentsPre", { ok: preAttach?.ok, count: preAttach?.count ?? 0, rootCls: preAttach?.rootCls });
+      if (!preAttach?.ok) return fail(`无法读取输入区状态：${preAttach?.reason || "未知原因"}`);
+      const unknownUrls = (preAttach.urls || []).filter((url) => !knownAttachments.some((entry) => entry.url === url));
+      if (unknownUrls.length) {
+        return {
+          outcome: "failed",
+          errorCode: "ATTACHMENT_CONFLICT",
+          accepted: false,
+          retryable: false,
+          needsUser: true,
+          evidence: { kind: "attachment-conflict", unknown: unknownUrls.length, known: knownAttachments.length },
+          message: `输入区里已有 ${unknownUrls.length} 张来源不明的参考图（可能是平台恢复的草稿或手工加入的），为避免发错图片，本次不提交、也不擅自清空；请在平台输入区手动清空后重试`,
+          steps,
+        };
+      }
 
       // 4) 写入提示词：@图N 已在主进程转成「参考图N」，不再写入任何占位符
       const textStep = await evaluate(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
@@ -1089,41 +1179,56 @@ function createDolaDriver(options = {}) {
         record("chooseRatio", { ok: true, skipped: true, reason: "未设置比例，使用平台默认比例（无法回读核实）" });
       }
 
-      // 6) 上传参考图，并核实编辑器里真的出现了内联引用
-      const uploadNames = (plan.uploads || []).map((filePath) => String(filePath).split(/[\\/]/).pop());
+      // 6) 逐张上传参考图（已传过的复用，只补缺失），再按「附件标识 + 顺序 + 文本编号」三重复核
       const refList = plan.references || [];
       const refLabels = refList.map((item) => item.label).filter(Boolean);
-      let uploadStep = null;
-      let refsStep = null;
-      // 平台的参考图区可能是懒渲染的（清空时还没出现、上传后才把旧图带出来），
-      // 因此这里允许「清空 → 上传 → 核对」最多两轮，仍然对不上就阻断，绝不带不明图片提交。
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        if (attempt > 1) {
-          const retryClear = await evaluate(contents, STEP_CLEAR_ATTACHMENTS);
-          record("clearAttachments", { ...retryClear, retry: attempt - 1 });
-          if (!retryClear?.ok) {
-            return fail(`参考图区里有清理不掉的旧图：${retryClear?.reason || "未知原因"}`);
-          }
-        }
-        uploadStep = await withTimeout(attachImages(contents, plan.uploads), IMAGE_TIMEOUT_MS, {
-          ok: false,
-          reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
-        });
-        record("attachImages", uploadStep);
-        if (!uploadStep.ok) {
-          return fail(uploadStep.reason, { limitation: uploadStep.limitation });
-        }
-        refsStep = await evaluate(
-          contents,
-          STEP_VERIFY_REFS.replace("__NAMES__", JSON.stringify(uploadNames)).replace("__LABELS__", JSON.stringify(refLabels))
-        );
-        record("verifyRefs", refsStep);
-        if (refsStep?.ok) break;
+      const uploadStep = await withTimeout(attachImages(contents, refList, knownAttachments), IMAGE_TIMEOUT_MS, {
+        ok: false,
+        reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
+      });
+      record("attachImages", {
+        ok: uploadStep.ok,
+        count: uploadStep.count,
+        expected: uploadStep.expected,
+        reused: (uploadStep.mapping || []).filter((item) => item.reused).length,
+        failedNames: uploadStep.failedNames,
+        reason: uploadStep.reason,
+      });
+      if (!uploadStep.ok) {
+        return fail(`参考图上传未完成：${uploadStep.reason || "有图片没有出现在输入区"}`);
       }
+      const mapping = uploadStep.mapping || [];
+      state.attachments.set(attachKey, mapping);
+
+      // 实测（2026-09-23）：平台在上传参考图的过程中可能重渲染并清空输入框里的文本，
+      // 因此上传完成后重新写入一次提示词（幂等），否则后面「文本里有没有参考图N」会被误判成失败。
+      const textStep2 = await evaluate(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
+      record("setPromptAfterUpload", { ok: textStep2?.ok, actualText: textStep2?.actualText, reason: textStep2?.reason });
+      if (!textStep2?.ok) {
+        return fail(`上传后重新写入提示词失败：${textStep2?.reason || "编辑器回读与预期不一致"}`);
+      }
+
+      const refsStep = await evaluate(
+        contents,
+        STEP_VERIFY_REFS.replace("__URLS__", JSON.stringify(mapping.map((item) => item.url))).replace(
+          "__LABELS__",
+          JSON.stringify(refLabels)
+        )
+      );
+      record("verifyRefs", {
+        ok: refsStep?.ok,
+        expected: refsStep?.expected,
+        attachmentCards: refsStep?.attachmentCards,
+        orderMatched: refsStep?.orderMatched,
+        extraCount: refsStep?.extraCount,
+        missingCount: refsStep?.missingCount,
+        labelsInText: refsStep?.labelsInText,
+        reason: refsStep?.reason,
+      });
       if (!refsStep?.ok) {
         // 引用没对上就提交，等于白白消耗额度：这里阻断并说明能力差异
         return fail(
-          `参考图未核实通过：${refsStep?.reason || "附件与本次图片不一致"}（已上传 ${uploadStep?.count || 0} 张，平台附件 ${
+          `参考图未核实通过：${refsStep?.reason || "附件映射不一致"}（本次 ${mapping.length} 张，输入区 ${
             refsStep?.attachmentCards ?? 0
           } 张，顺序一致：${refsStep?.orderMatched ? "是" : "否"}）`
         );
@@ -1291,8 +1396,12 @@ function createDolaDriver(options = {}) {
     dispose() {
       // 只放开引用，绝不销毁：这些是应用自己的账号 webview，不是驱动层创建的窗口
       state.pages.clear();
+      state.attachments.clear();
+      state.locks.clear();
     },
   };
+
+  return api;
 }
 
 module.exports = {
