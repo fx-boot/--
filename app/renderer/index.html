@@ -259,6 +259,21 @@
           </div>
           <div class="workbench-storyboards" id="workbenchStoryboardList"></div>
         </div>
+        <aside class="workbench-tasks">
+          <div class="workbench-section-head">
+            <strong>生成任务</strong>
+            <span class="count-badge" id="workbenchTaskCount">0</span>
+          </div>
+          <div class="workbench-task-controls">
+            <label class="workbench-field"><span>执行账号</span><select id="workbenchAccountSelect"></select></label>
+            <div class="workbench-task-buttons">
+              <button type="button" class="secondary-action compact" id="workbenchQueuePause">暂停队列</button>
+              <button type="button" class="secondary-action compact" id="workbenchQueueResume">恢复队列</button>
+            </div>
+          </div>
+          <div class="workbench-account-note" id="workbenchAccountNote">账号状态与额度本工作台无法核实，显示为未知。</div>
+          <div class="workbench-task-list" id="workbenchTaskList"></div>
+        </aside>
       </div>
     </section>
   </div>
@@ -316,6 +331,21 @@
         <button type="button" class="modal-close" data-close="workbenchPreviewModal">×</button>
       </div>
       <div class="workbench-preview-body"><img id="workbenchPreviewImage" alt="素材预览"></div>
+    </section>
+  </div>
+
+  <!-- 提交前确认：先展示校验结果与平台限制 -->
+  <div class="overlay hidden" id="workbenchRunModal">
+    <section class="modal confirm-modal workbench-run-modal">
+      <div class="modal-title">
+        <div><span class="eyebrow">SUBMIT ONE STORYBOARD</span><h2>确认提交这一条分镜</h2><p>默认只提交一条，用于验证闭环；不会批量消耗账号额度</p></div>
+        <button type="button" class="modal-close" data-close="workbenchRunModal">×</button>
+      </div>
+      <div class="workbench-run-body" id="workbenchRunPreview"></div>
+      <div class="modal-actions">
+        <button type="button" class="secondary-action" data-close="workbenchRunModal">取消</button>
+        <button type="button" class="primary-action" id="workbenchRunConfirm">确认提交</button>
+      </div>
     </section>
   </div>
 

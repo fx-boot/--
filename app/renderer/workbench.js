@@ -20,8 +20,15 @@
     assets: [],
     capabilities: null,
     limits: null,
+    accounts: [],
+    tasks: [],
+    queue: null,
+    selectedAccountId: "",
+    run: { storyboardId: "", attemptId: "" },
     search: "",
     saveTimers: new Map(),
+    // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
+    pendingValues: new Map(),
     lastSaved: "",
     focusedStoryboardId: "",
     mention: { storyboardId: "", prompt: "", caret: 0, search: "" },
@@ -93,6 +100,9 @@
           assets: snapshot.assets,
           capabilities: snapshot.capabilities,
           limits: snapshot.limits,
+          accounts: snapshot.accounts || [],
+          tasks: snapshot.tasks || [],
+          queue: snapshot.queue || null,
         });
       } catch (error) {
         toast(`读取工作台数据失败：${error.message}`, "error");
@@ -131,6 +141,8 @@
     renderAssets();
     renderDefaults();
     renderStoryboards();
+    renderAccounts();
+    renderTasks();
     renderHint();
     restoreFocus(focus);
   }
@@ -445,6 +457,212 @@
     return wrap;
   }
 
+  // ── 执行账号与任务 ───────────────────────────────────────
+  const statusLabel = (status) => state.statusLabels?.[status] || status;
+  const downloadLabel = (status) => state.downloadLabels?.[status] || status;
+  const ACTIVE_STATUSES = ["pending", "submitting", "queued", "generating"];
+  const isActiveStatus = (status) => ACTIVE_STATUSES.includes(status);
+
+  function emptyDiv(message) {
+    return Object.assign(document.createElement("div"), { className: "workbench-empty", textContent: message });
+  }
+
+  function renderAccounts() {
+    const select = $("workbenchAccountSelect");
+    const note = $("workbenchAccountNote");
+    if (!select) return;
+    const accounts = state.accounts || [];
+    if (!accounts.length) {
+      select.innerHTML = "";
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "（没有可执行账号）";
+      select.appendChild(option);
+      if (note) note.textContent = "未读到任何账号。账号来自本机既有账号列表，工作台不会新建或修改账号。";
+      return;
+    }
+    if (!accounts.some((a) => a.id === state.selectedAccountId)) {
+      state.selectedAccountId = accounts[0].id;
+    }
+    select.innerHTML = "";
+    for (const account of accounts) {
+      const option = document.createElement("option");
+      option.value = account.id;
+      option.textContent = `${account.name}${account.blocked ? "（已暂停）" : ""} · 执行中 ${account.activeTasks}`;
+      select.appendChild(option);
+    }
+    select.value = state.selectedAccountId;
+
+    if (!note) return;
+    note.innerHTML = "";
+    const current = accounts.find((a) => a.id === state.selectedAccountId);
+    const line = document.createElement("span");
+    if (current?.blocked) {
+      line.textContent = `已暂停：${current.blocked.label}（${current.blocked.message || "无详情"}）`;
+    } else {
+      // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
+      line.textContent = `登录状态：未知 · 额度：未知 · 执行中任务：${current?.activeTasks ?? 0}`;
+    }
+    note.appendChild(line);
+    if (current?.blocked) {
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "text-button";
+      clear.dataset.act = "clear-block";
+      clear.textContent = "解除暂停";
+      note.appendChild(clear);
+    }
+  }
+
+  function renderTasks() {
+    const host = $("workbenchTaskList");
+    const count = $("workbenchTaskCount");
+    if (!host) return;
+    const tasks = state.tasks || [];
+    if (count) count.textContent = String(tasks.filter((t) => isActiveStatus(t.status)).length);
+    host.innerHTML = "";
+    if (!tasks.length) {
+      host.appendChild(emptyDiv("还没有生成任务。在分镜卡片上点「生成这一条」开始。"));
+      return;
+    }
+    for (const record of tasks) host.appendChild(taskCard(record));
+  }
+
+  function taskCard(record) {
+    const card = document.createElement("div");
+    card.className = "workbench-task";
+    card.dataset.attemptId = record.id;
+    if (isActiveStatus(record.status)) card.classList.add("workbench-task-active");
+
+    const head = document.createElement("div");
+    head.className = "workbench-task-head";
+    const title = document.createElement("strong");
+    title.textContent = `${record.storyboardName || "未命名分镜"} · 尝试 ${record.attempt}`;
+    head.appendChild(title);
+    const chip = document.createElement("span");
+    chip.className = `workbench-status workbench-status-${record.status}`;
+    chip.textContent = statusLabel(record.status);
+    head.appendChild(chip);
+    card.appendChild(head);
+
+    const meta = document.createElement("div");
+    meta.className = "workbench-task-meta";
+    const pieces = [
+      `账号 ${record.accountId}`,
+      record.submittedAt ? `提交 ${formatTime(record.submittedAt)}` : "尚未提交",
+      `最近更新 ${formatTime(record.updatedAt)}`,
+      record.platformTaskId ? `平台任务 ${record.platformTaskId}` : "平台任务 ID：无",
+    ];
+    if (record.params?.model) pieces.push(`模型 ${record.params.model}`);
+    if (record.params?.duration) pieces.push(`时长 ${record.params.duration}`);
+    if (record.refs?.length) pieces.push(`参考图 ${record.refs.length} 张`);
+    for (const piece of pieces) {
+      const span = document.createElement("span");
+      span.textContent = piece;
+      meta.appendChild(span);
+    }
+    card.appendChild(meta);
+
+    if (record.poll?.lastAt || record.poll?.message) {
+      const poll = document.createElement("div");
+      poll.className = "workbench-task-poll";
+      poll.textContent = `状态更新 ${formatTime(record.poll.lastAt)} · ${record.poll.message || "平台未给出明确阶段"}${
+        record.poll.stale ? "（监控异常）" : ""
+      }`;
+      card.appendChild(poll);
+    }
+
+    if (record.error) {
+      const error = document.createElement("div");
+      error.className = "workbench-task-error";
+      error.textContent = `[${record.error.code}] ${record.error.message}`;
+      card.appendChild(error);
+    }
+
+    // 状态变化日志：只展示本工作台记录的阶段与脱敏摘要，不含 Cookie / Token
+    const log = document.createElement("details");
+    log.className = "workbench-task-log";
+    const summary = document.createElement("summary");
+    summary.textContent = `状态变化（${record.history.length} 条，仅阶段与摘要）`;
+    log.appendChild(summary);
+    for (const item of record.history) {
+      const row = document.createElement("div");
+      row.textContent = `${formatTime(item.at)} ${statusLabel(item.status)}${item.note ? ` · ${item.note}` : ""}`;
+      log.appendChild(row);
+    }
+    card.appendChild(log);
+
+    const foot = document.createElement("div");
+    foot.className = "workbench-task-foot";
+    const dl = document.createElement("span");
+    dl.className = "workbench-download-state";
+    dl.textContent = `下载：${downloadLabel(record.download?.status)}${
+      record.download?.message ? `（${record.download.message}）` : ""
+    }`;
+    foot.appendChild(dl);
+    if (record.result?.filePath) {
+      const pathText = document.createElement("span");
+      pathText.className = "workbench-task-path";
+      pathText.textContent = record.result.filePath;
+      foot.appendChild(pathText);
+    }
+
+    const buttons = [];
+    if (isActiveStatus(record.status)) buttons.push(["cancel", "取消"]);
+    if (["failed", "manual", "unconfirmed"].includes(record.status)) buttons.push(["retry", "重试"]);
+    if (record.status === "succeeded") buttons.push(["download", "下载"]);
+    for (const [act, label] of buttons) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "text-button";
+      button.dataset.act = act;
+      button.textContent = label;
+      foot.appendChild(button);
+    }
+    card.appendChild(foot);
+    return card;
+  }
+
+  function runPreview(host, preview) {
+    host.innerHTML = "";
+    const rows = [
+      ["分镜", state.project?.storyboards?.find((s) => s.id === state.run.storyboardId)?.name || ""],
+      ["模型", preview.params.model || "(未设置)"],
+      ["时长", preview.params.duration || "(未设置)"],
+      ["比例", preview.params.ratio ? `${preview.params.ratio}（平台比例能力未核实，不会提交）` : "(未设置)"],
+      ["参考图片", preview.uploads.length ? `${preview.uploads.length} 张` : "无"],
+      ["执行账号", state.accounts.find((a) => a.id === preview.accountId)?.name || preview.accountId],
+    ];
+    for (const [name, value] of rows) {
+      const row = document.createElement("div");
+      row.className = "workbench-run-row";
+      const label = document.createElement("span");
+      label.textContent = name;
+      row.appendChild(label);
+      const text = document.createElement("strong");
+      text.textContent = value;
+      row.appendChild(text);
+      host.appendChild(row);
+    }
+    const prompt = document.createElement("div");
+    prompt.className = "workbench-run-prompt";
+    prompt.textContent = preview.promptPreview || "(空提示词)";
+    host.appendChild(prompt);
+
+    if (preview.errors.length) {
+      const box = document.createElement("div");
+      box.className = "workbench-run-errors";
+      box.textContent = `无法提交：${preview.errors.join("；")}`;
+      host.appendChild(box);
+    }
+    if (preview.limitations.length) {
+      const box = document.createElement("div");
+      box.className = "workbench-run-notes";
+      box.textContent = `平台限制说明：${preview.limitations.join("；")}`;
+      host.appendChild(box);
+    }
+  }
+
   // ── 分镜 ─────────────────────────────────────────────────
   function renderStoryboards() {
     const host = $("workbenchStoryboardList");
@@ -481,7 +699,8 @@
 
     const nameInput = document.createElement("input");
     nameInput.className = "workbench-sb-name";
-    nameInput.value = storyboard.name;
+    const pendingName = state.pendingValues.get(`sb-name:${storyboard.id}`);
+    nameInput.value = pendingName === undefined ? storyboard.name : pendingName;
     nameInput.maxLength = 120;
     nameInput.dataset.focusKey = `sb-name:${storyboard.id}`;
     header.appendChild(nameInput);
@@ -541,7 +760,8 @@
 
     const prompt = document.createElement("textarea");
     prompt.className = "workbench-sb-prompt";
-    prompt.value = storyboard.prompt;
+    const pendingPrompt = state.pendingValues.get(`sb-prompt:${storyboard.id}`);
+    prompt.value = pendingPrompt === undefined ? storyboard.prompt : pendingPrompt;
     prompt.placeholder = "描述这个分镜的画面与动作；输入 @ 插入参考图片。";
     prompt.dataset.focusKey = `sb-prompt:${storyboard.id}`;
     card.appendChild(prompt);
@@ -555,6 +775,13 @@
       overridden.length ? `（含 ${overridden.length} 项单条覆盖）` : "（继承全局）"
     }`;
     foot.appendChild(params);
+
+    const runButton = document.createElement("button");
+    runButton.type = "button";
+    runButton.className = "text-button workbench-run-button";
+    runButton.dataset.act = "run";
+    runButton.textContent = "生成这一条";
+    foot.appendChild(runButton);
 
     const overrideToggle = document.createElement("button");
     overrideToggle.type = "button";
@@ -627,6 +854,7 @@
       key,
       setTimeout(async () => {
         state.saveTimers.delete(key);
+        state.pendingValues.delete(`sb-${options.key || "prompt"}:${storyboardId}`);
         try {
           const result = await api.storyboard.update(projectId(), storyboardId, patch);
           state.lastSaved = formatTime(new Date());
@@ -953,6 +1181,83 @@
       renderMention();
     });
 
+    $("workbenchAccountSelect")?.addEventListener("change", (event) => {
+      state.selectedAccountId = event.target.value;
+      renderAccounts();
+    });
+
+    $("workbenchQueuePause")?.addEventListener("click", async () => {
+      try {
+        await api.queue.pause();
+        await refresh();
+        toast("已暂停待执行队列");
+      } catch (error) {
+        toast(`暂停失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchQueueResume")?.addEventListener("click", async () => {
+      try {
+        await api.queue.resume();
+        await refresh();
+        toast("已恢复队列");
+      } catch (error) {
+        toast(`恢复失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchRunConfirm")?.addEventListener("click", async () => {
+      const confirm = $("workbenchRunConfirm");
+      if (confirm) confirm.disabled = true;
+      try {
+        const created = await api.task.enqueue(projectId(), state.run.storyboardId, state.selectedAccountId);
+        closeModal("workbenchRunModal");
+        await refresh();
+        toast(`已入队第 ${created.attempt.attempt} 次尝试，开始提交`);
+        await api.task.execute(projectId(), created.attempt.id);
+        await refresh();
+      } catch (error) {
+        toast(`提交失败：${error.message}`, "error");
+      } finally {
+        if (confirm) confirm.disabled = false;
+      }
+    });
+
+    $("workbenchAccountNote")?.addEventListener("click", async (event) => {
+      if (!event.target.closest('[data-act="clear-block"]')) return;
+      try {
+        await api.account.clearBlock(state.selectedAccountId);
+        await refresh();
+        toast("已解除账号暂停");
+      } catch (error) {
+        toast(`解除失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchTaskList")?.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-act]");
+      if (!button) return;
+      const attemptId = button.closest(".workbench-task")?.dataset.attemptId;
+      if (!attemptId) return;
+      button.disabled = true;
+      try {
+        if (button.dataset.act === "cancel") {
+          const record = await api.task.cancel(projectId(), attemptId);
+          toast(record.status === "canceled" ? "已取消" : `未取消：${record.poll?.message || "平台不支持取消"}`);
+        } else if (button.dataset.act === "retry") {
+          await api.task.retry(projectId(), attemptId);
+          toast("已创建新的尝试记录，历史保留");
+        } else if (button.dataset.act === "download") {
+          const result = await api.task.download(projectId(), attemptId);
+          toast(result.ok ? `已下载：${result.filePath}` : `下载失败：${result.error}`, result.ok ? "info" : "error");
+        }
+        await refresh();
+      } catch (error) {
+        toast(`操作失败：${error.message}`, "error");
+        button.disabled = false;
+      }
+    });
+
     const list = $("workbenchStoryboardList");
     if (!list) return;
 
@@ -962,11 +1267,13 @@
       const storyboardId = card.dataset.sbId;
       state.focusedStoryboardId = storyboardId;
       if (event.target.classList.contains("workbench-sb-name")) {
+        state.pendingValues.set(`sb-name:${storyboardId}`, event.target.value);
         scheduleUpdate(storyboardId, { name: event.target.value }, { key: "name" });
         return;
       }
       if (event.target.classList.contains("workbench-sb-prompt")) {
         const node = event.target;
+        state.pendingValues.set(`sb-prompt:${storyboardId}`, node.value);
         const caret = node.selectionStart;
         // 刚输入 @ → 弹出图片选择器；把 @ 本身排除在插入点之外
         if (caret > 0 && node.value[caret - 1] === "@") {
@@ -1029,6 +1336,16 @@
         }
         if (act === "override") {
           card.querySelector(".workbench-sb-overrides")?.classList.toggle("hidden");
+          return;
+        }
+        if (act === "run") {
+          if (!state.selectedAccountId) return toast("请先选择执行账号", "error");
+          const preview = await api.task.preview(projectId(), storyboardId, state.selectedAccountId);
+          state.run = { storyboardId, attemptId: "" };
+          runPreview($("workbenchRunPreview"), preview);
+          const confirm = $("workbenchRunConfirm");
+          if (confirm) confirm.disabled = !preview.valid;
+          openModal("workbenchRunModal");
           return;
         }
         if (act === "up" || act === "down") {

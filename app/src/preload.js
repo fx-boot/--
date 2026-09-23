@@ -145,6 +145,26 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   ui: {
     set: (projectId, patch) => ipcRenderer.invoke("workbench:ui-state", projectId, patch),
   },
+  account: {
+    list: () => ipcRenderer.invoke("workbench:accounts"),
+    clearBlock: (accountId) => ipcRenderer.invoke("workbench:account-clear-block", accountId),
+  },
+  task: {
+    preview: (projectId, storyboardId, accountId) =>
+      ipcRenderer.invoke("workbench:task-preview", projectId, storyboardId, accountId),
+    enqueue: (projectId, storyboardId, accountId) =>
+      ipcRenderer.invoke("workbench:task-enqueue", projectId, storyboardId, accountId),
+    list: (projectId) => ipcRenderer.invoke("workbench:tasks", projectId),
+    execute: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-execute", projectId, attemptId),
+    cancel: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-cancel", projectId, attemptId),
+    retry: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-retry", projectId, attemptId),
+    download: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-download", projectId, attemptId),
+  },
+  queue: {
+    status: () => ipcRenderer.invoke("workbench:queue-status"),
+    pause: () => ipcRenderer.invoke("workbench:queue-pause"),
+    resume: () => ipcRenderer.invoke("workbench:queue-resume"),
+  },
   onChanged: (callback) => ipcRenderer.on("workbench:changed", () => callback()),
 });
 

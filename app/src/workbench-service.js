@@ -25,6 +25,8 @@ const {
   syncRefsFromPrompt,
 } = require("./workbench-store");
 const { createAssets, MAX_BYTES } = require("./workbench-assets");
+const { createTaskService } = require("./workbench-task-service");
+const { DOWNLOAD_LABEL, STATUS_LABEL } = require("./workbench-task-store");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
 
 const CHANGED = "workbench:changed";
@@ -36,6 +38,7 @@ const state = {
   registered: false,
   store: null,
   assets: null,
+  tasks: null,
   projectId: "",
   notifyTimer: null,
   lastError: "",
@@ -51,6 +54,21 @@ function store() {
 
 function assets() {
   return (state.assets ||= createAssets(store()));
+}
+
+/** 任务服务懒加载：涉及 session/分区，等 app ready 后再建更稳妥 */
+function tasks() {
+  return (state.tasks ||= createTaskService({
+    store: store(),
+    assets: assets(),
+    userDataDir: app.getPath("userData"),
+    log: (kind, payload) => {
+      if (process.env.DBM_WORKBENCH_DEBUG === "1") {
+        process.stderr.write(`[workbench] ${kind} ${JSON.stringify(payload || {})}\n`);
+      }
+    },
+    onChanged: notify,
+  }));
 }
 
 function storageStatus() {
@@ -150,6 +168,8 @@ async function snapshot() {
     }
   }
   const assetList = project ? await assets().list(project.id) : [];
+  const taskList = project ? await tasks().tasksFor(project.id) : [];
+  const accountList = await tasks().accountView();
   return {
     storage: storageStatus(),
     index,
@@ -157,8 +177,12 @@ async function snapshot() {
     assets: assetList,
     capabilities: VIDEO_CAPABILITIES,
     limits: { maxAssetBytes: MAX_BYTES },
-    // 阶段 2 才会产生真实任务记录；此处明确为空，不伪造任何状态
-    tasks: [],
+    accounts: accountList,
+    tasks: taskList,
+    queue: tasks().status(),
+    // 状态文案由主进程单一来源提供，避免前后端各写一份
+    statusLabels: STATUS_LABEL,
+    downloadLabels: DOWNLOAD_LABEL,
   };
 }
 
@@ -213,7 +237,7 @@ function unbindAsset(project, storyboardId, assetId) {
   return { storyboard, removed: true };
 }
 
-function handlers() {
+function baseHandlers() {
   return {
     "workbench:snapshot": () => snapshot(),
 
@@ -419,6 +443,11 @@ function handlers() {
   };
 }
 
+/** 基础通道 + 任务通道（账号 / 入队 / 执行 / 取消 / 重试 / 下载 / 队列） */
+function handlers() {
+  return { ...baseHandlers(), ...tasks().handlers };
+}
+
 function registerIpc() {
   if (state.registered) return;
   state.registered = true;
@@ -429,7 +458,10 @@ function registerIpc() {
     ipcMain.handle(channel, async (event, ...args) => {
       try {
         assertSender(event);
-        return await handler(event, ...args);
+        const result = await handler(event, ...args);
+        // 成功即清空上次错误，避免存储状态被历史错误长期污染
+        state.lastError = "";
+        return result;
       } catch (error) {
         state.lastError = error?.message || String(error);
         notify();
@@ -450,11 +482,18 @@ function install() {
       state.projectId = index.currentProjectId || "";
       // 已有项目时预热一次，尽早暴露目录权限等问题
       if (state.projectId) await store().readProject(state.projectId);
+      // 重启后恢复任务追踪：活跃记录重新纳入轮询，长时间无更新则标记监控异常
+      await tasks().recover();
       notify();
     } catch (error) {
       state.lastError = error?.message || String(error);
       notify();
     }
+  });
+  app.once("will-quit", () => {
+    try {
+      state.tasks?.dispose();
+    } catch {}
   });
 }
 
