@@ -42,7 +42,7 @@
  */
 
 const { webContents, session } = require("electron");
-const { DOLA_SELECTORS, classifyPlatformReply } = require("./workbench-platform");
+const { DOLA_SELECTORS, classifyAcceptance, classifyPlatformReply } = require("./workbench-platform");
 
 const PARTITION_PREFIX = "persist:doubao-manager-";
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
@@ -428,12 +428,16 @@ const STEP_CHOOSE = `
   };
 `;
 
-/** 写入提示词：按分段顺序插入，图片位置写入原子占位符（与既有模块同一套约定） */
+/**
+ * 写入提示词：直接写入「平台可用的纯文本」（@图N 已在主进程转成参考图N）。
+ * 实测：平台视频编辑器不支持内联图片节点，写入 U+FFFC 只会被当成普通文本，
+ * 提交后消息里显示为方框（用户截图里的 OBJ）。因此这里不再写任何占位符。
+ */
 const STEP_SET_TEXT = `
   const list = editors();
   if (!list.length) return { ok: false, reason: '找不到提示词输入框（可能未登录、页面未加载完成或页面结构已变化）', ...pageInfo() };
   const editor = list[0];
-  const segments = __SEGMENTS__;
+  const value = __VALUE__;
   editor.focus();
   const range = document.createRange();
   range.selectNodeContents(editor);
@@ -441,29 +445,61 @@ const STEP_SET_TEXT = `
   selection.removeAllRanges();
   selection.addRange(range);
   document.execCommand('delete');
-  let failed = 0;
-  for (const segment of segments) {
-    const value = segment.kind === 'image' ? SEL.atomicMark : String(segment.value || '');
-    if (!value) continue;
-    if (!document.execCommand('insertText', false, value)) failed++;
+  if (value && !document.execCommand('insertText', false, value)) {
+    return { ok: false, reason: '输入框拒绝写入文本', ...pageInfo() };
   }
   await new Promise(r => setTimeout(r, 300));
   const readback = String(editor.innerText || editor.textContent || '');
-  const atomicCount = (editor.textContent || '').split(SEL.atomicMark).length - 1;
-  const plain = segments.map(s => s.kind === 'image' ? '' : String(s.value || '')).join('');
-  const actual = readback.replace(/\\s+/g, '').replace(/\\uFFFC/g, '');
-  const expected = plain.replace(/\\s+/g, '');
+  const strip = (s) => String(s || '').replace(/\\s+/g, '');
   return {
-    ok: failed === 0 && Boolean(expected) && actual === expected,
-    failed,
-    atomicCount,
-    expectedImages: segments.filter(s => s.kind === 'image').length,
-    // 不一致时同时给出两边的开头，便于实机校准（不是猜）
-    actualText: actual.slice(0, 120),
-    expectedText: expected.slice(0, 120),
-    reason: failed === 0 ? undefined : String(failed) + ' 个分段没有被编辑器接受',
+    ok: strip(readback) === strip(value),
+    // 不一致时给出两边开头，便于实机校准（不是猜）
+    actualText: strip(readback).slice(0, 120),
+    expectedText: strip(value).slice(0, 120),
+    hasAtomicMark: String(editor.textContent || '').includes(SEL.atomicMark),
     ...toolbarState(),
     ...pageInfo(),
+  };
+`;
+
+/**
+ * 时长增强（复用应用自带的 dola-duration-enhancer）：
+ * 打开 localStorage 开关并写入秒数；增强器会在请求体里把 ability_param.duration 改写成该秒数。
+ * 注意：工具栏文案与 16—30 网格依赖页面可见（元素尺寸为 0 时增强器跳过），
+ * 所以「实际时长」以请求体回读为准，这里只负责把条件摆好并回报条件状态。
+ */
+const STEP_SET_DURATION_ENHANCEMENT = `
+  const seconds = String(__SECONDS__);
+  const enableKey = __ENABLE_KEY__;
+  const secondsKey = __SECONDS_KEY__;
+  const requiresModelLabel = __REQUIRES_MODEL__;
+  const enhancerInstalled = Boolean(window.__DBM_DOLA_30_SECOND_ENHANCER__);
+  const fetchPatched = Boolean(window.fetch && window.fetch.__dbmDola30SecondRequestPatch__ === true);
+  const modelText = textOf(controlFor('video-model'));
+  const modelOk = /2\\.5|seedance[^\\d]*2[^\\d]*5/i.test(String(modelText || '').replace(/\\s+/g, ''));
+  try {
+    localStorage.setItem(enableKey, '1');
+    localStorage.setItem(secondsKey, seconds);
+  } catch (error) {
+    return { ok: false, reason: '无法写入时长增强开关：' + (error && error.message), modelText, enhancerInstalled, fetchPatched };
+  }
+  await new Promise(r => setTimeout(r, 400));
+  const readback = { enable: localStorage.getItem(enableKey), seconds: localStorage.getItem(secondsKey) };
+  return {
+    ok: enhancerInstalled && fetchPatched && modelOk && readback.enable === '1' && readback.seconds === seconds,
+    enhancerInstalled,
+    fetchPatched,
+    modelText,
+    requiresModelLabel,
+    modelOk,
+    readback,
+    reason: !enhancerInstalled
+      ? '页面里没有检测到应用自带的时长增强器，无法保证 16—30 秒生效'
+      : !fetchPatched
+        ? '增强器的请求改写未安装（fetch 未被 patch），无法保证实际时长'
+        : !modelOk
+          ? '当前模型不是 ' + requiresModelLabel + '，增强器不会改写时长'
+          : undefined,
   };
 `;
 
@@ -494,6 +530,11 @@ const STEP_RESET_FILE_INPUT = `
 const STEP_CLEAR_ATTACHMENTS = `
   const cards = () => [...document.querySelectorAll('[class*="thumb-card"], [data-kind="image"]')]
     .filter(el => el.querySelector('img[src^="blob:"]'));
+  // 参考图区域可能是懒渲染的：先给它几秒时间冒出来，否则会把残留图片当成「没有」
+  const waitDeadline = Date.now() + 4000;
+  while (!cards().length && Date.now() < waitDeadline) {
+    await new Promise(r => setTimeout(r, 300));
+  }
   const before = cards().length;
   if (!before) return { ok: true, skipped: true, removed: 0, remaining: 0 };
   let guard = 0;
@@ -514,39 +555,49 @@ const STEP_CLEAR_ATTACHMENTS = `
   };
 `;
 
-/** 上传后核实编辑器里真的出现了内联引用节点，以及平台收到的附件是否就是本次的图片 */
+/**
+ * 上传后核实：平台收到的附件是否就是本次的图片、顺序是否与「参考图N」一致、
+ * 文本里是否写明了与附件对应的参考图编号。
+ * 平台不提供内联图片节点，所以这里的「绑定正确」= 数量一致 + 顺序一致 + 文本标注一致。
+ */
 const STEP_VERIFY_REFS = `
   const list = editors();
   const editor = list[0] || null;
-  const names = __NAMES__;      // 本次要上传的文件名，用于和平台附件逐一对应
+  const names = __NAMES__;      // 本次要上传的文件名（按 参考图1..N 的顺序）
+  const labels = __LABELS__;    // 文本里应出现的 参考图N
   const expected = names.length;
   const text = editor ? String(editor.textContent || '') : '';
-  const atomicCount = editor ? text.split(SEL.atomicMark).length - 1 : 0;
   // 实测：每个参考图缩略卡里有两个 img（明/暗主题各一），按父节点去重才是真实张数；
-  // alt 就是上传时的原始文件名，用它核对「平台收到的附件 = 本次要传的图片」
+  // alt 就是上传时的原始文件名
   const blobImgs = [...document.querySelectorAll('img')].filter(img => /^blob:/i.test(String(img.getAttribute('src') || '')));
   const cards = [...new Set(blobImgs.map(img => img.parentElement))];
   const altNames = cards.map(card => { const img = card.querySelector('img[alt]'); return img ? String(img.getAttribute('alt')) : ''; });
-  const matched = names.filter(name => altNames.includes(name));
+  const orderMatched = expected === 0 || names.every((name, i) => altNames[i] === name);
   const missingNames = names.filter(name => !altNames.includes(name));
-  const enoughAttachments = expected === 0 || cards.length === expected;
-  const enoughInline = expected === 0 || atomicCount >= expected;
+  const labelsInText = labels.filter(label => text.includes(label));
+  const missingLabels = labels.filter(label => !text.includes(label));
+  const enoughAttachments = expected === 0 || (cards.length === expected && missingNames.length === 0);
+  const labelsOk = labels.length === 0 || missingLabels.length === 0;
   return {
-    ok: enoughAttachments && enoughInline,
+    ok: enoughAttachments && orderMatched && labelsOk,
     expected,
     attachmentCards: cards.length,
-    matched: matched.length,
+    orderMatched,
+    altNames,
     missingNames,
-    atomicCount,
-    blobImages: blobImgs.length,
+    labelsInText,
+    missingLabels,
+    hasAtomicMark: text.includes(SEL.atomicMark),
     editorText: text.slice(0, 200),
     reason: expected === 0
       ? '本次没有参考图'
       : !enoughAttachments
-        ? '平台上的参考图数量与本次要传的不一致（本次 ' + expected + ' 张，平台上 ' + cards.length + ' 张；缺 ' + (missingNames.join('、') || '无') + '）'
-        : !enoughInline
-          ? '编辑器里的内联原子节点数少于参考图数量，平台可能没有建立内联引用'
-          : undefined,
+        ? '平台上的参考图数量/名称与本次要传的不一致（本次 ' + expected + ' 张，平台上 ' + cards.length + ' 张；缺 ' + (missingNames.join('、') || '无') + '）'
+        : !orderMatched
+          ? '平台附件的顺序与「参考图1..N」不一致，编号会对应错图片'
+          : !labelsOk
+            ? '文本里缺少参考图编号标注：' + missingLabels.join('、')
+            : undefined,
   };
 `;
 
@@ -575,14 +626,17 @@ const STEP_SEND_REACTION = `
 `;
 
 /**
- * 读取会话里平台最近给出的回复文本。
- * 实测（2026-09-23）：平台拒绝时不会产生任务 ID，而是在会话里回一条说明，
- * 只盯任务 ID 会把它误判成「提交结果待确认」。
+ * 读取「本次提交之后」平台新增的回复文本。
+ * 关键：必须限定在本次提交产生的消息上 —— 旧会话里的受理/拒绝提示不能算到本次头上。
+ * 判定方式：地址没变时按消息条数取增量；地址变了（平台新建会话）说明整页都是本次的。
  */
 const STEP_READ_REPLIES = `
+  const before = __BEFORE__;
   const nodes = [...document.querySelectorAll('[data-message-id]')];
-  const replies = nodes.slice(-2).map(n => String(n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300));
-  return { ok: true, count: nodes.length, replies, url: location.href };
+  const urlChanged = String(location.href) !== String(before.url || "");
+  const fresh = urlChanged ? nodes : nodes.slice(Math.max(0, Number(before.count) || 0));
+  const replies = fresh.map(n => String(n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300));
+  return { ok: true, count: nodes.length, newCount: fresh.length, urlChanged, newReplies: replies, url: location.href };
 `;
 
 /**
@@ -643,6 +697,41 @@ function collectIds(value, out = [], depth = 0) {
     }
   }
   return out;
+}
+
+/**
+ * 从「视频生成请求体」里读出真正的时长（ability_type === 17 且 ability_param.duration）。
+ * 只返回数字，不返回正文 —— 正文里可能有提示词等敏感内容。
+ * 这是「实际提交时长」的唯一可信来源：增强器正是改写这里，而不是改平台控件文案。
+ */
+function collectAbilityDuration(value, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 8) return "";
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 60)) {
+      const found = collectAbilityDuration(item, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (Number(value.ability_type) === 17) {
+    let param = value.ability_param;
+    if (typeof param === "string") {
+      try {
+        param = JSON.parse(param);
+      } catch {
+        param = null;
+      }
+    }
+    const seconds = Number(param?.duration);
+    if (Number.isFinite(seconds) && seconds > 0) return String(seconds);
+  }
+  for (const item of Object.values(value).slice(0, 100)) {
+    if (item && typeof item === "object") {
+      const found = collectAbilityDuration(item, depth + 1);
+      if (found) return found;
+    }
+  }
+  return "";
 }
 
 /** 单个步骤：把计划里的文本与图片依次写入编辑器 */
@@ -796,7 +885,7 @@ function createDolaDriver(options = {}) {
   async function watchForTaskId(contents, timeoutMs) {
     const dbg = contents.debugger;
     const owned = !dbg.isAttached();
-    const seen = { taskId: "", ids: [], error: "", requests: [] };
+    const seen = { taskId: "", ids: [], error: "", requests: [], submittedDuration: "" };
     let resolveDone;
     const done = new Promise((resolve) => {
       resolveDone = resolve;
@@ -842,6 +931,14 @@ function createDolaDriver(options = {}) {
         }
         if (method === "Network.requestWillBeSent") {
           noteRequest(String(params?.request?.method || "GET"), params?.request?.url, null);
+          // 从请求体里回读「实际提交的时长」（只留数字，不留正文）
+          try {
+            const post = params?.request?.postData;
+            if (post && post.length < 400000 && !seen.submittedDuration) {
+              const seconds = collectAbilityDuration(JSON.parse(post));
+              if (seconds) seen.submittedDuration = seconds;
+            }
+          } catch {}
         }
       } catch {}
     };
@@ -925,12 +1022,8 @@ function createDolaDriver(options = {}) {
       record("clearAttachments", clearStep);
       if (!clearStep?.ok) return fail(`无法清空已有的参考图：${clearStep?.reason || "未知原因"}`);
 
-      // 4) 写入提示词（图片位置写入原子占位符）
-      // 只把「类型 + 文本」送进页面，本地文件路径等敏感信息留在主进程
-      const segments = (plan.segments?.length ? plan.segments : [{ kind: "text", value: plan.plainText }]).map(
-        (segment) => ({ kind: segment.kind === "image" ? "image" : "text", value: segment.kind === "image" ? "" : segment.value })
-      );
-      const textStep = await evaluate(contents, STEP_SET_TEXT.replace("__SEGMENTS__", JSON.stringify(segments)));
+      // 4) 写入提示词：@图N 已在主进程转成「参考图N」，不再写入任何占位符
+      const textStep = await evaluate(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
       record("setPrompt", textStep);
       if (!textStep?.ok) {
         return fail(`写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`);
@@ -948,18 +1041,38 @@ function createDolaDriver(options = {}) {
       record("chooseModel", modelStep);
       if (!modelStep?.ok) return fail(`模型未生效：${modelStep?.reason || "选择失败"}（期望 ${target.modelLabel}）`);
 
+      // 5b) 时长：原生档位直接设置；16—30 秒属于增强，先把平台档位设成原生基线，
+      //     再由应用自带的增强器在请求体里改写成目标秒数（实际时长以请求体回读为准）
+      const isEnhanced = target.durationMode === "enhanced";
+      const baseDuration = isEnhanced ? "10" : target.duration;
       const durationStep = await chooseOption(
         contents,
         DOLA_SELECTORS.durationControl,
         "video-duration",
-        `${target.duration}s`,
-        `${target.duration}s`
+        `${baseDuration}s`,
+        `${baseDuration}s`
       );
       record("chooseDuration", durationStep);
       if (!durationStep?.ok) {
-        return fail(
-          `时长未生效：${durationStep?.reason || "选择失败"}（期望 ${target.duration}s；若模型为 2.5 且开启了 30 秒增强，工具栏文案会被应用改写，需先关闭该增强）`
+        return fail(`时长未生效：${durationStep?.reason || "选择失败"}（平台档位期望 ${baseDuration}s）`);
+      }
+
+      if (isEnhanced) {
+        const spec = plan.durationEnhancement || {};
+        const enhanceStep = await evaluate(
+          contents,
+          STEP_SET_DURATION_ENHANCEMENT.replace("__SECONDS__", JSON.stringify(String(target.duration)))
+            .replace("__ENABLE_KEY__", JSON.stringify("dbm_dola_enable_30s_v1"))
+            .replace("__SECONDS_KEY__", JSON.stringify("dbm_dola_duration_seconds_v2"))
+            .replace("__REQUIRES_MODEL__", JSON.stringify(target.modelLabel))
         );
+        record("setDurationEnhancement", { ...enhanceStep, requiredSeconds: target.duration, requiresModel: spec.requiresModel });
+        if (!enhanceStep?.ok) {
+          // 不静默降级到 10 秒：条件不满足就阻断，并说明原因
+          return fail(`时长增强未就绪：${enhanceStep?.reason || "条件不满足"}（要求 ${target.duration} 秒）`);
+        }
+      } else {
+        record("setDurationEnhancement", { ok: true, skipped: true, reason: `使用平台原生 ${target.duration} 秒，未启用增强` });
       }
 
       if (target.ratio) {
@@ -977,30 +1090,42 @@ function createDolaDriver(options = {}) {
       }
 
       // 6) 上传参考图，并核实编辑器里真的出现了内联引用
-      const uploadStep = await withTimeout(attachImages(contents, plan.uploads), IMAGE_TIMEOUT_MS, {
-        ok: false,
-        reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
-      });
-      record("attachImages", uploadStep);
-      if (!uploadStep.ok) {
-        return fail(uploadStep.reason, { limitation: uploadStep.limitation });
+      const uploadNames = (plan.uploads || []).map((filePath) => String(filePath).split(/[\\/]/).pop());
+      const refList = plan.references || [];
+      const refLabels = refList.map((item) => item.label).filter(Boolean);
+      let uploadStep = null;
+      let refsStep = null;
+      // 平台的参考图区可能是懒渲染的（清空时还没出现、上传后才把旧图带出来），
+      // 因此这里允许「清空 → 上传 → 核对」最多两轮，仍然对不上就阻断，绝不带不明图片提交。
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (attempt > 1) {
+          const retryClear = await evaluate(contents, STEP_CLEAR_ATTACHMENTS);
+          record("clearAttachments", { ...retryClear, retry: attempt - 1 });
+          if (!retryClear?.ok) {
+            return fail(`参考图区里有清理不掉的旧图：${retryClear?.reason || "未知原因"}`);
+          }
+        }
+        uploadStep = await withTimeout(attachImages(contents, plan.uploads), IMAGE_TIMEOUT_MS, {
+          ok: false,
+          reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
+        });
+        record("attachImages", uploadStep);
+        if (!uploadStep.ok) {
+          return fail(uploadStep.reason, { limitation: uploadStep.limitation });
+        }
+        refsStep = await evaluate(
+          contents,
+          STEP_VERIFY_REFS.replace("__NAMES__", JSON.stringify(uploadNames)).replace("__LABELS__", JSON.stringify(refLabels))
+        );
+        record("verifyRefs", refsStep);
+        if (refsStep?.ok) break;
       }
-
-      // 核实「平台收到的附件」就是本次要传的图片，而不是只看编辑器里有没有 @图 标记
-      const uploadNames = (plan.uploads || []).map((filePath) =>
-        String(filePath).split(/[\\/]/).pop()
-      );
-      const refsStep = await evaluate(
-        contents,
-        STEP_VERIFY_REFS.replace("__NAMES__", JSON.stringify(uploadNames))
-      );
-      record("verifyRefs", refsStep);
       if (!refsStep?.ok) {
-        // 引用没建立起来就提交，等于白白消耗额度：这里阻断并说明能力差异
+        // 引用没对上就提交，等于白白消耗额度：这里阻断并说明能力差异
         return fail(
-          `参考图引用未核实通过：${refsStep?.reason || "附件与本次图片不一致"}（已上传 ${uploadStep.count || 0} 张，平台附件 ${
+          `参考图未核实通过：${refsStep?.reason || "附件与本次图片不一致"}（已上传 ${uploadStep?.count || 0} 张，平台附件 ${
             refsStep?.attachmentCards ?? 0
-          } 张，名称命中 ${refsStep?.matched ?? 0} 张，编辑器内联节点 ${refsStep?.atomicCount ?? 0} 个）`
+          } 张，顺序一致：${refsStep?.orderMatched ? "是" : "否"}）`
         );
       }
 
@@ -1027,11 +1152,17 @@ function createDolaDriver(options = {}) {
       });
       record("sendReaction", reaction);
       if (!reaction?.started) {
-        return fail(
-          `已点击发送按钮，但 ${12} 秒内页面没有任何反应（编辑器内容未被消费、没有新消息、地址未变化），说明这次点击没有真正提交${
-            reaction?.hints?.length ? `；页面提示：${reaction.hints.join("、")}` : ""
-          }`
-        );
+        // 点击没有任何反应 = 本次请求没发出去，属于可重试的临时状态（但绝不在这里自动重发）
+        return {
+          ...fail(
+            `已点击发送按钮，但 12 秒内页面没有任何反应（编辑器内容未被消费、没有新消息、地址未变化），说明这次点击没有真正提交${
+              reaction?.hints?.length ? `；页面提示：${reaction.hints.join("、")}` : ""
+            }`
+          ),
+          accepted: false,
+          retryable: true,
+          evidence: { kind: "no-reaction" },
+        };
       }
 
       if (typeof onStep === "function") {
@@ -1044,28 +1175,79 @@ function createDolaDriver(options = {}) {
         } catch {}
       }
       const watched = await watcher;
+      const durationEvidence = {
+        required: plan.params?.duration || "",
+        // 实际提交的时长以请求体回读为准（增强器改写的正是这里）
+        submitted: watched.submittedDuration || "",
+        mode: plan.params?.durationMode || "native",
+      };
       if (watched.taskId) {
         return {
           outcome: "ok",
           platformTaskId: watched.taskId,
           state: "queued",
+          accepted: true,
+          acceptanceEvidence: { kind: "task-id", taskId: watched.taskId },
+          durationEvidence,
           message: "已点击发送，并从平台响应中取得任务 ID",
           steps,
         };
       }
-      // 关键：没有确认到任务 ID 就绝不当作已提交，交由编排层标记「提交结果待确认」。
-      // 但先看平台是不是已经在会话里明确说明「没有开始生成」——那就不是待确认，而是明确的失败。
-      const replies = await evaluate(contents, STEP_READ_REPLIES).catch(() => null);
-      const verdict = replies?.ok ? classifyPlatformReply((replies.replies || []).join(" \n ")) : null;
+
+      // 没有任务 ID：先看平台是不是明确说了「没有开始生成」，再看是不是已受理（费用预告/生成中）
+      const replies = await evaluate(
+        contents,
+        STEP_READ_REPLIES.replace("__BEFORE__", JSON.stringify({ count: sendStep?.beforeMessages || 0, url: sendStep?.beforeUrl || "" }))
+      ).catch(() => null);
+      const replyText = (replies?.newReplies || []).join(" \n ");
+      const verdict = replies?.ok ? classifyPlatformReply(replyText) : null;
       if (verdict) {
-        record("platformReply", { ok: false, reason: verdict.label, excerpt: verdict.excerpt, count: replies.count });
-        return { outcome: "failed", errorCode: verdict.code, message: `${verdict.label}；平台原文：${verdict.excerpt}`, steps };
+        record("platformReply", { ok: false, reason: verdict.label, excerpt: verdict.excerpt, count: replies?.count });
+        // 平台明确拒绝：不可自动重试，也不换素材/换模型，交给人处理
+        return {
+          outcome: "failed",
+          errorCode: verdict.code,
+          accepted: false,
+          retryable: false,
+          needsUser: true,
+          evidence: { kind: "platform-reject", code: verdict.code, excerpt: verdict.excerpt },
+          message: `${verdict.label}；平台原文：${verdict.excerpt}`,
+          steps,
+        };
       }
-      if (replies?.ok) record("platformReply", { ok: true, count: replies.count, reason: `未发现平台拒绝类回复（会话消息 ${replies.count} 条）` });
+
+      const acceptance = replies?.ok ? classifyAcceptance(replyText) : null;
+      if (acceptance) {
+        record("platformReply", { ok: true, reason: acceptance.note, excerpt: acceptance.excerpt, count: replies?.count });
+        // 已受理但没拿到任务 ID：停止重复提交，转入监控（不宣告成功）
+        return {
+          outcome: "accepted",
+          accepted: true,
+          acceptanceEvidence: { kind: "platform-message", codes: acceptance.codes, strength: acceptance.strength, excerpt: acceptance.excerpt },
+          durationEvidence,
+          state: "queued",
+          message: `${acceptance.note}；平台原文：${acceptance.excerpt}`,
+          steps,
+        };
+      }
+      if (replies?.ok) {
+        record("platformReply", {
+          ok: true,
+          count: replies?.count,
+          reason: `平台上没有出现受理/拒绝类回复（本次提交后新增消息 ${(replies.newReplies || []).length} 条）`,
+        });
+      }
 
       const observed = (watched.requests || []).map((item) => `${item.method} ${item.path}${item.status ? `→${item.status}` : ""}`);
+      const rateLimited = (watched.requests || []).find((item) => Number(item.status) === 429 || Number(item.status) >= 500);
       return {
         outcome: "unknown",
+        accepted: false,
+        // 明确「没有受理证据」时才允许自动重试；这里先把裁决权交给编排层（见 runner 的重试策略）
+        retryable: Boolean(rateLimited),
+        retryAfterMs: rateLimited?.retryAfterMs || 0,
+        evidence: { kind: "no-acceptance-evidence", requests: watched.requests || [] },
+        durationEvidence,
         message: `${watched.error || "已点击发送，但未在超时时间内确认平台任务 ID"}，未重复提交；发送按钮命中：${
           sendStep?.clicked || "未知"
         }${observed.length ? `；观察到的网络请求：${observed.join(" | ")}` : "；超时窗口内没有观察到任何生成类网络请求"}`,
@@ -1116,6 +1298,7 @@ function createDolaDriver(options = {}) {
 module.exports = {
   DOLA_HOST_RE,
   PARTITION_PREFIX,
+  collectAbilityDuration,
   collectIds,
   createDolaDriver,
   findAccountWebview,

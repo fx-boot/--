@@ -30,6 +30,28 @@ const VIDEO_CAPABILITIES = Object.freeze({
       name: "Dola",
       models: Object.freeze(["seedance2.5", "seedance2.0fast", "seedance1.0"]),
       durations: Object.freeze(["5", "10"]),
+      /**
+       * 时长增强（复用应用自身已有的 dola-duration-enhancer）：
+       *   实测 2026-09-23：增强器由 webview-preload 注入页面主世界，且已确认
+       *   `__DBM_DOLA_30_SECOND_ENHANCER__=true`、fetch/XHR 均被 patch。
+       *   生效条件（来自实现本身，不是猜）：
+       *     1) 当前模型必须是 Seedance 2.5（读工具栏 video-model 文案判断）
+       *     2) localStorage dbm_dola_enable_30s_v1 === "1"
+       *     3) 秒数取 dbm_dola_duration_seconds_v2，合法区间 16—30，超出则回落到 30
+       *   生效方式：改写请求体里 ability_type===17 的 ability_param.duration
+       *   —— 也就是「实际提交时长」由请求体决定，而不是平台控件文案。
+       *   工具栏文案改写与 16—30 网格依赖页面可见（元素尺寸为 0 时增强器会跳过），
+       *   因此界面不得以工具栏文案作为「实际时长」的证据。
+       */
+      enhancedDuration: Object.freeze({
+        from: 16,
+        to: 30,
+        requiresModel: "seedance2.5",
+        enableKey: "dbm_dola_enable_30s_v1",
+        secondsKey: "dbm_dola_duration_seconds_v2",
+        mechanism: "request-patch",
+        measuredAt: "2026-09-23",
+      }),
       ratios: Object.freeze(["1:1", "3:4", "4:3", "9:16", "16:9", "21:9"]),
       watermark: "official-no-watermark",
       executionEngine: "manager-chromium-webview",

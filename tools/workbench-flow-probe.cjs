@@ -255,7 +255,10 @@ function makeFixture(file) {
   check("预览带上了真实上传文件路径", previewPlan.uploads.length === 1 && fs.existsSync(previewPlan.uploads[0]), previewPlan.uploads);
   check("参考图数量上限仍被标注为平台未声明", previewPlan.warnings.some((w) => w.includes("参考图数量上限")), previewPlan.warnings);
   check("比例已实测核实（预览里带上了比例值）", Boolean(previewPlan.params.ratio), previewPlan.params);
-  check("提示词预览里引用位置以原子占位符呈现", String(previewPlan.promptPreview).includes("\uFFFC"), previewPlan.promptPreview);
+  // 实测：平台编辑器不支持内联图片节点，提交文本里不再有占位符，改成「参考图N」
+  check("提交文本用「参考图N」而不是占位符", String(previewPlan.promptPreview).includes("参考图1"), previewPlan.promptPreview);
+  check("提交文本不再包含 U+FFFC", !String(previewPlan.promptPreview).includes("\uFFFC"), previewPlan.promptPreview.slice(0, 80));
+  check("预览带出引用与附件顺序", (previewPlan.references || []).length === 1 && previewPlan.references[0].label === "参考图1", previewPlan.references);
 
   // ── 6. 任务入队（占位账号，不执行、不消耗额度） ──
   const enqueued = await js(
@@ -345,10 +348,10 @@ function makeFixture(file) {
   report.steps.renderer.storyboardCards = await js(`document.querySelectorAll('.workbench-sb').length`);
   report.steps.renderer.assetCards = await js(`document.querySelectorAll('.workbench-asset').length`);
   report.steps.renderer.defaultsRendered = await js(
-    `document.querySelectorAll('#workbenchDefaults select').length`
+    `document.querySelectorAll('#workbenchParamsRow select').length`
   );
   report.steps.renderer.modelOptions = await js(
-    `[...document.querySelectorAll('#workbenchDefaults select')][0] ? [...[...document.querySelectorAll('#workbenchDefaults select')][0].options].map(o=>o.textContent) : []`
+    `[...document.querySelectorAll('#workbenchParamsRow select')][0] ? [...[...document.querySelectorAll('#workbenchParamsRow select')][0].options].map(o=>o.textContent) : []`
   );
   report.steps.renderer.durationOptions = await js(
     `[...document.querySelectorAll('#workbenchDefaults select')][1] ? [...[...document.querySelectorAll('#workbenchDefaults select')][1].options].map(o=>o.textContent) : []`
@@ -365,34 +368,45 @@ function makeFixture(file) {
   check("渲染层未产生控制台错误", report.consoleErrors.length === 0, report.consoleErrors.slice(0, 3));
   check("渲染层未出现 preload / 加载失败", report.pageErrors.length === 0, report.pageErrors.slice(0, 3));
 
-  // ── 10. 比例可选 / 提示词框加大（用户反馈项） ──
+  // ── 10. 单条创作区：一个编辑框 + 参数一套 + 主按钮（用户反馈项） ──
   report.steps.fixes = {};
-  const defaultsInfo = await js(`(() => {
-    const selects = [...document.querySelectorAll('#workbenchDefaults select')];
-    if (selects.length < 3) return { count: selects.length };
-    const ratio = selects[2];
+  const composeInfo = await js(`(() => {
+    const prompt = document.getElementById('workbenchMainPrompt');
+    const params = [...document.querySelectorAll('#workbenchParamsRow select')];
+    const duration = document.getElementById('workbenchParamDuration');
     return {
-      count: selects.length,
-      ratioDisabled: ratio.disabled,
-      ratioOptions: [...ratio.options].map((o) => o.value),
-      ratioValue: ratio.value,
-      notes: [...document.querySelectorAll('#workbenchDefaults .workbench-unknown')].map((n) => n.textContent),
+      promptCount: document.querySelectorAll('#workbenchCreate textarea').length,
+      promptMinHeight: prompt ? getComputedStyle(prompt).minHeight : null,
+      paramCount: params.length,
+      durationOptions: duration ? [...duration.options].map((o) => o.value) : [],
+      durationGroups: duration ? [...duration.querySelectorAll('optgroup')].map((g) => g.label) : [],
+      durationNote: [...document.querySelectorAll('#workbenchParamsRow .workbench-unknown')].map((n) => n.textContent),
+      sourceNote: document.querySelector('#workbenchParamsRow .workbench-param-source')?.textContent || '',
+      refsText: document.getElementById('workbenchRefsRow')?.textContent || '',
+      summary: document.getElementById('workbenchRunSummary')?.textContent || '',
+      buttonHeight: getComputedStyle(document.getElementById('workbenchGenerate')).height,
+      buttonDisabled: document.getElementById('workbenchGenerate').disabled,
     };
   })()`);
-  report.steps.fixes.defaults = defaultsInfo;
-  check("全局默认参数含比例下拉", defaultsInfo.count >= 3, defaultsInfo);
-  check("比例下拉可选（不再被禁用）", defaultsInfo.ratioDisabled === false, defaultsInfo);
-  check("比例下拉候选来自平台实测能力表", (defaultsInfo.ratioOptions || []).length === 6, defaultsInfo.ratioOptions);
+  report.steps.fixes.compose = composeInfo;
+  check("主操作区只有一个提示词编辑框", composeInfo.promptCount === 1, composeInfo.promptCount);
+  check("编辑框够大（最小高度 >= 180px）", parseFloat(composeInfo.promptMinHeight) >= 180, composeInfo.promptMinHeight);
+  check("主界面参数只有一套（模型/时长/比例）", composeInfo.paramCount === 3, composeInfo.paramCount);
+  check("时长下拉含平台原生 5/10 秒", ["5", "10"].every((v) => composeInfo.durationOptions.includes(v)), composeInfo.durationOptions);
   check(
-    "比例候选是实测的那 6 档",
-    ["1:1", "3:4", "4:3", "9:16", "16:9", "21:9"].every((v) => (defaultsInfo.ratioOptions || []).includes(v)),
-    defaultsInfo.ratioOptions
+    "时长下拉含增强档位（16—30，来自能力表）",
+    composeInfo.durationOptions.includes("16") && composeInfo.durationOptions.includes("30"),
+    composeInfo.durationOptions
   );
+  check("增强档位标注了适用模型", (composeInfo.durationGroups || []).some((t) => t.includes("Seedance 2.5")), composeInfo.durationGroups);
+  check("参数区说明了当前生效值来源（消除覆盖歧义）", /继承自全局|单条设置/.test(composeInfo.sourceNote), composeInfo.sourceNote);
   check(
-    "比例旁标明来源是实测且会回读核实",
-    (defaultsInfo.notes || []).some((t) => String(t).includes("实测")),
-    defaultsInfo.notes
+    "引用摘要区已渲染（有引用显示参考图N，无引用给出明确提示）",
+    /参考图|还没有参考图/.test(composeInfo.refsText),
+    composeInfo.refsText
   );
+  check("操作栏显示模型/时长/比例/账号数", /模型/.test(composeInfo.summary) && /账号/.test(composeInfo.summary), composeInfo.summary);
+  check("生成按钮是主按钮（高度 >= 44px）", parseFloat(composeInfo.buttonHeight) >= 44, composeInfo.buttonHeight);
 
   const promptBox = await js(`(() => {
     const ta = document.querySelector('.workbench-sb-prompt');
@@ -401,7 +415,7 @@ function makeFixture(file) {
     return { minHeight: style.minHeight, fontSize: style.fontSize };
   })()`);
   report.steps.fixes.promptBox = promptBox;
-  check("提示词输入框已放大（最小高度 >= 200px）", promptBox && parseFloat(promptBox.minHeight) >= 200, promptBox);
+  check("列表里的分镜编辑框仍可用（未删除既有能力）", promptBox === null || parseFloat(promptBox.minHeight) >= 100, promptBox);
 
   // ── 11. 执行账号改为多选 ──
   const accountPicks = await js(`(() => {
@@ -564,6 +578,123 @@ function makeFixture(file) {
   check("任务卡片展示提交步骤", stepView.count >= 1, stepView);
   check("失败步骤被单独标出并写明步骤名", stepView.bad >= 1 && stepView.text.includes("点击发送"), stepView.text);
   check("失败步骤带上页面候选控件清单", stepView.candidates.includes("label:发送"), stepView.candidates);
+
+  // ── 16. 单编辑框交互：@ 插入、切换保存、主按钮状态与防重复（不消耗额度） ──
+  console.log("── 单编辑框交互与主按钮 ──");
+  await js(`document.getElementById('showWorkbench').click()`);
+  await delay(600);
+  const composeTyped = await js(`(() => {
+    const ta = document.getElementById('workbenchMainPrompt');
+    if (!ta) return { ok: false };
+    ta.focus();
+    ta.value = "前段 @后段";
+    const caret = ta.value.indexOf("@") + 1;
+    ta.setSelectionRange(caret, caret);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return { ok: true, value: ta.value, caret: ta.selectionStart };
+  })()`);
+  await delay(200);
+  check("创作区输入 @ 会弹出素材选择器", (await js(`!document.getElementById('workbenchMentionModal').classList.contains('hidden')`)) === true, composeTyped);
+  const pickedInCompose = await js(`(() => {
+    const row = document.querySelector('#workbenchMentionList .workbench-mention-row');
+    if (!row) return false;
+    row.click();
+    return true;
+  })()`);
+  check("创作区的素材选择器可点选", pickedInCompose === true);
+  await delay(1200);
+  const composeAfterBind = await js(`(() => {
+    const ta = document.getElementById('workbenchMainPrompt');
+    return {
+      value: ta ? ta.value : '',
+      chips: document.querySelectorAll('#workbenchRefsRow .workbench-ref-chip').length,
+      chipText: document.getElementById('workbenchRefsRow')?.textContent || '',
+    };
+  })()`);
+  report.steps.fixes.composeAfterBind = composeAfterBind;
+  check("创作区 @ 插入后带 @图N 标记（提交时转成参考图N）", /@图\d/.test(composeAfterBind.value), composeAfterBind.value);
+  check("创作区插入位置正确（@ 之后文字仍在末尾）", String(composeAfterBind.value).endsWith("后段"), composeAfterBind.value);
+  check("引用摘要出现芯片", composeAfterBind.chips >= 1, composeAfterBind.chipText);
+
+  // 切换到历史分镜：内容应被载入同一个编辑框，且切换前会保存
+  const switchResult = await js(`(async () => {
+    const cards = [...document.querySelectorAll('.workbench-sb')];
+    if (cards.length < 2) return { skipped: true };
+    const before = document.getElementById('workbenchMainPrompt').value;
+    const loadBtn = cards[1].querySelector('[data-act="load"]');
+    loadBtn.click();
+    await new Promise((r) => setTimeout(r, 1500));
+    return { skipped: false, before, after: document.getElementById('workbenchMainPrompt').value };
+  })()`);
+  report.steps.fixes.switchStoryboard = switchResult;
+  check("切换历史分镜后内容载入同一个编辑框", switchResult.skipped || typeof switchResult.after === "string", switchResult);
+
+  // 主按钮：无账号时禁用并说明原因
+  await js(`(() => { document.querySelector('#workbenchAccountNote [data-act="accounts-none"]')?.click(); })()`);
+  await delay(300);
+  const disabledState = await js(`(() => {
+    const btn = document.getElementById('workbenchGenerate');
+    return { disabled: btn.disabled, title: btn.title, status: document.getElementById('workbenchMainStatus').textContent };
+  })()`);
+  report.steps.fixes.generateDisabled = disabledState;
+  check("未选账号时主按钮禁用", disabledState.disabled === true, disabledState);
+  check("禁用时说明原因", /未选择执行账号/.test(`${disabledState.title}${disabledState.status}`), disabledState);
+
+  // 选回一个账号，点一次主按钮：立刻进入「正在检查/提交」且按钮禁用（防重复）
+  await js(`(() => {
+    const box = document.querySelector('#workbenchAccountPicks input[type="checkbox"]');
+    if (box && !box.checked) { box.checked = true; box.dispatchEvent(new Event('change', { bubbles: true })); }
+  })()`);
+  await delay(400);
+  await js(`document.getElementById('workbenchGenerate').click()`);
+  await delay(120);
+  const busyState = await js(`(() => {
+    const btn = document.getElementById('workbenchGenerate');
+    return { disabled: btn.disabled, text: btn.textContent, status: document.getElementById('workbenchMainStatus').textContent };
+  })()`);
+  report.steps.fixes.generateBusy = busyState;
+  check("点击后立即进入进行态（按钮禁用 + 文案变化）", busyState.disabled === true && /正在/.test(busyState.text), busyState);
+  check("点击后立即有状态提示", /正在/.test(busyState.status), busyState.status);
+  // 进行中再点一次不应产生第二条尝试
+  await js(`document.getElementById('workbenchGenerate').click()`);
+  // 占位账号没有对应 webview：驱动会先等页面就绪（上限 25 秒）再失败，这里等它彻底结束
+  await delay(32000);
+  const afterRun = await js(`(() => ({
+    status: document.getElementById('workbenchMainStatus').textContent,
+    disabled: document.getElementById('workbenchGenerate').disabled,
+    text: document.getElementById('workbenchGenerate').textContent,
+  }))()`);
+  report.steps.fixes.generateAfter = afterRun;
+  const placeholderTasks = (await js(`window.managerWorkbenchAPI.task.list(${JSON.stringify(projectId)})`)).filter(
+    (t) => t.accountId === "probe-acct-001"
+  );
+  report.steps.fixes.placeholderAttempts = placeholderTasks.length;
+  check("进行中重复点击不会产生多条尝试", placeholderTasks.length <= 1, placeholderTasks.length);
+  check("提交失败时主按钮恢复可用", afterRun.disabled === false, afterRun);
+  check("提交结果在按钮下方可见（不谎报成功）", afterRun.status.length > 0, afterRun.status);
+
+  // 更新：折叠素材库与详情入口
+  const uiBits = await js(`(() => {
+    const toggle = document.getElementById('workbenchAssetsToggle');
+    toggle.click();
+    const collapsed = document.getElementById('workbenchAssetPane').classList.contains('is-collapsed');
+    toggle.click();
+    const expanded = !document.getElementById('workbenchAssetPane').classList.contains('is-collapsed');
+    return {
+      collapsed, expanded,
+      storageText: document.getElementById('workbenchStorage').textContent,
+      storageTitle: document.getElementById('workbenchStorage').title,
+      hasDiagnostics: Boolean(document.getElementById('workbenchStorage')),
+      minWidthOk: document.documentElement.scrollWidth <= window.innerWidth + 1,
+    };
+  })()`);
+  report.steps.fixes.ui = uiBits;
+  check("素材库可折叠/展开", uiBits.collapsed === true && uiBits.expanded === true, uiBits);
+  const storageText = String(uiBits.storageText || "");
+  const storageTitle = String(uiBits.storageTitle || "");
+  check("主界面不再直接显示本地路径", !storageText.includes("C:\\") && !storageText.includes("/Users/"), storageText);
+  check("本地路径放进 title（详情可见）", storageTitle.includes("C:\\") || storageTitle.includes("/Users/"), storageTitle);
+  check("常用窗口尺寸下无横向溢出", uiBits.minWidthOk === true, uiBits);
 
   await delay(800);
   check("隔离内未出现越界写入（报告目录仍在隔离根内）", reportPath.startsWith(exeDir));

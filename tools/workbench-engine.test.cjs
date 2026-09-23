@@ -214,7 +214,8 @@ async function main() {
   );
   check(
     "不支持的时长被拒绝",
-    platform.validateParams({ params: { ...okParams, duration: "7" }, capabilities: CAPS }).errors.join().includes("不在平台能力表")
+    platform.validateParams({ params: { ...okParams, duration: "7" }, capabilities: CAPS }).errors.join().includes("不在平台"),
+    platform.validateParams({ params: { ...okParams, duration: "7" }, capabilities: CAPS }).errors
   );
   check(
     "空提示词被拒绝",
@@ -266,7 +267,14 @@ const refWarn = platform.validateParams({
   ]);
   eq("文本段保留原文", segments[0].value, "开场 ");
   eq("图片段带本地文件路径", segments[1].filePath, "B.png");
-  eq("原子占位符使用 \\uFFFC", platform.segmentsToPlainText(segments).includes("\uFFFC"), true);
+  // 实测：平台编辑器不支持内联图片节点，写入 U+FFFC 只会变成方框（用户截图里的 OBJ）
+  const platformText = platform.toPlatformText(segments);
+  eq("提交文本把 @图N 写成参考图N", platformText, "开场 参考图2 之后 参考图1 结束");
+  check("提交文本不再包含 U+FFFC 占位符", !platformText.includes("\uFFFC"), platformText);
+  const ordered = platform.orderReferences(segments);
+  eq("附件按 @图N 编号升序排列（参考图N = 第 N 个附件）", ordered.map((item) => item.label), ["参考图1", "参考图2"]);
+  eq("参考图1 对应的是 @图1 绑定的素材", ordered[0].assetId, "asset_a");
+  eq("每个引用带上传顺序", ordered.map((item) => item.order), [1, 2]);
   eq("无 token 时只有一段文本", platform.buildSegments("纯文本", [], assetsById).length, 1);
 
   const plan = platform.buildPlan({
@@ -823,13 +831,38 @@ const refWarn = platform.validateParams({
   eq("时长只有实测的 5s / 10s", platform.durationOptionsFor(VIDEO_CAPABILITIES, "dola"), ["5", "10"]);
   check("30 秒不在默认能力表中（需应用自带增强才可能出现）", !platform.durationOptionsFor(VIDEO_CAPABILITIES, "dola").includes("30"));
   eq("模型菜单文案取自实测", platform.menuLabelForModel("seedance2.0fast"), "Seedance 2.0 Fast");
-  const thirty = platform.validateParams({
+  // 16—30 秒走应用自带的时长增强：只有 Seedance 2.5 可用，且绝不静默降级
+  const thirtyOn25 = platform.validateParams({
     target: "dola",
     params: { model: "seedance2.5", duration: "30", prompt: "x", ratio: "9:16" },
     refs: [],
     capabilities: VIDEO_CAPABILITIES,
   });
-  check("时长 30 会被拒绝提交（不再静默用平台默认值生成）", thirty.ok === false && thirty.errors.join().includes("时长 30"), thirty);
+  check("Seedance 2.5 上 30 秒（增强）通过校验", thirtyOn25.ok, thirtyOn25.errors);
+  const thirtyOn10 = platform.validateParams({
+    target: "dola",
+    params: { model: "seedance1.0", duration: "30", prompt: "x", ratio: "9:16" },
+    refs: [],
+    capabilities: VIDEO_CAPABILITIES,
+  });
+  check(
+    "非 2.5 模型上 30 秒被拒绝且说明原因（不降级到 10 秒）",
+    thirtyOn10.ok === false && /时长增强|不会自动降级/.test(thirtyOn10.errors.join()),
+    thirtyOn10.errors
+  );
+  const enhancedPlan = platform.buildPlan({
+    attempt: task.createAttempt({
+      projectId,
+      storyboardId: "sb_enh",
+      accountId: "acc_1",
+      params: { model: "seedance2.5", duration: "24", prompt: "推门" },
+      refs: [],
+    }),
+    capabilities: VIDEO_CAPABILITIES,
+  });
+  eq("增强时长在计划里被标为 enhanced", enhancedPlan.params.durationMode, "enhanced");
+  eq("计划带上增强所需模型", enhancedPlan.params.durationEnhancement?.requiresModel, "seedance2.5");
+  check("计划说明实际时长以请求体回读为准", enhancedPlan.limitations.join().includes("请求体"), enhancedPlan.limitations);
 
   // 12.4 粘贴导入：剪贴板图片走 base64 落盘，并沿用内容哈希去重
   const pasteRoot = path.join(root, "pasteproj");
@@ -977,7 +1010,14 @@ const refWarn = platform.validateParams({
   // 「出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频」。
   // 旧实现只盯任务 ID，于是把这种明确拒绝误报成「提交结果待确认」。
   check("会读取平台在会话里的回复", /STEP_READ_REPLIES/.test(driverSrc) && /classifyPlatformReply/.test(driverSrc));
-  check("平台明确拒绝时判为失败而不是待确认", /outcome: "failed", errorCode: verdict\.code/.test(driverSrc));
+  check(
+    "平台明确拒绝时判为失败、不可重试、需要人工处理",
+    /outcome: "failed"/.test(driverSrc) &&
+      /retryable: false/.test(driverSrc) &&
+      /needsUser: true/.test(driverSrc) &&
+      driverSrc.indexOf("needsUser: true") > driverSrc.indexOf("classifyPlatformReply")
+  );
+  check("平台回复只取本次提交之后的新消息（旧提示不算本次）", /before\.count|beforeMessages/.test(driverSrc) && /urlChanged/.test(driverSrc));
   const faceReject = platform.classifyPlatformReply(
     "出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频。你可以尝试换其它参考图或文生视频。"
   );
@@ -1058,6 +1098,190 @@ const refWarn = platform.validateParams({
     ["waitReady", "enterVideoMode", "verifyRefs"].every((key) => labelSrc.includes(`${key}:`)),
     ["waitReady", "enterVideoMode", "verifyRefs"].filter((key) => !labelSrc.includes(`${key}:`))
   );
+
+  // ══ 14. 自动重试与提交锁（第八项验收重点） ══
+  const RETRY_PARAMS = { model: "seedance2.5", duration: "10", ratio: "9:16", prompt: "推门" };
+  console.log("── 自动重试与提交锁 ──");
+  const retryStore = task.createTaskStore((id) => path.join(root, "retry-" + id));
+  const retrySched = createFakeScheduler();
+  const mkRunner = (driver, extra = {}) =>
+    createRunner({
+      taskStore: retryStore,
+      driver,
+      capabilities: CAPS,
+      schedule: retrySched.schedule,
+      cancelSchedule: retrySched.cancel,
+      resolveAssets: async () => new Map(),
+      listProjectIds: async () => ["prj_retry"],
+      autoRetryBaseMs: 10,
+      ...extra,
+    });
+
+  // 14.1 已取得任务 ID → 绝不重提
+  let okCalls = 0;
+  const okRunner = mkRunner({
+    async submit() {
+      okCalls++;
+      return { outcome: "ok", platformTaskId: "pt_ok", accepted: true, state: "queued", message: "已取得任务 ID" };
+    },
+    async poll() {
+      return { state: "generating" };
+    },
+  });
+  const okAttempt = await okRunner.enqueue({ projectId: "prj_retry", storyboardId: "sb_ok", accountId: "acc_1", params: { model: "seedance2.5", duration: "10", ratio: "9:16", prompt: "推门" }, refs: [] });
+  await okRunner.execute("prj_retry", okAttempt.id);
+  await retrySched.flush();
+  eq("有任务 ID 时只提交一次", okCalls, 1);
+  check("有任务 ID 时进入监控（排队/生成中）", ["queued", "generating"].includes((await retryStore.list("prj_retry")).find((t) => t.id === okAttempt.id).status));
+
+  // 14.2 平台已受理（无任务 ID）→ 停止重复提交，转入监控
+  let acceptedCalls = 0;
+  const acceptedRunner = mkRunner({
+    async submit() {
+      acceptedCalls++;
+      return {
+        outcome: "accepted",
+        accepted: true,
+        acceptanceEvidence: { kind: "platform-message", codes: ["PLAN_USE", "COST_FORECAST"], strength: "accepted" },
+        state: "queued",
+        message: "平台已受理，等待任务 ID",
+      };
+    },
+    async poll() {
+      return { state: "unknown" };
+    },
+  });
+  const acceptedAttempt = await acceptedRunner.enqueue({
+    projectId: "prj_retry",
+    storyboardId: "sb_accepted",
+    accountId: "acc_1",
+    params: RETRY_PARAMS,
+    refs: [],
+  });
+  await acceptedRunner.execute("prj_retry", acceptedAttempt.id);
+  await retrySched.flush();
+  eq("平台受理后不再重复提交", acceptedCalls, 1);
+  const acceptedNow = (await retryStore.list("prj_retry")).find((t) => t.id === acceptedAttempt.id);
+  eq("受理状态进入排队", acceptedNow.status, "queued");
+  check("受理证据被落库", acceptedNow.acceptanceEvidence?.kind === "platform-message", acceptedNow.acceptanceEvidence);
+
+  // 14.3 响应超时（没有受理证据）→ 标记待确认，不自动重提
+  let timeoutCalls = 0;
+  const timeoutRunner = mkRunner({
+    async submit() {
+      timeoutCalls++;
+      return { outcome: "unknown", message: "响应超时，未取得任务 ID" };
+    },
+    async verifySubmission() {
+      return { found: false, message: "未在平台找到该任务" };
+    },
+    async poll() {
+      return { state: "unknown" };
+    },
+  });
+  const timeoutAttempt = await timeoutRunner.enqueue({ projectId: "prj_retry", storyboardId: "sb_timeout", accountId: "acc_1", params: { model: "seedance2.5", duration: "10", ratio: "9:16", prompt: "推门" }, refs: [] });
+  await timeoutRunner.execute("prj_retry", timeoutAttempt.id);
+  await retrySched.flush();
+  eq("超时未确认时只提交一次（不盲目重提）", timeoutCalls, 1);
+  eq("标记为提交结果待确认", (await retryStore.list("prj_retry")).find((t) => t.id === timeoutAttempt.id).status, "unconfirmed");
+
+  // 14.4 明确临时失败且未创建任务 → 按上限自动重试（默认最多 2 次，总 3 次）
+  let transientCalls = 0;
+  const transientRunner = mkRunner({
+    async submit() {
+      transientCalls++;
+      return { outcome: "failed", retryable: true, accepted: false, message: "点击后页面没有反应", evidence: { kind: "no-reaction" } };
+    },
+    async poll() {
+      return { state: "unknown" };
+    },
+  });
+  const transientAttempt = await transientRunner.enqueue({
+    projectId: "prj_retry",
+    storyboardId: "sb_transient",
+    accountId: "acc_1",
+    params: RETRY_PARAMS,
+    refs: [],
+  });
+  await transientRunner.execute("prj_retry", transientAttempt.id);
+  const firstRetry = (await retryStore.list("prj_retry")).find((t) => t.id === transientAttempt.id);
+  eq("安排第 1 次自动重试", firstRetry.autoRetry?.count, 1);
+  check("重试信息里有原因与下次时间", Boolean(firstRetry.autoRetry?.reason) && Boolean(firstRetry.autoRetry?.nextAt), firstRetry.autoRetry);
+  check("重试等待期间锁住这条分镜", transientRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_transient"), transientRunner.status().locks);
+  await retrySched.flush();
+  await retrySched.flush();
+  await retrySched.flush();
+  eq("总计最多提交 3 次（1 次原始 + 2 次重试）", transientCalls, 3);
+  const chain = (await retryStore.list("prj_retry")).filter((t) => t.storyboardId === "sb_transient");
+  eq("每次重试都留下独立尝试记录", chain.length, 3);
+  check("重试记录指向原尝试", chain.some((t) => t.retryOf === transientAttempt.id), chain.map((t) => t.retryOf));
+  check("达到上限后标记为已停止", chain.some((t) => t.autoRetry?.stopped), chain.map((t) => t.autoRetry));
+
+  // 14.5 平台明确拒绝（人脸未认证等）→ 不重试、不换素材换模型、提示人工处理
+  let rejectCalls = 0;
+  const rejectRunner = mkRunner({
+    async submit() {
+      rejectCalls++;
+      return {
+        outcome: "failed",
+        errorCode: "FACE_UNVERIFIED",
+        retryable: false,
+        needsUser: true,
+        message: "平台拒绝：未认证人脸不支持该模型",
+      };
+    },
+    async poll() {
+      return { state: "unknown" };
+    },
+  });
+  const rejectAttempt = await rejectRunner.enqueue({
+    projectId: "prj_retry",
+    storyboardId: "sb_reject",
+    accountId: "acc_1",
+    params: RETRY_PARAMS,
+    refs: [],
+  });
+  await rejectRunner.execute("prj_retry", rejectAttempt.id);
+  await retrySched.flush();
+  eq("明确拒绝只提交一次", rejectCalls, 1);
+  const rejectNow = (await retryStore.list("prj_retry")).find((t) => t.id === rejectAttempt.id);
+  eq("明确拒绝标记为生成失败（非待确认）", rejectNow.status, "failed");
+  eq("明确拒绝不带自动重试", rejectNow.autoRetry?.count, undefined);
+  check("拒绝原因可读", /未认证人脸/.test(rejectNow.error?.message || ""), rejectNow.error);
+  check("释放提交锁（可人工处理后重试）", !rejectRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_reject"));
+
+  // 14.6 提交锁：等待自动重试期间，手动再点同一条分镜会被拒绝
+  let lockCalls = 0;
+  const lockRunner = mkRunner({
+    async submit() {
+      lockCalls++;
+      return { outcome: "failed", retryable: true, accepted: false, message: "临时失败" };
+    },
+    async poll() {
+      return { state: "unknown" };
+    },
+  });
+  const lockedFirst = await lockRunner.enqueue({ projectId: "prj_retry", storyboardId: "sb_lock", accountId: "acc_1", params: { model: "seedance2.5", duration: "10", ratio: "9:16", prompt: "推门" }, refs: [] });
+  await lockRunner.execute("prj_retry", lockedFirst.id);
+  const lockedSecond = await lockRunner.enqueue({ projectId: "prj_retry", storyboardId: "sb_lock", accountId: "acc_1", params: { model: "seedance2.5", duration: "10", ratio: "9:16", prompt: "推门" }, refs: [] });
+  let lockError = "";
+  try {
+    await lockRunner.execute("prj_retry", lockedSecond.id);
+  } catch (error) {
+    lockError = error.message;
+  }
+  check("重试等待期间手点会被拒绝并说明原因", /正在提交中/.test(lockError), lockError);
+  await lockRunner.stopAutoRetry("prj_retry", lockedFirst.id);
+  check("停止重试后释放锁", !lockRunner.status().locks.some((lock) => lock.key === "prj_retry:sb_lock"));
+  eq("停止重试后不再继续提交", lockCalls, 1);
+
+  // 14.7 受理信号识别：不硬编码整句，靠结构特征（使用+生成 / 消耗+额度）
+  const costHint = platform.classifyAcceptance("本次使用 Dreamina Seedance 2.5 生成，将消耗 2 个视频生成额度");
+  eq("费用预告类提示被识别为受理", costHint?.strength, "accepted");
+  check("受理判定说明不算生成成功", /不算生成成功|不作为生成成功依据/.test(costHint?.note || ""), costHint?.note);
+  eq("只出现“消耗额度”时算弱信号", platform.classifyAcceptance("本次将消耗 1 个额度")?.strength, "hint");
+  eq("普通回复不会被当成受理", platform.classifyAcceptance("有什么我可以帮你的吗"), null);
+  eq("生成中字样被识别为强受理信号", platform.classifyAcceptance("正在生成视频，请稍候")?.strength, "accepted");
 
   fs.rmSync(root, { recursive: true, force: true });
 

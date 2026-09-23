@@ -28,6 +28,11 @@
     // 执行账号可多选：一次为每个勾选账号各建一条尝试
     selectedAccountIds: [],
     run: { mode: "distribute", storyboardIds: [], accountIds: [], assignments: [], currentAttemptId: "" },
+    // 单条创作区：当前分镜、繁忙状态与状态文案
+    compose: { storyboardId: "", draft: "", busy: "", status: "", statusKind: "" },
+    assetsCollapsed: false,
+    // 用户是否手动改过账号勾选（手动清空后不再自动勾回第一个）
+    accountsTouched: false,
     search: "",
     saveTimers: new Map(),
     // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
@@ -144,9 +149,11 @@
     renderStorage();
     renderProjects();
     renderAssets();
-    renderDefaults();
-    renderStoryboards();
+    // 账号先渲染：首次进入会默认勾选第一个账号，主按钮的可用性依赖它
     renderAccounts();
+    renderParams();
+    renderCompose();
+    renderStoryboards();
     renderTasks();
     renderRunProgress();
     renderHint();
@@ -189,9 +196,9 @@
       node.textContent = "数据目录读取中…";
       return;
     }
-    node.textContent = storage.ok
-      ? `数据目录：${storage.root}（素材导入后会复制到项目目录，原文件移动不影响项目）`
-      : storage.message;
+    // 本地路径不在主界面展示：只留一句状态，完整路径放进 title（详情/诊断里可见）
+    node.textContent = storage.ok ? "数据目录：已就绪（隔离运行）" : storage.message;
+    node.title = storage.ok ? `数据目录：${storage.root}` : "";
     node.classList.toggle("workbench-error", !storage.ok);
   }
 
@@ -451,90 +458,168 @@
     openModal("workbenchImpactModal");
   }
 
-  // ── 默认参数（只展示平台真实能力） ────────────────────────
+  // ── 参数与单条创作区（主界面只显示一套当前生效设置） ────────
   function capabilityTarget() {
     return state.capabilities?.targets?.dola || state.capabilities?.targets?.doubao || null;
   }
 
-  function renderDefaults() {
-    const host = $("workbenchDefaults");
+  /** 当前正在创作的分镜：优先界面选中项，其次第一条 */
+  function currentStoryboard() {
+    const list = state.project?.storyboards || [];
+    if (!list.length) return null;
+    const wanted = state.compose.storyboardId || state.project?.ui?.selectedStoryboardId;
+    return list.find((item) => item.id === wanted) || list[0];
+  }
+
+  function effectiveOf(storyboard) {
+    const defaults = state.project?.defaults || {};
+    const overrides = storyboard?.overrides || {};
+    return {
+      model: overrides.model || defaults.model,
+      duration: overrides.duration || defaults.duration,
+      ratio: overrides.ratio || defaults.ratio,
+    };
+  }
+
+  /**
+   * 把某条历史分镜载入上面的编辑框。
+   * 切换前先把当前未落盘的输入保存掉，避免「切过去再切回来内容没了」。
+   */
+  async function loadStoryboardIntoCompose(storyboardId) {
+    const current = currentStoryboard();
+    if (current && current.id !== storyboardId) {
+      const pendingKey = `sb-prompt:${current.id}`;
+      const pending = state.pendingValues.get(pendingKey);
+      if (pending !== undefined && pending !== current.prompt) {
+        try {
+          await api.storyboard.update(projectId(), current.id, { prompt: pending });
+          state.pendingValues.delete(pendingKey);
+        } catch (error) {
+          toast(`切换前保存失败：${error.message}`, "error");
+          return;
+        }
+      }
+    }
+    state.compose.storyboardId = "";
+    state.compose.status = "";
+    setMainStatus("");
+    try {
+      await api.ui.set(projectId(), { selectedStoryboardId: storyboardId });
+    } catch {}
+    await refresh();
+  }
+
+  /**
+   * 主界面参数行：只渲染「当前生效」的一套值，改动即写到当前分镜的 overrides。
+   * 这样就不会出现「改了全局默认，旧的单条覆盖还在偷偷生效」的歧义。
+   */
+  function renderParams() {
+    const host = $("workbenchParamsRow");
     if (!host) return;
     host.innerHTML = "";
     if (!state.project) return;
-
+    const storyboard = currentStoryboard();
     const target = capabilityTarget();
-    const defaults = state.project.defaults;
+    const effective = effectiveOf(storyboard);
+    const overrides = storyboard?.overrides || {};
+    const view = state.capabilityView || {};
 
-    const label = document.createElement("span");
-    label.className = "workbench-defaults-label";
-    label.textContent = "全局默认参数";
-    host.appendChild(label);
+    const labelOfModel = new Map((view.modelLabels || []).map((m) => [m.value, m.label]));
 
     const model = document.createElement("select");
-    model.dataset.focusKey = "default:model";
-    const labelOfModel = new Map((state.capabilityView?.modelLabels || []).map((m) => [m.value, m.label]));
+    model.id = "workbenchParamModel";
+    model.dataset.focusKey = "param:model";
     for (const value of target?.models || []) {
       const option = document.createElement("option");
       option.value = value;
-      option.textContent = labelOfModel.get(value) ? `${value}（菜单：${labelOfModel.get(value)}）` : value;
+      option.textContent = labelOfModel.get(value) ? `${value}（${labelOfModel.get(value)}）` : value;
       model.appendChild(option);
     }
-    model.value = defaults.model;
-    if (model.value !== defaults.model) {
+    if (effective.model && !(target?.models || []).includes(effective.model)) {
       const option = document.createElement("option");
-      option.value = defaults.model;
-      option.textContent = `${defaults.model}（不在能力表中）`;
-      option.disabled = true;
+      option.value = effective.model;
+      option.textContent = `${effective.model}（不在能力表中）`;
       model.appendChild(option);
-      model.value = defaults.model;
     }
+    model.value = effective.model || "";
     host.appendChild(field("模型", model));
 
     const duration = document.createElement("select");
-    duration.dataset.focusKey = "default:duration";
-    for (const value of target?.durations || []) {
+    duration.id = "workbenchParamDuration";
+    duration.dataset.focusKey = "param:duration";
+    const nativeDurations = (target?.durations || []).map(String);
+    const enhanced = view.enhancedDuration || null;
+    for (const value of nativeDurations) {
       const option = document.createElement("option");
-      option.value = String(value);
-      option.textContent = value === "auto" ? "自动" : `${value} 秒`;
+      option.value = value;
+      option.textContent = `${value} 秒`;
       duration.appendChild(option);
     }
-    duration.value = String(defaults.duration);
+    if (enhanced) {
+      const group = document.createElement("optgroup");
+      group.label = `时长增强 ${enhanced.from}—${enhanced.to} 秒（仅 ${labelOfModel.get(enhanced.requiresModel) || enhanced.requiresModel}）`;
+      for (const value of enhanced.values) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = `${value} 秒（增强）`;
+        group.appendChild(option);
+      }
+      duration.appendChild(group);
+    }
+    if (effective.duration && ![...nativeDurations, ...((enhanced && enhanced.values) || [])].includes(String(effective.duration))) {
+      const option = document.createElement("option");
+      option.value = String(effective.duration);
+      option.textContent = `${effective.duration} 秒（不在已核实范围内）`;
+      duration.appendChild(option);
+    }
+    duration.value = String(effective.duration || "");
     host.appendChild(field("时长", duration));
 
-    // 比例：候选值来自平台实测的能力表，且提交前会回读核实
     const ratio = document.createElement("select");
-    ratio.dataset.focusKey = "default:ratio";
-    ratioOptions(defaults.ratio).forEach((value) => {
+    ratio.id = "workbenchParamRatio";
+    ratio.dataset.focusKey = "param:ratio";
+    ratioOptions(effective.ratio).forEach((value) => {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = value;
       ratio.appendChild(option);
     });
-    ratio.value = defaults.ratio;
+    ratio.value = effective.ratio || "";
     host.appendChild(field("比例", ratio));
-    const ratioNote = document.createElement("span");
-    ratioNote.className = "workbench-unknown";
-    ratioNote.textContent = state.capabilityView?.measuredAt
-      ? `比例来自 ${state.capabilityView.measuredAt} 实测；设置后回读不一致会阻断提交`
-      : "比例能力来源未知";
-    host.appendChild(ratioNote);
 
-    const refLimit = document.createElement("span");
-    refLimit.className = "workbench-unknown";
-    refLimit.textContent = "参考图数量上限：未知";
-    host.appendChild(refLimit);
+    // 生效来源标注：消除「全局改了但单条覆盖还在生效」的歧义
+    const source = document.createElement("span");
+    source.className = "workbench-param-source";
+    const overridden = ["model", "duration", "ratio"].filter((key) => overrides[key]);
+    source.textContent = overridden.length
+      ? `当前生效值来自本条分镜的单条设置（${overridden.length} 项）；改这里的值会直接写入本条分镜`
+      : "当前生效值继承自全局默认；改这里的值会写入本条分镜，不再影响全局";
+    host.appendChild(source);
+
+    // 增强时长的可用性说明（不静默降级）
+    const enhancedNote = document.createElement("span");
+    enhancedNote.className = "workbench-unknown";
+    if (enhanced) {
+      const usable = effective.model === enhanced.requiresModel;
+      enhancedNote.textContent = usable
+        ? `${enhanced.from}—${enhanced.to} 秒由应用自带增强器改写请求体，实际时长以请求体回读为准；结果视频长度平台不保证`
+        : `${enhanced.from}—${enhanced.to} 秒增强仅 ${labelOfModel.get(enhanced.requiresModel) || enhanced.requiresModel} 可用，当前模型不支持（不会自动降级）`;
+    } else {
+      enhancedNote.textContent = "时长增强能力未在能力表中声明，只显示已核实档位";
+    }
+    host.appendChild(enhancedNote);
 
     const onChange = async () => {
+      if (!storyboard) return;
       try {
-        await api.project.defaults(projectId(), {
-          model: model.value,
-          duration: duration.value,
-          ratio: ratio.value,
+        await api.storyboard.update(projectId(), storyboard.id, {
+          overrides: { model: model.value, duration: duration.value, ratio: ratio.value },
         });
         state.lastSaved = formatTime(new Date());
         await refresh();
+        setMainStatus("参数已保存到本条分镜", "ok");
       } catch (error) {
-        toast(`保存默认参数失败：${error.message}`, "error");
+        toast(`保存参数失败：${error.message}`, "error");
       }
     };
     model.addEventListener("change", onChange);
@@ -542,7 +627,7 @@
     ratio.addEventListener("change", onChange);
   }
 
-  /** 比例候选：主进程给的常见值 + 当前值（保证历史项目里已有的值也能选中） */
+  /** 比例候选：主进程给的已核实值 + 当前值（保证历史项目里已有的值也能选中） */
   function ratioOptions(current) {
     const list = (state.ratioOptions || []).slice();
     if (current && !list.includes(current)) list.unshift(current);
@@ -558,6 +643,100 @@
     wrap.appendChild(span);
     wrap.appendChild(control);
     return wrap;
+  }
+
+  function setMainStatus(text, kind = "") {
+    state.compose.status = text || "";
+    state.compose.statusKind = kind;
+    const host = $("workbenchMainStatus");
+    if (host) {
+      host.textContent = state.compose.status;
+      host.className = `workbench-main-status${kind ? ` workbench-main-status-${kind}` : ""}`;
+    }
+  }
+
+  /** 单条创作区：一个编辑框 + 引用摘要 + 主操作栏 */
+  function renderCompose() {
+    const prompt = $("workbenchMainPrompt");
+    const refsHost = $("workbenchRefsRow");
+    const summary = $("workbenchRunSummary");
+    const button = $("workbenchGenerate");
+    if (!prompt || !summary || !button) return;
+    if (!state.project) return;
+    const storyboard = currentStoryboard();
+
+    // 正在编辑但尚未落盘的值优先，避免自动保存期间被覆盖
+    const pending = storyboard ? state.pendingValues.get(`sb-prompt:${storyboard.id}`) : undefined;
+    const value = pending === undefined ? String(storyboard?.prompt || "") : pending;
+    if (document.activeElement !== prompt && prompt.value !== value) prompt.value = value;
+    prompt.dataset.sbId = storyboard?.id || "";
+
+    if (refsHost) {
+      refsHost.innerHTML = "";
+      const refs = storyboard?.refs || [];
+      if (!refs.length) {
+        const none = document.createElement("span");
+        none.className = "workbench-refs-empty";
+        none.textContent = "还没有参考图：在素材上点「插入」，或在提示词里输入 @";
+        refsHost.appendChild(none);
+      }
+      refs.forEach((ref) => {
+        const asset = (state.assets || []).find((item) => item.id === ref.assetId);
+        const chip = document.createElement("span");
+        chip.className = "workbench-ref-chip";
+        const number = String(ref.token || "").replace(/[^\d]/g, "");
+        chip.title = `编辑器里写 ${ref.token || `@图${number}`}，提交时写成「参考图${number}」；素材：${
+          asset?.name || ref.name || ref.assetId
+        }`;
+        const num = document.createElement("em");
+        num.textContent = `参考图${number}`;
+        chip.appendChild(num);
+        const name = document.createElement("span");
+        name.textContent = shortName(asset?.name || ref.name || ref.assetId);
+        chip.appendChild(name);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "workbench-ref-remove";
+        remove.dataset.act = "compose-unbind";
+        remove.dataset.assetId = ref.assetId;
+        remove.textContent = "×";
+        remove.title = "解除引用";
+        chip.appendChild(remove);
+        refsHost.appendChild(chip);
+      });
+    if (refs.length) {
+        const hint = document.createElement("span");
+        hint.className = "workbench-refs-hint";
+        hint.textContent = "平台不支持内联图片节点：编辑器里的 @图N 提交时会写成「参考图N」，并按同一编号顺序作为参考图上传";
+        refsHost.appendChild(hint);
+      }
+    }
+
+    const effective = effectiveOf(storyboard);
+    const accountCount = (state.selectedAccountIds || []).length;
+    const busy = state.compose.busy;
+    const reasons = [];
+    if (!storyboard) reasons.push("还没有分镜");
+    if (!String(prompt.value || "").trim()) reasons.push("提示词为空");
+    if (!accountCount) reasons.push("未选择执行账号");
+    if (!effective.model || !effective.duration || !effective.ratio) reasons.push("参数未就绪");
+    summary.textContent = `模型 ${effective.model || "-"} · 时长 ${effective.duration || "-"} 秒 · 比例 ${
+      effective.ratio || "-"
+    } · 已选账号 ${accountCount} 个（本条只提交 1 个账号）`;
+    button.disabled = Boolean(busy) || reasons.length > 0;
+    button.textContent = busy === "checking" ? "正在检查…" : busy === "submitting" ? "正在提交…" : "生成视频";
+    button.title = reasons.length ? `不可提交：${reasons.join("；")}` : "向平台提交这一条（真实提交）";
+    if (reasons.length && !busy) {
+      setMainStatus(`暂不可提交：${reasons.join("；")}`, "warn");
+    } else if (!busy && state.compose.statusKind === "warn") {
+      setMainStatus("", "");
+    }
+  }
+
+  /** 素材名截断显示（悬停可看全名） */
+  function shortName(name, max = 14) {
+    const text = String(name || "");
+    return text.length > max ? `${text.slice(0, max)}…` : text;
   }
 
   // ── 执行账号与任务 ───────────────────────────────────────
@@ -601,10 +780,13 @@
       return;
     }
 
-    // 账号集合变化时剔除失效选择；首次进入默认勾选第一个，避免「一个都没选」的困惑
+    // 账号集合变化时剔除失效选择；首次进入默认勾选第一个，避免「一个都没选」的困惑。
+// 但用户手动清空过之后不再自动勾选，否则「清空」会失效。
     const valid = new Set(accounts.map((a) => a.id));
     state.selectedAccountIds = state.selectedAccountIds.filter((id) => valid.has(id));
-    if (!state.selectedAccountIds.length) state.selectedAccountIds = [accounts[0].id];
+    if (!state.selectedAccountIds.length && !state.accountsTouched) {
+      state.selectedAccountIds = [accounts[0].id];
+    }
     const picked = new Set(state.selectedAccountIds);
 
     for (const account of accounts) {
@@ -699,20 +881,68 @@
     const meta = document.createElement("div");
     meta.className = "workbench-task-meta";
     const pieces = [
-      `账号 ${record.accountId}`,
+      `账号 ${accountName(record.accountId)}`,
       record.submittedAt ? `提交 ${formatTime(record.submittedAt)}` : "尚未提交",
       `最近更新 ${formatTime(record.updatedAt)}`,
       record.platformTaskId ? `平台任务 ${record.platformTaskId}` : "平台任务 ID：无",
     ];
-    if (record.params?.model) pieces.push(`模型 ${record.params.model}`);
-    if (record.params?.duration) pieces.push(`时长 ${record.params.duration}`);
+    if (record.params?.duration) {
+      const evidence = record.driver?.durationEvidence;
+      pieces.push(
+        `时长 ${record.params.duration} 秒${
+          evidence?.mode === "enhanced"
+            ? evidence.submitted
+              ? `（增强，请求体回读 ${evidence.submitted} 秒）`
+              : "（增强，未回读到请求体时长）"
+            : ""
+        }`
+      );
+    }
     if (record.refs?.length) pieces.push(`参考图 ${record.refs.length} 张`);
     for (const piece of pieces) {
       const span = document.createElement("span");
       span.textContent = piece;
       meta.appendChild(span);
     }
+    // UUID / 内部标识默认折叠，避免挤占任务卡片的主要信息
+    const detailBits = document.createElement("details");
+    detailBits.className = "workbench-task-ids";
+    detailBits.innerHTML = `<summary>内部标识</summary><div>账号 ${record.accountId}</div><div>尝试 ${record.id}${
+      record.params?.model ? ` · 模型标识 ${record.params.model}` : ""
+    }</div>`;
+    meta.appendChild(detailBits);
     card.appendChild(meta);
+
+    // 自动重试：次数 / 原因 / 下次时间 / 停止按钮（全部可见，不静默重试）
+    if (record.autoRetry && !record.autoRetry.stopped) {
+      const box = document.createElement("div");
+      box.className = "workbench-task-retry";
+      box.textContent = `自动重试 第 ${record.autoRetry.count}/${record.autoRetry.max} 次 · 原因：${
+        record.autoRetry.reason || "平台未受理"
+      } · 下次：${formatTime(record.autoRetry.nextAt)}`;
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "text-button";
+      stop.dataset.act = "stop-retry";
+      stop.textContent = "停止重试";
+      box.appendChild(stop);
+      card.appendChild(box);
+    } else if (record.autoRetry?.stopped) {
+      const box = document.createElement("div");
+      box.className = "workbench-task-retry workbench-task-retry-stopped";
+      box.textContent = `自动重试已停止：${record.autoRetry.reason || "需人工处理"}`;
+      card.appendChild(box);
+    }
+
+    // 平台明确拒绝（人脸未认证、内容规则等）：显示原因并要求人工处理，不自动换素材/换模型
+    if (record.driver?.needsUser || record.autoRetry?.stopped) {
+      const note = document.createElement("div");
+      note.className = "workbench-task-reject";
+      note.textContent = `平台未受理，需你处理：${
+        record.error?.message || record.driver?.message || "见提交步骤"
+      }。工作台不会自动换素材、换模型或重试。`;
+      card.appendChild(note);
+    }
 
     if (record.poll?.lastAt || record.poll?.message) {
       const poll = document.createElement("div");
@@ -961,6 +1191,148 @@
     openModal("workbenchRunModal");
   }
 
+  // ── 单条创作区交互 ───────────────────────────────────────
+  /**
+   * 主按钮：提交「当前这一条」。
+   * 默认只交给一个账号执行（避免同一条分镜因为多选账号被重复生成）；
+   * 需要多账号对比时走「分镜列表 / 批量」里的对比模式。
+   */
+  async function generateCurrent() {
+    if (state.compose.busy) return; // 提交期间防重复点击
+    const storyboard = currentStoryboard();
+    if (!storyboard) return setMainStatus("还没有分镜，先新增一条", "warn");
+    const accountIds = (state.selectedAccountIds || []).slice();
+    if (!accountIds.length) return setMainStatus("请先在右侧勾选执行账号", "warn");
+    const accountId = accountIds[0];
+
+    state.compose.busy = "checking";
+    renderCompose();
+    setMainStatus("正在检查提交条件…");
+    let preview = null;
+    try {
+      preview = await api.task.preview(projectId(), storyboard.id, accountId);
+    } catch (error) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`检查失败：${error.message}`, "error");
+    }
+    if (!preview?.valid) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`暂不可提交：${(preview?.errors || ["参数未通过校验"]).join("；")}`, "error");
+    }
+
+    state.compose.busy = "submitting";
+    renderCompose();
+    setMainStatus(`正在提交…（真实提交 · 账号 ${accountName(accountId)} · 请勿关闭窗口）`);
+    let attemptId = "";
+    try {
+      const created = await api.task.enqueue(projectId(), storyboard.id, accountId);
+      attemptId = created.attempt.id;
+      await refresh();
+      await api.task.execute(projectId(), attemptId);
+    } catch (error) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`提交失败：${error.message}`, "error");
+    }
+    await refresh();
+    state.compose.busy = "";
+    const record = (state.tasks || []).find((t) => t.id === attemptId);
+    renderCompose();
+    if (!record) return setMainStatus("已提交，但读不到任务记录，请到右侧任务列表核对", "warn");
+    if (record.status === "queued" || record.status === "generating") {
+      return setMainStatus(`已提交：平台已受理（${statusLabel(record.status)}）`, "ok");
+    }
+    if (record.status === "unconfirmed") {
+      return setMainStatus(`提交结果待确认：${record.poll?.message || record.error?.message || "未取得平台任务 ID"}`, "warn");
+    }
+    return setMainStatus(
+      `未提交成功：${statusLabel(record.status)} · ${record.error?.message || record.driver?.message || "见任务卡片"}`,
+      "error"
+    );
+  }
+
+  /** 创作区的 @ 提及、粘贴与拖拽：与素材库行为保持一致 */
+  function bindComposeEvents() {
+    const prompt = $("workbenchMainPrompt");
+
+    prompt?.addEventListener("input", (event) => {
+      const storyboard = currentStoryboard();
+      if (!storyboard) return;
+      const node = event.target;
+      state.pendingValues.set(`sb-prompt:${storyboard.id}`, node.value);
+      setMainStatus("");
+      const caret = node.selectionStart;
+      if (caret > 0 && node.value[caret - 1] === "@") {
+        const withoutAt = node.value.slice(0, caret - 1) + node.value.slice(caret);
+        openMention(storyboard.id, withoutAt, caret - 1);
+        return;
+      }
+      scheduleUpdate(storyboard.id, { prompt: node.value });
+      const summary = $("workbenchRunSummary");
+      if (summary) summary.dataset.dirty = "1";
+    });
+
+    prompt?.addEventListener("blur", () => {
+      const storyboard = currentStoryboard();
+      if (!storyboard) return;
+      const value = String(prompt.value || "");
+      if (value !== String(storyboard.prompt || "")) scheduleUpdate(storyboard.id, { prompt: value });
+    });
+
+    for (const type of ["dragenter", "dragover"]) {
+      prompt?.addEventListener(type, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        prompt.classList.add("is-over");
+      });
+    }
+    prompt?.addEventListener("dragleave", () => prompt.classList.remove("is-over"));
+    prompt?.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      prompt.classList.remove("is-over");
+      const files = [...(event.dataTransfer?.files || [])].filter((file) => /^image\//i.test(file.type));
+      if (files.length) await importClipboardImages(files);
+    });
+    prompt?.addEventListener("paste", async (event) => {
+      const files = [...(event.clipboardData?.files || [])].filter((file) => /^image\//i.test(file.type));
+      if (!files.length) return;
+      event.preventDefault();
+      await importClipboardImages(files);
+    });
+
+    $("workbenchGenerate")?.addEventListener("click", generateCurrent);
+
+    $("workbenchRefsRow")?.addEventListener("click", async (event) => {
+      const button = event.target.closest('[data-act="compose-unbind"]');
+      if (!button) return;
+      const storyboard = currentStoryboard();
+      if (!storyboard) return;
+      try {
+        await api.storyboard.unbind(projectId(), storyboard.id, button.dataset.assetId);
+        await refresh();
+        toast("已解除引用");
+      } catch (error) {
+        toast(`解除引用失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchAssetsToggle")?.addEventListener("click", () => {
+      state.assetsCollapsed = !state.assetsCollapsed;
+      renderAssetsCollapse();
+    });
+  }
+
+  function renderAssetsCollapse() {
+    const pane = $("workbenchAssetPane");
+    const toggle = $("workbenchAssetsToggle");
+    if (!pane || !toggle) return;
+    pane.classList.toggle("is-collapsed", state.assetsCollapsed);
+    toggle.textContent = state.assetsCollapsed ? "▶ 素材库" : "◀ 素材库";
+  }
+
   // ── 分镜 ─────────────────────────────────────────────────
   function renderStoryboards() {
     const host = $("workbenchStoryboardList");
@@ -1073,6 +1445,14 @@
       overridden.length ? `（含 ${overridden.length} 项单条覆盖）` : "（继承全局）"
     }`;
     foot.appendChild(params);
+
+    const loadButton = document.createElement("button");
+    loadButton.type = "button";
+    loadButton.className = "text-button";
+    loadButton.dataset.act = "load";
+    loadButton.textContent = "载入编辑区";
+    loadButton.title = "把这条分镜载入上方的提示词编辑框";
+    foot.appendChild(loadButton);
 
     const runButton = document.createElement("button");
     runButton.type = "button";
@@ -1324,6 +1704,9 @@
       refresh();
     });
 
+    bindComposeEvents();
+    renderAssetsCollapse();
+
     for (const node of document.querySelectorAll("#workbenchModal [data-close], #workbenchPasteModal [data-close], #workbenchMentionModal [data-close], #workbenchPreviewModal [data-close], #workbenchImpactModal [data-close]")) {
       node.addEventListener(
         "click",
@@ -1528,7 +1911,10 @@
       if (box.checked) set.add(id);
       else set.delete(id);
       state.selectedAccountIds = [...set];
+      state.accountsTouched = true;
       renderAccounts();
+      // 账号选择直接影响主按钮的可用性，这里必须同步刷新
+      renderCompose();
     });
 
     $("workbenchAccountPicks")?.addEventListener("click", async (event) => {
@@ -1628,13 +2014,17 @@
 
     $("workbenchAccountNote")?.addEventListener("click", (event) => {
       if (event.target.closest('[data-act="accounts-all"]')) {
+        state.accountsTouched = true;
         state.selectedAccountIds = (state.accounts || []).map((a) => a.id);
         renderAccounts();
+        renderCompose();
         return;
       }
       if (event.target.closest('[data-act="accounts-none"]')) {
+        state.accountsTouched = true;
         state.selectedAccountIds = [];
         renderAccounts();
+        renderCompose();
       }
     });
 
@@ -1648,6 +2038,9 @@
         if (button.dataset.act === "cancel") {
           const record = await api.task.cancel(projectId(), attemptId);
           toast(record.status === "canceled" ? "已取消" : `未取消：${record.poll?.message || "平台不支持取消"}`);
+        } else if (button.dataset.act === "stop-retry") {
+          await api.task.stopAutoRetry(projectId(), attemptId);
+          toast("已停止自动重试");
         } else if (button.dataset.act === "retry") {
           await api.task.retry(projectId(), attemptId);
           toast("已创建新的尝试记录，历史保留");
@@ -1742,6 +2135,11 @@
         }
         if (act === "override") {
           card.querySelector(".workbench-sb-overrides")?.classList.toggle("hidden");
+          return;
+        }
+        if (act === "load") {
+          await loadStoryboardIntoCompose(storyboardId);
+          toast("已载入编辑区");
           return;
         }
         if (act === "run") {

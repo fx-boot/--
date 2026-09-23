@@ -161,6 +161,8 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
       ipcRenderer.invoke("workbench:task-assignments", storyboardIds, accountIds, mode),
     execute: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-execute", projectId, attemptId),
     cancel: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-cancel", projectId, attemptId),
+    stopAutoRetry: (projectId, attemptId) =>
+      ipcRenderer.invoke("workbench:task-auto-retry-stop", projectId, attemptId),
     retry: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-retry", projectId, attemptId),
     download: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-download", projectId, attemptId),
   },

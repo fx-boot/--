@@ -235,34 +235,61 @@
         </div>
       </div>
       <div class="workbench-body">
-        <aside class="workbench-assets">
-          <div class="workbench-section-head">
-            <strong>素材库</strong>
+        <aside class="workbench-assets" id="workbenchAssetPane">
+          <div class="workbench-section-head workbench-pane-head">
+            <button type="button" class="text-button workbench-pane-toggle" id="workbenchAssetsToggle" title="折叠/展开素材库">◀ 素材库</button>
             <span class="count-badge" id="workbenchAssetCount">0</span>
           </div>
-          <div class="workbench-asset-tools">
-            <label class="search-box">
-              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
-              <input id="workbenchAssetSearch" type="search" placeholder="搜索素材名称">
-            </label>
-            <button type="button" class="secondary-action compact" id="workbenchAssetImport">导入图片</button>
+          <div class="workbench-asset-inner" id="workbenchAssetInner">
+            <div class="workbench-asset-tools">
+              <label class="search-box">
+                <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+                <input id="workbenchAssetSearch" type="search" placeholder="搜索素材名称">
+              </label>
+              <button type="button" class="secondary-action compact" id="workbenchAssetImport">导入图片</button>
+            </div>
+            <div class="workbench-dropzone" id="workbenchDropzone">把图片拖到这里、点击「导入图片」，或直接 Ctrl+V 粘贴</div>
+            <div class="workbench-asset-list" id="workbenchAssetList"></div>
           </div>
-          <div class="workbench-dropzone" id="workbenchDropzone">把图片拖到这里、点击「导入图片」，或直接 Ctrl+V 粘贴</div>
-          <div class="workbench-asset-list" id="workbenchAssetList"></div>
         </aside>
+
         <div class="workbench-main">
-          <div class="workbench-defaults" id="workbenchDefaults"></div>
-          <div class="workbench-toolbar">
-            <button type="button" class="secondary-action compact" id="workbenchStoryboardAdd">新增分镜</button>
-            <button type="button" class="secondary-action compact" id="workbenchRunBatch">生成整批（分配执行）</button>
-            <button type="button" class="secondary-action compact" id="workbenchPasteOpen">批量粘贴提示词</button>
-            <span class="workbench-hint" id="workbenchHint"></span>
+          <!-- 单条创作主区：一个编辑框 + 上方参数 + 下方主操作栏 -->
+          <div class="workbench-create" id="workbenchCreate">
+            <div class="workbench-params-row" id="workbenchParamsRow"></div>
+            <label class="workbench-prompt-label" for="workbenchMainPrompt">
+              <span>提示词</span>
+              <em>输入 @ 可插入参考图片</em>
+            </label>
+            <textarea id="workbenchMainPrompt" class="workbench-main-prompt" spellcheck="false"
+              placeholder="描述这个分镜的画面与动作；在需要的位置输入 @ 插入参考图片"></textarea>
+            <div class="workbench-refs-row" id="workbenchRefsRow"></div>
+            <div class="workbench-main-actionbar">
+              <div class="workbench-run-summary" id="workbenchRunSummary"></div>
+              <button type="button" class="primary-action workbench-generate-btn" id="workbenchGenerate">生成视频</button>
+            </div>
+            <div class="workbench-main-status" id="workbenchMainStatus"></div>
           </div>
-          <div class="workbench-storyboards" id="workbenchStoryboardList"></div>
+
+          <!-- 分镜列表 / 批量模式（保留既有能力，默认收进次级入口，避免和主编辑框抢输入） -->
+          <details class="workbench-storyboards-wrap" id="workbenchStoryboardsWrap">
+            <summary>
+              <strong>分镜列表 / 批量</strong>
+              <span class="workbench-hint">收起的：历史分镜与批量提交都在这里，不会影响上面的编辑框</span>
+            </summary>
+            <div class="workbench-storyboards-actions">
+              <button type="button" class="secondary-action compact" id="workbenchStoryboardAdd">新增分镜</button>
+              <button type="button" class="secondary-action compact" id="workbenchRunBatch">生成整批（分配执行）</button>
+              <button type="button" class="secondary-action compact" id="workbenchPasteOpen">批量粘贴提示词</button>
+            </div>
+            <div class="workbench-storyboards" id="workbenchStoryboardList"></div>
+          </details>
+          <span class="workbench-hint" id="workbenchHint"></span>
         </div>
+
         <aside class="workbench-tasks">
           <div class="workbench-section-head">
-            <strong>生成任务</strong>
+            <strong>账号与任务</strong>
             <span class="count-badge" id="workbenchTaskCount">0</span>
           </div>
           <div class="workbench-task-controls">

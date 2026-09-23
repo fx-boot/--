@@ -131,16 +131,51 @@ function classifyPlatformReply(text) {
   return null;
 }
 
+/**
+ * 「平台是否受理了本次提交」的通用信号（不硬编码整句文案、模型名或额度数字）。
+ *   - 说明型信号（生成中/排队中/任务已创建）→ 受理；
+ *   - 费用预告（本次使用…生成 + 将消耗…额度）→ 受理（但不等于生成成功，仍需任务 ID 落定）；
+ *   - 只有费用预告、没有开始生成字样时记为「弱信号」，同样停止重试，转入监控。
+ * 只用于「停止重复提交、转入监控」的判定，绝不据此宣告生成成功。
+ */
+const ACCEPTANCE_PATTERNS = Object.freeze([
+  { code: "GENERATING", re: /正在生成|生成中|已开始生成|排队中|已排队|任务已创建|已提交生成/, strength: "strong" },
+  { code: "COST_FORECAST", re: /(消耗|扣除|扣减|花费)[^。；\n]{0,20}(额度|积分|次数)/, strength: "weak" },
+  { code: "PLAN_USE", re: /本次(将)?使用[^。；\n]{0,60}生成/, strength: "weak" },
+]);
+
+function classifyAcceptance(text) {
+  const source = String(text || "");
+  if (!source.trim()) return null;
+  const hits = [];
+  for (const rule of ACCEPTANCE_PATTERNS) {
+    const match = source.match(rule.re);
+    if (match) {
+      const at = Math.max(0, (match.index || 0) - 40);
+      hits.push({ code: rule.code, strength: rule.strength, excerpt: source.slice(at, at + 160).trim() });
+    }
+  }
+  if (!hits.length) return null;
+  const strong = hits.some((hit) => hit.strength === "strong");
+  const hasPlanAndCost = hits.some((h) => h.code === "PLAN_USE") && hits.some((h) => h.code === "COST_FORECAST");
+  return {
+    accepted: strong || hasPlanAndCost,
+    strength: strong || hasPlanAndCost ? "accepted" : "hint",
+    codes: hits.map((hit) => hit.code),
+    excerpt: hits[0].excerpt,
+    note:
+      strong || hasPlanAndCost
+        ? "平台已受理本次提交（停止重复提交，转入监控；任务 ID 未落定前不算生成成功）"
+        : "平台给出了费用预告类提示（停止重复提交，转入监控；不作为生成成功依据）",
+  };
+}
+
 const text = (value, max = 0) => {
   const out = String(value ?? "");
   return max > 0 ? out.slice(0, max) : out;
 };
 
-/**
- * 结构化引用 → 分段计划
- * 保证「图片标签的位置与顺序」被带到提交阶段：token 出现在文本哪里，
- * 图片就插到哪里，而不是统一堆到末尾。
- */
+/** 结构化引用 → 分段计划（保留 @图N 在文本中的出现位置，供界面展示与顺序核对） */
 function buildSegments(prompt, refs, assetsById = new Map()) {
   const source = text(prompt);
   const byToken = new Map((refs || []).map((r) => [r.token, r]));
@@ -156,7 +191,8 @@ function buildSegments(prompt, refs, assetsById = new Map()) {
     segments.push({
       kind: "image",
       assetId: ref.assetId,
-      token: ref.token,
+      token: match[0],
+      number: Number(match[1]) || 0,
       name: text(asset?.name ?? ref.name, 120),
       filePath: text(asset?.filePath),
       sha256: text(asset?.sha256 ?? ref.sha256, 64),
@@ -169,16 +205,72 @@ function buildSegments(prompt, refs, assetsById = new Map()) {
   return segments;
 }
 
-/** 提交给平台的纯文本：引用位置换成原子占位符，平台侧再替换为真实图片节点 */
-function segmentsToPlainText(segments) {
+/**
+ * 平台的图片引用能力（实测 2026-09-23，DevTools 直连真实 webview）：
+ *   - 上传图片后编辑器里不会出现任何图片节点（`<p>` 始终是空的）；
+ *   - 在编辑器里输入 @ 不会唤起引用菜单；"/" 也没有命令菜单；
+ *   - 往编辑器粘贴图片不插入任何节点（img 数 0、U+FFFC 数 0）；
+ *   - 附件缩略卡没有编号/标签，只有 img 的 alt = 原文件名。
+ * 结论：平台的视频编辑器**不支持内联图片节点**，图片只能作为参考图附件按上传顺序生效。
+ * 因此这里不再写入 U+FFFC（那会被平台当成普通文本，提交后在消息里显示为方框），
+ * 改为：按 @图N 的编号顺序上传附件，并把文本里的 @图N 写成「参考图N」。
+ */
+const REFERENCE_CAPABILITY = Object.freeze({
+  inline: false,
+  mechanism: "attachment-order",
+  labelPrefix: "参考图",
+  measuredAt: "2026-09-23",
+  note: "平台视频编辑器不支持内联图片节点（实测：上传后编辑器无图片节点、@ 无引用菜单、粘贴图片无效）。提交方式为「按参考图1..N 的顺序作为附件上传」+ 文本里的 @图N 写成参考图N",
+});
+
+/** 引用标签：@图3 → 参考图3 */
+const referenceLabel = (token) => {
+  const match = String(token || "").match(/^@图(\d{1,3})$/);
+  return match ? `${REFERENCE_CAPABILITY.labelPrefix}${match[1]}` : String(token || "");
+};
+
+/**
+ * 提交给平台的文本：把 @图N 转成「参考图N」（不再写入 U+FFFC 占位符）。
+ * 之所以能用编号一一对应，是因为附件按 @图N 的编号升序上传（见 buildPlan.references）。
+ */
+function toPlatformText(segments) {
   return (segments || [])
-    .map((segment) => (segment.kind === "image" ? DOLA_SELECTORS.atomicMark : segment.value))
+    .map((segment) => (segment.kind === "image" ? referenceLabel(segment.token) : segment.value))
     .join("");
 }
+
+/** 按 @图N 的编号升序整理引用：保证「参考图N」与第 N 个附件严格对应 */
+function orderReferences(segments) {
+  const images = (segments || []).filter((segment) => segment.kind === "image");
+  const seen = new Set();
+  const ordered = [];
+  for (const segment of images.slice().sort((a, b) => (a.number || 0) - (b.number || 0))) {
+    if (seen.has(segment.token)) continue;
+    seen.add(segment.token);
+    ordered.push({ ...segment, order: ordered.length + 1, label: referenceLabel(segment.token) });
+  }
+  return ordered;
+}
+
+/** 时长增强能力：来自能力表，未配置就返回 null（界面不得编造秒数） */
+function enhancedDurationOf(capabilities, target = "dola") {
+  const caps = capabilitiesFor(capabilities, target);
+  const spec = caps?.enhancedDuration;
+  if (!spec || !Number(spec.from) || !Number(spec.to)) return null;
+  const list = [];
+  for (let seconds = Number(spec.from); seconds <= Number(spec.to); seconds++) list.push(String(seconds));
+  return { ...spec, from: Number(spec.from), to: Number(spec.to), values: list };
+}
+
+const isEnhancedDuration = (capabilities, target, duration) => {
+  const spec = enhancedDurationOf(capabilities, target);
+  return Boolean(spec) && spec.values.includes(String(duration));
+};
 
 function describeCapabilities(capabilities, target = "dola") {
   const caps = capabilitiesFor(capabilities, target);
   const durations = (caps?.durations || []).map(String);
+  const enhanced = enhancedDurationOf(capabilities, target);
   return {
     target,
     name: caps?.name || target,
@@ -186,10 +278,22 @@ function describeCapabilities(capabilities, target = "dola") {
     // 模型标识对应的平台菜单文案：界面与驱动层共用同一份映射
     modelLabels: (caps?.models || []).map((model) => ({ value: String(model), label: menuLabelForModel(model) })),
     durations,
+    // 增强时长（逐秒 16—30）只在满足模型条件时可用；界面据此显示原因
+    enhancedDuration: enhanced
+      ? {
+          values: enhanced.values,
+          from: enhanced.from,
+          to: enhanced.to,
+          requiresModel: enhanced.requiresModel,
+          mechanism: enhanced.mechanism,
+          note: `仅 ${menuLabelForModel(enhanced.requiresModel)} 可用；由应用自带增强器改写请求体里的时长，实际时长以请求体回读为准`,
+        }
+      : null,
     ratios: (caps?.ratios || []).map(String),
     watermark: caps?.watermark || "",
     executionEngine: caps?.executionEngine || "",
     measuredAt: caps?.measuredAt || "",
+    reference: { ...REFERENCE_CAPABILITY },
     // true 表示平台能力表里没有该项 —— 界面必须显示「未知」，不得编造
     unknown: {
       ratio: !Array.isArray(caps?.ratios) || caps.ratios.length === 0,
@@ -217,9 +321,19 @@ function validateParams({ target = "dola", params = {}, refs = [], capabilities 
   }
 
   const duration = text(params.duration);
+  const enhanced = enhancedDurationOf(capabilities, target);
   if (!duration) errors.push("未选择时长");
-  else if (caps && !(caps.durations || []).map(String).includes(duration)) {
-    errors.push(`时长 ${duration} 不在平台能力表中，拒绝提交`);
+  else if (caps && (caps.durations || []).map(String).includes(duration)) {
+    // 平台原生时长（5/10）：直接在控件上设置并回读
+  } else if (enhanced && enhanced.values.includes(duration)) {
+    // 增强时长（16—30）：只在该模型下可用，且必须由增强器改写请求体 —— 绝不静默降级
+    if (model !== enhanced.requiresModel) {
+      errors.push(
+        `${duration} 秒属于时长增强，仅 ${menuLabelForModel(enhanced.requiresModel)} 可用（当前模型 ${model || "未选择"}）；请改用平台原生的 5/10 秒，或切换模型，不会自动降级`
+      );
+    }
+  } else if (caps) {
+    errors.push(`时长 ${duration} 不在平台已核实能力表中，拒绝提交`);
   }
 
   // 比例已实测核实：用户选了什么就必须在平台上设成什么，不支持的直接拒绝
@@ -259,11 +373,12 @@ function validateParams({ target = "dola", params = {}, refs = [], capabilities 
 function buildPlan({ target = "dola", attempt, assetsById = new Map(), capabilities = null } = {}) {
   const refs = attempt?.refs || [];
   const segments = buildSegments(attempt?.params?.prompt || "", refs, assetsById);
-  const uploads = segments.filter((s) => s.kind === "image").map((s) => s.filePath);
+  const references = orderReferences(segments);
+  const uploads = references.map((item) => item.filePath);
   const validation = validateParams({
     target,
     params: attempt?.params || {},
-    refs: segments.filter((s) => s.kind === "image").map((s) => ({ ...s, token: s.token })),
+    refs: references.map((item) => ({ ...item, token: item.token })),
     capabilities,
   });
 
@@ -271,13 +386,21 @@ function buildPlan({ target = "dola", attempt, assetsById = new Map(), capabilit
   if (!uploads.length) limitations.push("本次没有绑定参考图片");
   else
     limitations.push(
-      `参考图片以编辑器内联原子节点插入，位置与 @图片 标记一致（共 ${uploads.length} 张）；提交前会回读编辑器里的原子节点数量`
+      `${REFERENCE_CAPABILITY.note}（本次 ${uploads.length} 张，按 ${references.map((item) => item.label).join("、")} 的顺序上传）`
     );
   if (validation.warnings.length) limitations.push(...validation.warnings);
   limitations.push("平台未提供生成进度百分比，只能按阶段与等待时长展示");
 
   const model = text(attempt?.params?.model);
   const ratio = text(attempt?.params?.ratio);
+  const duration = text(attempt?.params?.duration);
+  const enhanced = enhancedDurationOf(capabilities, target);
+  const durationMode = enhanced && enhanced.values.includes(duration) ? "enhanced" : "native";
+  if (durationMode === "enhanced") {
+    limitations.push(
+      `${duration} 秒由应用自带时长增强（改写请求体 ability_param.duration）实现，平台控件仍显示原生档位；结果视频的实际时长需以平台产物为准，本层不能保证`
+    );
+  }
   return {
     target,
     valid: validation.ok,
@@ -285,37 +408,47 @@ function buildPlan({ target = "dola", attempt, assetsById = new Map(), capabilit
     warnings: validation.warnings,
     limitations,
     segments,
+    // 按 @图N 编号升序的引用：第 N 个附件就是「参考图N」
+    references,
     uploads,
     params: {
       model,
-      // 平台菜单里的实际文案：驱动层用它匹配菜单项，匹配不到就阻断而不是退回默认值
       modelLabel: menuLabelForModel(model),
-      // 选完后触发器上显示的短名：驱动层用它做回读校验
       modelTrigger: triggerLabelForModel(model),
-      duration: text(attempt?.params?.duration),
+      duration,
+      durationMode,
+      durationEnhancement: durationMode === "enhanced" ? { seconds: duration, requiresModel: enhanced.requiresModel } : null,
       ratio,
       removeWatermark: attempt?.params?.removeWatermark !== false,
     },
-    plainText: segmentsToPlainText(segments),
+    // 真正写进平台编辑器的文本（@图N → 参考图N，不含 U+FFFC）
+    platformText: toPlatformText(segments),
   };
 }
 
 module.exports = {
+  ACCEPTANCE_PATTERNS,
   DOLA_SELECTORS,
   PLATFORM_REPLY_PATTERNS,
+  REFERENCE_CAPABILITY,
   TOKEN_RE,
   UNKNOWN_CAPABILITIES,
   assignStoryboards,
   buildPlan,
   buildSegments,
   capabilitiesFor,
+  classifyAcceptance,
   classifyPlatformReply,
   describeCapabilities,
   durationOptionsFor,
+  enhancedDurationOf,
+  isEnhancedDuration,
   menuLabelForModel,
   modelOptionsFor,
+  orderReferences,
   ratioOptionsFor,
-  segmentsToPlainText,
+  referenceLabel,
+  toPlatformText,
   triggerLabelForModel,
   validateParams,
 };

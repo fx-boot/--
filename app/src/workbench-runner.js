@@ -58,6 +58,15 @@ function stepDetail(s) {
         ? `页面已起反应（${[s.editorEmptied ? "编辑器已清空" : "", s.changedUrl ? "地址已变化" : "", s.moreMessages ? "出现新消息" : ""].filter(Boolean).join("、") || "有生成相关提示"}）`
         : `点击后页面没有任何反应${s?.hints?.length ? `（页面提示：${s.hints.join("、")}）` : ""}`
     );
+  else if (s?.step === "platformReply") bits.push("已核对平台回复");
+  else if (s?.step === "setDurationEnhancement")
+    bits.push(
+      s?.skipped
+        ? "使用平台原生时长"
+        : s?.ok
+          ? `已开启时长增强（请求体改写为 ${Number(s?.requiredSeconds) || 0} 秒）`
+          : "时长增强条件不满足"
+    );
   else if (s?.step === "readState") bits.push("已读取页面状态");
 
   // 页面地址 / 加载中 / 渲染进程崩溃：这些是判断「是不是撞了登录墙或页面没加载完」的依据
@@ -103,6 +112,13 @@ function summarizeDriver(submitted) {
     at: new Date().toISOString(),
     steps: summarizeSteps(list),
     candidates: (sendStep?.candidates || submitted?.candidates || []).slice(0, 12).map((c) => String(c).slice(0, 120)),
+    // 受理/重试判定所依据的证据（原样落库，便于事后核对，不臆断）
+    accepted: submitted?.accepted === true,
+    retryable: submitted?.retryable === true,
+    needsUser: submitted?.needsUser === true,
+    evidence: submitted?.evidence || null,
+    acceptanceEvidence: submitted?.acceptanceEvidence || null,
+    durationEvidence: submitted?.durationEvidence || null,
   };
 }
 
@@ -120,14 +136,44 @@ function createRunner(options = {}) {
   const pollBaseMs = options.pollBaseMs ?? 3000;
   const pollMaxMs = options.pollMaxMs ?? 30000;
   const pollTimeoutMs = options.pollTimeoutMs ?? 30 * 60 * 1000;
+  // 自动重试策略：只在「明确没有受理 + 临时可恢复」时触发，默认最多 2 次（总提交 3 次）
+  const maxAutoRetries = options.maxAutoRetries ?? 2;
+  const autoRetryBaseMs = options.autoRetryBaseMs ?? 8000;
+  const autoRetryMaxMs = options.autoRetryMaxMs ?? 60000;
 
   const state = {
     paused: false,
     running: new Map(), // attemptId -> {projectId, accountId, startedAt}
     timers: new Map(), // attemptId -> handle
     blockedAccounts: new Map(), // accountId -> {code,label,message,at}
+    // 提交锁：同一条分镜在「提交中 / 等待自动重试」期间不允许再次提交
+    locks: new Map(), // `${projectId}:${storyboardId}` -> {at, attemptId, reason, until}
+    autoRetries: new Map(), // attemptId -> {count, reason, nextAt, handle}
     lastTick: "",
   };
+
+  const lockKey = (projectId, storyboardId) => `${projectId}:${storyboardId}`;
+
+  function lockOf(projectId, storyboardId) {
+    const lock = state.locks.get(lockKey(projectId, storyboardId));
+    if (!lock) return null;
+    return lock;
+  }
+
+  function takeLock(projectId, storyboardId, attemptId, reason) {
+    state.locks.set(lockKey(projectId, storyboardId), {
+      at: new Date().toISOString(),
+      attemptId,
+      reason,
+      until: "",
+    });
+    notify();
+  }
+
+  function releaseLock(projectId, storyboardId) {
+    state.locks.delete(lockKey(projectId, storyboardId));
+    notify();
+  }
 
   const runningCountFor = (accountId) =>
     [...state.running.values()].filter((r) => r.accountId === accountId).length;
@@ -213,6 +259,16 @@ function createRunner(options = {}) {
     state.running.set(attemptId, { projectId, accountId: record.accountId, startedAt: Date.now() });
     notify();
 
+    // 提交锁：同一条分镜在同一时刻只能有一次提交（手动点击与自动重试不能并发）
+    const held = lockOf(projectId, record.storyboardId);
+    if (held && held.attemptId !== attemptId) {
+      state.running.delete(attemptId);
+      notify();
+      throw new Error(`这条分镜正在提交中（${held.reason}），已跳过重复提交，避免重复消耗额度`);
+    }
+    takeLock(projectId, record.storyboardId, attemptId, "正在提交");
+    let keepLock = false;
+
     // 中途步骤与最终结果都会写同一个 tasks.json：串行化写入，保证最终结果最后落盘。
     // 声明在 try 之外，catch 里才能等它们落地后再写失败结果。
     const liveSteps = [];
@@ -271,6 +327,27 @@ function createRunner(options = {}) {
           return r;
         });
         if (rule) blockAccount(record.accountId, rule, submitted?.message);
+        // 平台明确拒绝（人脸未认证/内容规则/要求确认）：不自动重试，也不换素材换模型
+        if (submitted?.needsUser || !submitted?.retryable) {
+          releaseLock(projectId, record.storyboardId);
+          return;
+        }
+        // 明确「没有受理 + 临时可恢复」：按上限自动重试
+        const retried = await scheduleAutoRetry(projectId, attemptId, submitted);
+        if (retried) keepLock = true;
+        return;
+      }
+
+      if (outcome === "accepted" && submitted?.accepted) {
+        // 平台已受理但没有任务 ID：停止重复提交、转入监控（不算生成成功）
+        await patch(projectId, attemptId, (r) => {
+          r.accepted = true;
+          r.acceptanceEvidence = submitted?.acceptanceEvidence || { kind: "platform-message" };
+          applyStatus(r, STATUS.QUEUED, submitted?.message || "平台已受理，等待任务 ID");
+          return r;
+        });
+        releaseLock(projectId, record.storyboardId);
+        schedulePoll(projectId, attemptId, pollBaseMs);
         return;
       }
 
@@ -323,8 +400,86 @@ function createRunner(options = {}) {
       if (rule) blockAccount(record.accountId, rule, error?.message);
     } finally {
       state.running.delete(attemptId);
+      // 有自动重试在排队时保留提交锁，避免手动再点一次造成并发提交
+      if (!keepLock) releaseLock(projectId, record.storyboardId);
       notify();
     }
+  }
+
+  /**
+   * 自动重试：只在「明确没有受理 + 临时可恢复」时调用。
+   * 每次重试都是一条新的尝试记录（关联同一条分镜），保留全部证据。
+   * 重试前先复核是否已有本次任务被受理，避免重复消耗额度。
+   */
+  async function scheduleAutoRetry(projectId, attemptId, submitted) {
+    const record = await loadRecord(projectId, attemptId);
+    if (!record) return false;
+    // 复核：已经有任务 ID / 已被受理，绝不重试
+    if (record.platformTaskId || record.accepted) {
+      log("auto-retry-skip", { attemptId, reason: "已有受理证据" });
+      return false;
+    }
+    // 重试次数按「同一条分镜的尝试链」累计，避免每次重试都从 0 重新开始
+    const performed = await autoRetryCountOf(projectId, record);
+    if (performed >= maxAutoRetries) {
+      await patch(projectId, attemptId, (r) => {
+        r.autoRetry = { count: performed, max: maxAutoRetries, stopped: true, reason: "已达自动重试上限，停止重试" };
+        return r;
+      });
+      log("auto-retry-exhausted", { attemptId, performed });
+      return false;
+    }
+    const count = performed + 1;
+    const requested = Number(submitted?.retryAfterMs) || 0;
+    const backoff = Math.max(requested, Math.min(autoRetryMaxMs, autoRetryBaseMs * Math.pow(2, performed)));
+    const nextAt = new Date(Date.now() + backoff).toISOString();
+    const reason = String(submitted?.message || "平台未受理本次提交").slice(0, 200);
+    const handle = schedule(() => {
+      state.autoRetries.delete(attemptId);
+      // 交给尝试链上的新记录重新加锁，避免锁卡在旧尝试上
+      releaseLock(projectId, record.storyboardId);
+      return retry(projectId, attemptId).catch((error) => log("auto-retry-error", { attemptId, message: error?.message }));
+    }, backoff);
+    state.autoRetries.set(attemptId, { count, reason, nextAt, handle, projectId });
+    await patch(projectId, attemptId, (r) => {
+      r.autoRetry = { count, max: maxAutoRetries, reason, nextAt, stopped: false };
+      r.poll = { ...r.poll, message: `平台未受理，将在 ${Math.round(backoff / 1000)} 秒后自动重试（第 ${count}/${maxAutoRetries} 次）` };
+      return r;
+    });
+    log("auto-retry-scheduled", { attemptId, count, backoff, reason });
+    return true;
+  }
+
+  /** 统计这条分镜已经自动重试过几次（沿 retryOf 链回溯，只数自动重试产生的记录） */
+  async function autoRetryCountOf(projectId, record) {
+    const tasks = await taskStore.list(projectId);
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    let count = 0;
+    let current = record?.retryOf ? byId.get(record.retryOf) : null;
+    let guard = 0;
+    while (current && guard < 20) {
+      if (current.autoRetry && !current.autoRetry.stopped) count++;
+      current = current.retryOf ? byId.get(current.retryOf) : null;
+      guard++;
+    }
+    return count;
+  }
+
+  /** 手动停止自动重试（对应界面上的「停止重试」） */
+  async function stopAutoRetry(projectId, attemptId) {
+    const pending = state.autoRetries.get(attemptId);
+    if (pending) {
+      cancelSchedule(pending.handle);
+      state.autoRetries.delete(attemptId);
+    }
+    const record = await loadRecord(projectId, attemptId);
+    if (record) releaseLock(projectId, record.storyboardId);
+    return patch(projectId, attemptId, (r) => {
+      r.autoRetry = { ...(r.autoRetry || {}), stopped: true, reason: "已手动停止自动重试" };
+      // 已经是终态就只更新说明，不做状态迁移（避免非法迁移）
+      if (!isTerminal(r.status)) applyStatus(r, STATUS.FAILED, "已停止自动重试，需人工处理");
+      return r;
+    });
   }
 
   // ── 轮询（带退避） ─────────────────────────────────────────
@@ -530,8 +685,16 @@ function createRunner(options = {}) {
       paused: state.paused,
       running: [...state.running.entries()].map(([id, info]) => ({ attemptId: id, ...info })),
       blockedAccounts: [...state.blockedAccounts.entries()].map(([accountId, info]) => ({ accountId, ...info })),
+      // 提交锁与待执行的自动重试：界面据此展示「第几次 / 原因 / 下次时间 / 停止按钮」
+      locks: [...state.locks.entries()].map(([key, info]) => ({ key, ...info })),
+      autoRetries: [...state.autoRetries.entries()].map(([attemptId, info]) => ({
+        attemptId,
+        count: info.count,
+        reason: info.reason,
+        nextAt: info.nextAt,
+      })),
+      limits: { globalConcurrency, perAccountConcurrency, maxAutoRetries },
       lastTick: state.lastTick,
-      limits: { globalConcurrency, perAccountConcurrency },
     };
   }
 
@@ -545,6 +708,7 @@ function createRunner(options = {}) {
     resume,
     retry,
     status,
+    stopAutoRetry,
     tick,
   };
 }

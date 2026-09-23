@@ -210,7 +210,10 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
       warnings: plan.warnings,
       limitations: plan.limitations,
       uploads: plan.uploads,
-      promptPreview: plan.plainText,
+      references: plan.references,
+      durationMode: plan.params.durationMode,
+      // 真正会写进平台编辑器的文本（@图N → 参考图N，不含占位符）
+      promptPreview: plan.platformText,
     };
   }
 
@@ -252,6 +255,7 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
         return { ok: true };
       },
       "workbench:task-cancel": (_e, projectId, attemptId) => runner.cancel(projectId, attemptId),
+      "workbench:task-auto-retry-stop": (_e, projectId, attemptId) => runner.stopAutoRetry(projectId, attemptId),
       "workbench:task-retry": (_e, projectId, attemptId) => runner.retry(projectId, attemptId),
       "workbench:task-download": async (_e, projectId, attemptId) => {
         const raw = await store.readProject(projectId);

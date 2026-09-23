@@ -190,7 +190,38 @@ function normalizeAttempt(input = {}) {
         detail: text(s?.detail, 200),
       })),
       candidates: (Array.isArray(input.driver?.candidates) ? input.driver.candidates : []).slice(0, 12).map((c) => text(c, 120)),
+      // 受理/重试判定所依据的证据：原样落库，便于事后核对（不臆断）
+      accepted: input.driver?.accepted === true,
+      retryable: input.driver?.retryable === true,
+      needsUser: input.driver?.needsUser === true,
+      evidence: input.driver?.evidence && typeof input.driver.evidence === "object" ? input.driver.evidence : null,
+      acceptanceEvidence:
+        input.driver?.acceptanceEvidence && typeof input.driver.acceptanceEvidence === "object"
+          ? input.driver.acceptanceEvidence
+          : null,
+      durationEvidence:
+        input.driver?.durationEvidence && typeof input.driver.durationEvidence === "object"
+          ? {
+              required: text(input.driver.durationEvidence.required, 8),
+              submitted: text(input.driver.durationEvidence.submitted, 8),
+              mode: text(input.driver.durationEvidence.mode, 16),
+            }
+          : null,
     },
+    // 自动重试：次数 / 上限 / 原因 / 下次时间 / 是否已停止（界面据此展示与停止）
+    autoRetry: input.autoRetry
+      ? {
+          count: Number(input.autoRetry.count) || 0,
+          max: Number(input.autoRetry.max) || 0,
+          reason: text(input.autoRetry.reason, 200),
+          nextAt: text(input.autoRetry.nextAt),
+          stopped: input.autoRetry.stopped === true,
+        }
+      : null,
+    // 平台是否已受理本次提交（受理不等于生成成功）
+    accepted: input.accepted === true,
+    acceptanceEvidence:
+      input.acceptanceEvidence && typeof input.acceptanceEvidence === "object" ? input.acceptanceEvidence : null,
     canCancel: input.canCancel !== false,
   };
 }
