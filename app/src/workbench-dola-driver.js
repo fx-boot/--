@@ -108,6 +108,24 @@ const STEP_READ_STATE = `
   return { ok: true, text: String(body).replace(/\\s+/g, ' ').slice(0, 800), url: location.href };
 `;
 
+/** 从响应体中收集任务类 ID：只认既有模块已确认的字段名，不猜 */
+function collectIds(value, out = [], depth = 0) {
+  if (!value || typeof value !== "object" || depth > 8 || out.length > 12) return out;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 60)) collectIds(item, out, depth + 1);
+    return out;
+  }
+  for (const [key, item] of Object.entries(value).slice(0, 100)) {
+    if (/^(task_id|creation_task_id|generation_task_id|job_id|video_id|vid)$/.test(key)) {
+      const id = String(item ?? "");
+      if (id && id.length <= 120) out.push(id);
+    } else if (item && typeof item === "object") {
+      collectIds(item, out, depth + 1);
+    }
+  }
+  return out;
+}
+
 /** 单个步骤：把计划里的文本与图片依次写入编辑器 */
 function createDolaDriver(options = {}) {
   const resolveContents = options.resolveContents;
@@ -241,24 +259,6 @@ function createDolaDriver(options = {}) {
       } catch {}
     }
     return seen;
-  }
-
-  /** 从响应体中收集任务类 ID：只认既有模块已确认的字段名，不猜 */
-  function collectIds(value, out = [], depth = 0) {
-    if (!value || typeof value !== "object" || depth > 8 || out.length > 12) return out;
-    if (Array.isArray(value)) {
-      for (const item of value.slice(0, 60)) collectIds(item, out, depth + 1);
-      return out;
-    }
-    for (const [key, item] of Object.entries(value).slice(0, 100)) {
-      if (/^(task_id|creation_task_id|generation_task_id|job_id|video_id|vid)$/.test(key)) {
-        const id = String(item ?? "");
-        if (id && id.length <= 120) out.push(id);
-      } else if (item && typeof item === "object") {
-        collectIds(item, out, depth + 1);
-      }
-    }
-    return out;
   }
 
   return {

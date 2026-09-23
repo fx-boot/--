@@ -74,6 +74,53 @@ function createFakeScheduler() {
 
 async function main() {
   const CAPS = VIDEO_CAPABILITIES;
+
+  // ══ 0. 模块可加载性与导出完整性 ══
+  // node --check 只能查语法；「导出了未声明的标识符」这类错误只在真实 require 时暴露
+  // （workbench-dola-driver 曾因 module.exports 里多写了一个工厂内部函数而整包启动失败）。
+  console.log("── 模块加载 ──");
+  for (const file of [
+    "workbench-task-store.js",
+    "workbench-platform.js",
+    "workbench-runner.js",
+    "workbench-download.js",
+    "workbench-store.js",
+    "workbench-assets.js",
+  ]) {
+    try {
+      require(path.join(SRC, file));
+      check(`可加载 ${file}`, true);
+    } catch (error) {
+      check(`可加载 ${file}`, false, error.message);
+    }
+  }
+  for (const file of ["workbench-dola-driver.js", "workbench-task-service.js", "workbench-service.js"]) {
+    const src = fs.readFileSync(path.join(SRC, file), "utf8");
+    const block = /module\.exports\s*=\s*\{([\s\S]*?)\}/.exec(src);
+    if (!block) {
+      check(`${file} 有 module.exports`, false);
+      continue;
+    }
+    const names = block[1]
+      .split(",")
+      .map((part) => part.trim().split(":")[0].trim())
+      .filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
+    // 模块作用域声明：函数（含 async）、类、const/let/var，以及解构导入
+    const destructured = [...src.matchAll(/(?:const|let|var)\s*\{([\s\S]*?)\}\s*=/g)]
+      .flatMap((m) => m[1].split(",").map((s) => s.trim().split(":")[0].trim()))
+      .filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
+    // 模块作用域声明必须出现在「列 0」：这里刻意不加 \s*，
+    // 否则工厂函数内部（缩进）的同名声明也会被误判为模块作用域 —— 该漏洞曾让
+    // 「导出工厂内部函数」的缺陷逃过检查，直到隔离探针启动时才暴露。
+    const declared = (name) =>
+      new RegExp(`(?:^|\\n)(?:async\\s+)?function\\s+${name}\\b`).test(src) ||
+      new RegExp(`(?:^|\\n)class\\s+${name}\\b`).test(src) ||
+      new RegExp(`(?:^|\\n)(?:const|let|var)\\s+${name}\\b`).test(src) ||
+      destructured.includes(name);
+    const missing = names.filter((name) => !declared(name));
+    check(`${file} 导出的标识符都在模块作用域声明`, missing.length === 0, missing);
+  }
+
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-engine-test-"));
   const projectId = "prj_test";
   const taskStore = task.createTaskStore((id) => path.join(root, id));
