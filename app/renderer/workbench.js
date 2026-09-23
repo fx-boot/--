@@ -578,6 +578,7 @@
     readState: "回读参数与发送按钮",
     send: "点击发送",
     sendReaction: "确认平台已开始处理",
+    platformReply: "核对平台回复",
     awaitResponse: "等待平台响应",
   };
   const ACTIVE_STATUSES = ["pending", "submitting", "queued", "generating"];

@@ -973,6 +973,23 @@ const refWarn = platform.validateParams({
   check("记录请求时丢弃查询串（避免把敏感参数落库）", /parsed\.pathname/.test(driverSrc));
   check("参考图数量必须与本次一致（残图会让附件对不上）", /cards\.length === expected/.test(driverSrc));
 
+  // 实测证据（会话 38417881046054929）：平台拒绝时不会给任务 ID，而是在会话里回一条说明
+  // 「出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频」。
+  // 旧实现只盯任务 ID，于是把这种明确拒绝误报成「提交结果待确认」。
+  check("会读取平台在会话里的回复", /STEP_READ_REPLIES/.test(driverSrc) && /classifyPlatformReply/.test(driverSrc));
+  check("平台明确拒绝时判为失败而不是待确认", /outcome: "failed", errorCode: verdict\.code/.test(driverSrc));
+  const faceReject = platform.classifyPlatformReply(
+    "出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频。你可以尝试换其它参考图或文生视频。"
+  );
+  eq("未认证人脸被识别为平台拒绝", faceReject?.code, "FACE_UNVERIFIED");
+  check("识别结果带上平台原文", /未认证人脸/.test(faceReject?.excerpt || ""), faceReject);
+  const needConfirm = platform.classifyPlatformReply(
+    "This is a very long, highly specified 13-shot underwater narrative. I can generate it, but it's too extensive for a single turn.Please confirm one of these options: A. Generate a 15-second ..."
+  );
+  eq("提示词过长要求确认也被识别", needConfirm?.code, "NEED_CONFIRM");
+  eq("正常回复不会被误判为拒绝", platform.classifyPlatformReply("正在为你生成视频，请稍候"), null);
+  eq("空文本不臆断", platform.classifyPlatformReply(""), null);
+
   // 步骤顺序：等就绪 → 进视频模式 → 清残留图 → 写提示词 → 选参数 → 传图 → 核实 → 发送
   const order = [
     'record("waitReady"',

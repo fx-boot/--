@@ -91,6 +91,46 @@ function assignStoryboards({ storyboardIds = [], accountIds = [], mode = "distri
   }));
 }
 
+/**
+ * 平台在会话里给出的「没有开始生成」的明确回复。
+ * 实测（2026-09-23 真实提交 att_5344bc651f4b / att_a3ccf555afb4 之后的会话内容）：
+ *   - 一次是英文「This is a very long, highly specified 13-shot ... Please confirm one of these options」，
+ *     即提示词过长、平台要求先确认生成方式；
+ *   - 一次是「出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频」。
+ * 这两种都说明「平台收到了请求但没有开始生成」，不能当成「提交结果待确认」。
+ */
+const PLATFORM_REPLY_PATTERNS = Object.freeze([
+  {
+    code: "FACE_UNVERIFIED",
+    re: /未认证人脸|肖像保护|未认证.*人脸/i,
+    label: "平台拒绝：未认证人脸不支持该模型（可换其它参考图或改用文生视频）",
+  },
+  {
+    code: "POLICY",
+    re: /违规|涉嫌|敏感|不合规|未通过审核|不支持生成/i,
+    label: "平台拒绝：内容未通过平台规则",
+  },
+  {
+    code: "NEED_CONFIRM",
+    re: /请确认|Please confirm|too extensive|too long|过长/i,
+    label: "平台要求先确认生成方式，本次没有开始生成",
+  },
+]);
+
+/** 从页面文本里判断平台有没有明确「没有开始生成」；认不出返回 null，不臆断 */
+function classifyPlatformReply(text) {
+  const source = String(text || "");
+  if (!source.trim()) return null;
+  for (const rule of PLATFORM_REPLY_PATTERNS) {
+    if (rule.re.test(source)) {
+      const match = source.match(rule.re);
+      const at = Math.max(0, (match?.index || 0) - 40);
+      return { code: rule.code, label: rule.label, excerpt: source.slice(at, at + 200).trim() };
+    }
+  }
+  return null;
+}
+
 const text = (value, max = 0) => {
   const out = String(value ?? "");
   return max > 0 ? out.slice(0, max) : out;
@@ -262,12 +302,14 @@ function buildPlan({ target = "dola", attempt, assetsById = new Map(), capabilit
 
 module.exports = {
   DOLA_SELECTORS,
+  PLATFORM_REPLY_PATTERNS,
   TOKEN_RE,
   UNKNOWN_CAPABILITIES,
   assignStoryboards,
   buildPlan,
   buildSegments,
   capabilitiesFor,
+  classifyPlatformReply,
   describeCapabilities,
   durationOptionsFor,
   menuLabelForModel,

@@ -42,7 +42,7 @@
  */
 
 const { webContents, session } = require("electron");
-const { DOLA_SELECTORS } = require("./workbench-platform");
+const { DOLA_SELECTORS, classifyPlatformReply } = require("./workbench-platform");
 
 const PARTITION_PREFIX = "persist:doubao-manager-";
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
@@ -575,6 +575,17 @@ const STEP_SEND_REACTION = `
 `;
 
 /**
+ * 读取会话里平台最近给出的回复文本。
+ * 实测（2026-09-23）：平台拒绝时不会产生任务 ID，而是在会话里回一条说明，
+ * 只盯任务 ID 会把它误判成「提交结果待确认」。
+ */
+const STEP_READ_REPLIES = `
+  const nodes = [...document.querySelectorAll('[data-message-id]')];
+  const replies = nodes.slice(-2).map(n => String(n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300));
+  return { ok: true, count: nodes.length, replies, url: location.href };
+`;
+
+/**
  * 点击发送。
  * 发送按钮 id 已实测为 #flow-end-msg-send（聊天模式下不存在，故必须先进入视频模式）。
  * 按钮不可用时明确报错，绝不盲点。
@@ -1042,7 +1053,16 @@ function createDolaDriver(options = {}) {
           steps,
         };
       }
-      // 关键：没有确认到任务 ID 就绝不当作已提交，交由编排层标记「提交结果待确认」
+      // 关键：没有确认到任务 ID 就绝不当作已提交，交由编排层标记「提交结果待确认」。
+      // 但先看平台是不是已经在会话里明确说明「没有开始生成」——那就不是待确认，而是明确的失败。
+      const replies = await evaluate(contents, STEP_READ_REPLIES).catch(() => null);
+      const verdict = replies?.ok ? classifyPlatformReply((replies.replies || []).join(" \n ")) : null;
+      if (verdict) {
+        record("platformReply", { ok: false, reason: verdict.label, excerpt: verdict.excerpt, count: replies.count });
+        return { outcome: "failed", errorCode: verdict.code, message: `${verdict.label}；平台原文：${verdict.excerpt}`, steps };
+      }
+      if (replies?.ok) record("platformReply", { ok: true, count: replies.count, reason: `未发现平台拒绝类回复（会话消息 ${replies.count} 条）` });
+
       const observed = (watched.requests || []).map((item) => `${item.method} ${item.path}${item.status ? `→${item.status}` : ""}`);
       return {
         outcome: "unknown",
