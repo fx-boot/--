@@ -7,6 +7,7 @@ const accountProxy = require("./account-proxy");
 const cookieImportCompat = require("./cookie-import-compat");
 require('./hd-original-service').install();
 require('./video-log-service').install();
+require('./workbench-service').install();
 
 const debug = (message) => {
   if (process.env.DBM_COMPAT_DEBUG === "1") process.stderr.write(`[cookie-import] ${message}\n`);

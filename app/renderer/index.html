@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="hd-original.css">
   <link rel="stylesheet" href="video-log.css">
+  <link rel="stylesheet" href="workbench.css">
 </head>
 <body>
   <header class="titlebar">
@@ -39,6 +40,9 @@
       </button>
       <button class="toolbar-btn" id="toggleResourcesPanel" title="收起或展开素材栏">
         <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM15 5v14"/></svg><span>素材栏</span>
+      </button>
+      <button class="toolbar-btn toolbar-accent" id="showWorkbench" title="视频分镜批量生成工作台">
+        <svg viewBox="0 0 24 24"><path d="M3 5h18v14H3zM3 10h18M9 10v9M15 10v9"/></svg><span>分镜工作台</span>
       </button>
     </nav>
     <div class="license-pill" id="licensePill">
@@ -214,6 +218,121 @@
     </section>
   </div>
 
+  <!-- 视频分镜批量生成工作台（阶段1：素材 / 分镜 / @图片 / 草稿） -->
+  <div class="overlay hidden" id="workbenchModal">
+    <section class="modal workbench-modal">
+      <div class="modal-title">
+        <div>
+          <span class="eyebrow">STORYBOARD WORKBENCH</span>
+          <h2>视频分镜工作台</h2>
+          <p id="workbenchStorage">数据目录读取中…</p>
+        </div>
+        <div class="workbench-title-actions">
+          <select id="workbenchProjectSelect" aria-label="选择项目"></select>
+          <button type="button" class="secondary-action compact" id="workbenchProjectNew">新建项目</button>
+          <button type="button" class="secondary-action compact" id="workbenchProjectRename">重命名</button>
+          <button type="button" class="modal-close" data-close="workbenchModal">×</button>
+        </div>
+      </div>
+      <div class="workbench-body">
+        <aside class="workbench-assets">
+          <div class="workbench-section-head">
+            <strong>素材库</strong>
+            <span class="count-badge" id="workbenchAssetCount">0</span>
+          </div>
+          <div class="workbench-asset-tools">
+            <label class="search-box">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+              <input id="workbenchAssetSearch" type="search" placeholder="搜索素材名称">
+            </label>
+            <button type="button" class="secondary-action compact" id="workbenchAssetImport">导入图片</button>
+          </div>
+          <div class="workbench-dropzone" id="workbenchDropzone">把图片拖到这里，或点击「导入图片」</div>
+          <div class="workbench-asset-list" id="workbenchAssetList"></div>
+        </aside>
+        <div class="workbench-main">
+          <div class="workbench-defaults" id="workbenchDefaults"></div>
+          <div class="workbench-toolbar">
+            <button type="button" class="secondary-action compact" id="workbenchStoryboardAdd">新增分镜</button>
+            <button type="button" class="secondary-action compact" id="workbenchPasteOpen">批量粘贴提示词</button>
+            <span class="workbench-hint" id="workbenchHint"></span>
+          </div>
+          <div class="workbench-storyboards" id="workbenchStoryboardList"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 批量粘贴提示词：导入前预览拆分结果 -->
+  <div class="overlay hidden" id="workbenchPasteModal">
+    <section class="modal workbench-paste-modal">
+      <div class="modal-title">
+        <div><span class="eyebrow">BULK IMPORT</span><h2>批量粘贴提示词</h2><p>先预览拆分结果，确认后再导入为分镜</p></div>
+        <button type="button" class="modal-close" data-close="workbenchPasteModal">×</button>
+      </div>
+      <div class="workbench-paste-body">
+        <div class="workbench-paste-input">
+          <div class="workbench-paste-modes" id="workbenchPasteModes">
+            <label><input type="radio" name="workbenchPasteMode" value="blank" checked> 空行分隔</label>
+            <label><input type="radio" name="workbenchPasteMode" value="line"> 每行一条</label>
+            <label><input type="radio" name="workbenchPasteMode" value="marker"> 按标题/分镜标记</label>
+          </div>
+          <textarea id="workbenchPasteText" placeholder="把提示词粘贴到这里，多个分镜之间用空行分隔"></textarea>
+        </div>
+        <div class="workbench-paste-preview">
+          <div class="workbench-section-head"><strong>拆分预览</strong><span id="workbenchPasteCount">0 条</span></div>
+          <div class="workbench-paste-list" id="workbenchPasteList"></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="secondary-action" data-close="workbenchPasteModal">取消</button>
+        <button type="button" class="primary-action" id="workbenchPasteImport" disabled>导入为分镜</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- @图片选择器 -->
+  <div class="overlay hidden" id="workbenchMentionModal">
+    <section class="modal workbench-mention-modal">
+      <div class="modal-title">
+        <div><span class="eyebrow">REFERENCE IMAGE</span><h2>插入参考图片</h2></div>
+        <button type="button" class="modal-close" data-close="workbenchMentionModal">×</button>
+      </div>
+      <div class="workbench-mention-body">
+        <label class="search-box">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+          <input id="workbenchMentionSearch" type="search" placeholder="搜索素材名称">
+        </label>
+        <div class="workbench-mention-list" id="workbenchMentionList"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 素材预览 -->
+  <div class="overlay hidden" id="workbenchPreviewModal">
+    <section class="modal workbench-preview-modal">
+      <div class="modal-title">
+        <div><span class="eyebrow">ASSET PREVIEW</span><h2 id="workbenchPreviewName">素材预览</h2></div>
+        <button type="button" class="modal-close" data-close="workbenchPreviewModal">×</button>
+      </div>
+      <div class="workbench-preview-body"><img id="workbenchPreviewImage" alt="素材预览"></div>
+    </section>
+  </div>
+
+  <!-- 删除素材：影响范围确认 -->
+  <div class="overlay hidden" id="workbenchImpactModal">
+    <section class="modal confirm-modal workbench-impact-modal">
+      <div class="danger-icon">!</div>
+      <h2>这些素材仍被分镜引用</h2>
+      <p id="workbenchImpactSummary">删除会同时解除引用，并移除提示词中对应的 @图片 标记。</p>
+      <div class="workbench-impact-list" id="workbenchImpactList"></div>
+      <div class="modal-actions">
+        <button type="button" class="secondary-action" data-close="workbenchImpactModal">取消</button>
+        <button type="button" class="danger-action" id="workbenchImpactConfirm">解除引用并删除</button>
+      </div>
+    </section>
+  </div>
+
   <div class="toast-region" id="toastRegion"></div>
   <script src="app.js"></script>
   <script src="account-batch-tools.js"></script>
@@ -222,5 +341,6 @@
   <script src="hd-original.js"></script>
   <script src="video-log-shared.js"></script>
   <script src="video-log.js"></script>
+  <script src="workbench.js"></script>
 </body>
 </html>

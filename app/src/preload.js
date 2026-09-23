@@ -1,6 +1,6 @@
 "use strict";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 contextBridge.exposeInMainWorld('managerVideoLogAPI', {
@@ -107,4 +107,54 @@ contextBridge.exposeInMainWorld("managerProxyPoolAPI", {
   test: () => ipcRenderer.invoke("account-proxy-pool:test"),
   apply: () => ipcRenderer.invoke("account-proxy-pool:apply"),
   stop: () => ipcRenderer.invoke("account-proxy-pool:stop"),
+});
+
+contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
+  snapshot: () => ipcRenderer.invoke("workbench:snapshot"),
+  project: {
+    create: (name) => ipcRenderer.invoke("workbench:project-create", name),
+    open: (projectId) => ipcRenderer.invoke("workbench:project-open", projectId),
+    rename: (projectId, name) => ipcRenderer.invoke("workbench:project-rename", projectId, name),
+    remove: (projectId) => ipcRenderer.invoke("workbench:project-delete", projectId),
+    defaults: (projectId, defaults) => ipcRenderer.invoke("workbench:project-defaults", projectId, defaults),
+  },
+  storyboard: {
+    add: (projectId, options) => ipcRenderer.invoke("workbench:storyboard-add", projectId, options),
+    update: (projectId, id, patch) => ipcRenderer.invoke("workbench:storyboard-update", projectId, id, patch),
+    duplicate: (projectId, id) => ipcRenderer.invoke("workbench:storyboard-duplicate", projectId, id),
+    remove: (projectId, id) => ipcRenderer.invoke("workbench:storyboard-delete", projectId, id),
+    reorder: (projectId, ids) => ipcRenderer.invoke("workbench:storyboard-reorder", projectId, ids),
+    bind: (projectId, id, assetId) => ipcRenderer.invoke("workbench:storyboard-bind", projectId, id, assetId),
+    unbind: (projectId, id, assetId) => ipcRenderer.invoke("workbench:storyboard-unbind", projectId, id, assetId),
+  },
+  prompt: {
+    split: (rawText, mode) => ipcRenderer.invoke("workbench:prompt-split", rawText, mode),
+    import: (projectId, items, mode) => ipcRenderer.invoke("workbench:prompt-import", projectId, items, mode),
+  },
+  asset: {
+    importDialog: () => ipcRenderer.invoke("workbench:asset-import-dialog"),
+    importPaths: (projectId, filePaths) => ipcRenderer.invoke("workbench:asset-import-paths", projectId, filePaths),
+    list: (projectId, options) => ipcRenderer.invoke("workbench:asset-list", projectId, options),
+    rename: (projectId, assetId, name) => ipcRenderer.invoke("workbench:asset-rename", projectId, assetId, name),
+    thumb: (projectId, assetId) => ipcRenderer.invoke("workbench:asset-thumb", projectId, assetId),
+    preview: (projectId, assetId) => ipcRenderer.invoke("workbench:asset-preview", projectId, assetId),
+    usages: (projectId, assetIds) => ipcRenderer.invoke("workbench:asset-usages", projectId, assetIds),
+    remove: (projectId, assetIds, resolution) =>
+      ipcRenderer.invoke("workbench:asset-delete", projectId, assetIds, resolution),
+  },
+  ui: {
+    set: (projectId, patch) => ipcRenderer.invoke("workbench:ui-state", projectId, patch),
+  },
+  onChanged: (callback) => ipcRenderer.on("workbench:changed", () => callback()),
+});
+
+// 拖拽导入需要把 File 对象换成真实路径；webUtils.getPathForFile 是 Electron 官方推荐做法
+contextBridge.exposeInMainWorld("managerFileUtils", {
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return "";
+    }
+  },
 });
