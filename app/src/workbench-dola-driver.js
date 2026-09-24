@@ -78,6 +78,11 @@ const PANEL_MAX_ATTEMPTS = envNumber("DBM_PANEL_MAX_ATTEMPTS", 3);
 const PARAM_SETTLE_MS = envNumber("DBM_PARAM_SETTLE_MS", 800);
 // 下拉菜单内容挂载等待：平台负载高时点击后菜单可能 5—8 秒才渲染出来
 const MENU_OPEN_TIMEOUT_MS = envNumber("DBM_MENU_OPEN_TIMEOUT_MS", 10 * 1000);
+// 提示词输入框就绪等待：点击视频生成后 composer 会整段重挂载，
+// 旧编辑器已卸载、新编辑器未挂载的空窗期实测可达数百毫秒
+const EDITOR_READY_TIMEOUT_MS = envNumber("DBM_EDITOR_READY_TIMEOUT_MS", 10 * 1000);
+// 编辑器 DOM 出现后，Tiptap 实例（快速事务写入依赖它）挂上前的等待
+const PM_ATTACH_TIMEOUT_MS = envNumber("DBM_PM_ATTACH_TIMEOUT_MS", 2500);
 const DOLA_HOST_RE = /(^|\.)dola\.com$/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -344,6 +349,9 @@ const HELPERS = `
     fileInput: DOLA_SELECTORS.fileInput,
     atomicMark: DOLA_SELECTORS.atomicMark,
   })};
+  // 写入阶段的等待预算（由主进程环境变量配置，页面内不硬编码）
+  const EDITOR_READY_TIMEOUT_MS = ${EDITOR_READY_TIMEOUT_MS};
+  const PM_ATTACH_TIMEOUT_MS = ${PM_ATTACH_TIMEOUT_MS};
   // 刻意不要求「有非零尺寸」：目标可能是账号非当前选中态时的 webview（被应用隐藏），
   // 那种情况下元素 rect 恒为 0×0，但 DOM 完全可用。这里只排除真正不渲染的节点。
   const visible = (el) => {
@@ -791,9 +799,37 @@ const STEP_CHOOSE_DIAGNOSTIC = `
  */
 const STEP_SET_TEXT = `
   const value = __VALUE__;
-  const list = editors();
-  if (!list.length) return { ok: false, reason: '找不到提示词输入框（可能未登录、页面未加载完成或页面结构已变化）', ...pageInfo() };
+  // 点击「视频生成」后 composer 会整段重挂载：旧编辑器先卸载、新编辑器随后挂载。
+  // 不在空窗期立刻判失败，按预算轮询等待新输入框出现（实测该空窗期正是
+  // att_c9a5fd09685a 报「找不到输入框」的根因）。
+  const editorWaitStart = Date.now();
+  const editorDeadline = editorWaitStart + EDITOR_READY_TIMEOUT_MS;
+  let list = editors();
+  while (!list.length && Date.now() < editorDeadline) {
+    await new Promise(r => setTimeout(r, 150));
+    list = editors();
+  }
+  const editorWaitedMs = Date.now() - editorWaitStart;
+  if (!list.length) {
+    // 刻意不使用含「登录」的措辞：这是页面加载时序问题，runner 不得归类为 AUTH
+    return {
+      ok: false,
+      kind: 'editor-not-ready',
+      editorWaitedMs,
+      reason: '等待 ' + Math.round(EDITOR_READY_TIMEOUT_MS / 1000) + ' 秒后输入区仍未出现可写输入框（页面加载未完成或输入区未切换成功）',
+      ...pageInfo(),
+    };
+  }
   const editor = list[0];
+
+  // DOM 刚出现时 Tiptap 实例可能还没挂上：等它就绪，保证长文本走快速事务通道
+  const pmDeadline = Date.now() + PM_ATTACH_TIMEOUT_MS;
+  while (Date.now() < pmDeadline) {
+    const tipNow = editor.editor;
+    const viewNow = tipNow && (tipNow.view || tipNow.editorView);
+    if (viewNow && typeof viewNow.dispatch === 'function' && viewNow.state && viewNow.state.tr) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
 
   // 路径一：Tiptap 挂在 DOM 节点上的 editor 实例 → PM 事务整段替换
   const writeViaTransaction = () => {
@@ -844,6 +880,7 @@ const STEP_SET_TEXT = `
   return {
     ok: matched,
     writeMethod,
+    editorWaitedMs,
     // 不一致时给出两边开头，便于实机校准（不是猜）
     actualText: strip(readback).slice(0, 120),
     expectedText: strip(value).slice(0, 120),
@@ -1965,7 +2002,13 @@ function createDolaDriver(options = {}) {
       );
       record("setPrompt", textStep);
       if (!textStep?.ok) {
-        return fail(`写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`);
+        // 编辑器一直没出现 = 页面加载时序问题（尚未发送、可安全重试）；
+        // 其余（如回读不一致）不自动重试
+        const transient = textStep.kind === "editor-not-ready";
+        return fail(
+          `写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`,
+          transient ? { retryable: true } : {}
+        );
       }
       // 长提示词事务后浏览器仍在 layout/paint，先让渲染稳定，避免 radix 菜单只切状态不挂载内容
       await sleep(PARAM_SETTLE_MS);
