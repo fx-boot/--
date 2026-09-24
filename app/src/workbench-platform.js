@@ -101,6 +101,14 @@ function assignStoryboards({ storyboardIds = [], accountIds = [], mode = "distri
  */
 const PLATFORM_REPLY_PATTERNS = Object.freeze([
   {
+    // 实测（2026-09-24 真实提交 att_d56d75641fc4，Dola 004）：平台在会话里直接回
+    // 「今天的生成次数已经达到上限，明天再来免费生成吧」。这属于「平台明确拒绝」，
+    // 必须标失败并显示原文，绝不自动重试、也不换模型/换账号重发。
+    code: "QUOTA_EXHAUSTED",
+    re: /生成次数(?:已经)?达到上限|次数已达上限|今日次数(?:已)?用完|额度(?:已)?(?:用完|不足)|明天再来|免费生成次数/i,
+    label: "平台拒绝：该账号今日生成次数已达上限（额度用尽），需等额度恢复",
+  },
+  {
     code: "FACE_UNVERIFIED",
     re: /未认证人脸|肖像保护|未认证.*人脸/i,
     label: "平台拒绝：未认证人脸不支持该模型（可换其它参考图或改用文生视频）",

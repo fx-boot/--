@@ -55,7 +55,11 @@ const TRANSITIONS = Object.freeze({
   succeeded: [],
   failed: ["submitting"], // 仅「重试」时先复位为 submitting，且必须是新尝试；见 retryOf
   manual: ["canceled"],
-  unconfirmed: ["succeeded", "failed", "queued", "generating", "canceled"],
+  // 「提交结果待确认」也必须能走到「需人工处理」：监控窗口到期时轮询就是这么收尾的
+  // （workbench-runner.js pollOnce 的监控超时分支）。旧表漏了 manual，导致该分支
+  // 每次都抛「不允许的状态迁移：提交结果待确认 → 需人工处理」，任务被永久卡在待确认。
+  // 实测：2026-09-24 真实提交 att_d56d75641fc4。
+  unconfirmed: ["succeeded", "failed", "queued", "generating", "canceled", "manual"],
   canceled: [],
 });
 

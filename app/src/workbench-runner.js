@@ -414,6 +414,12 @@ function createRunner(options = {}) {
             applyStatus(r, STATUS.UNCONFIRMED, verified?.message || "提交结果待确认，未再次提交");
             return r;
           });
+          // 「提交结果待确认」同样必须继续监控：平台可能已经受理并生成完成，只是提交时
+          // 没抓到任务 ID。旧实现在这里直接 return、不再安排轮询，于是任务永远停在
+          // 「提交结果待确认」，连平台给出的明确拒绝（如额度用尽）都读不到
+          // （实测 2026-09-24 真实提交 att_d56d75641fc4）。
+          // 监控只读取页面，不会重复提交、也不会换模型重发。
+          schedulePoll(projectId, attemptId, pollBaseMs);
           return;
         }
       } else {
@@ -533,12 +539,29 @@ function createRunner(options = {}) {
   }
 
   // ── 轮询（带退避） ─────────────────────────────────────────
+  /** 连续失败计数：轮询本身出错时用它给重试设上限，避免无限重试 */
+  const pollErrorStreak = new Map();
+  const POLL_ERROR_LIMIT = 5;
+
   function schedulePoll(projectId, attemptId, delayMs) {
     clearTimer(attemptId);
     // 注意：回调必须把 promise 返回出去，否则调度不可等待（测试与关闭流程都无法同步）
     const handle = schedule(() => {
       state.timers.delete(attemptId);
-      return pollOnce(projectId, attemptId).catch((error) => log("poll-error", { attemptId, message: error?.message }));
+      return pollOnce(projectId, attemptId)
+        .then(() => {
+          pollErrorStreak.delete(attemptId);
+        })
+        .catch((error) => {
+          // 实测（2026-09-24，真实提交 att_d56d75641fc4）：旧实现只把异常写进日志、
+          // 不再安排下一次轮询，于是任务永远停在「提交结果待确认」——之后平台即使已经
+          // 给出结果（含明确拒绝）也永远不会被发现。改为：出错后仍继续轮询，
+          // 但连续失败到上限就停手，由界面上的状态提示人工核实。
+          const streak = (pollErrorStreak.get(attemptId) || 0) + 1;
+          pollErrorStreak.set(attemptId, streak);
+          log("poll-error", { attemptId, streak, message: error?.message || String(error) });
+          if (streak < POLL_ERROR_LIMIT) schedulePoll(projectId, attemptId, pollMaxMs);
+        });
     }, Math.max(0, delayMs));
     state.timers.set(attemptId, handle);
   }
@@ -546,7 +569,13 @@ function createRunner(options = {}) {
   async function pollOnce(projectId, attemptId) {
     const record = await loadRecord(projectId, attemptId);
     if (!record || isTerminal(record.status)) return;
-    if (!record.platformTaskId) return;
+    // 有平台任务 ID 时按 ID 核实；没有 ID 的「提交结果待确认」任务同样必须继续监控——
+    // 实测（2026-09-24 真实提交 att_d56d75641fc4）：平台已受理并生成了视频，
+    // 但驱动没在超时窗口内抓到任务 ID，旧逻辑在此直接 return，
+    // 于是工作台永远停在「待确认」、也永远不会转入下载。改为：无 ID 时仍轮询，
+    // 由驱动按「页面上出现本次提示词对应的视频」判定结果（不依赖平台 ID）。
+    const monitorable = Boolean(record.platformTaskId) || record.status === STATUS.UNCONFIRMED;
+    if (!monitorable) return;
 
     const startedAt = Date.parse(record.submittedAt || record.createdAt) || Date.now();
     if (Date.now() - startedAt > pollTimeoutMs) {
@@ -721,22 +750,27 @@ function createRunner(options = {}) {
     for (const projectId of projects) {
       const tasks = await taskStore.list(projectId);
       for (const task of tasks) {
-        if (!isActive(task.status)) continue;
+        // 「提交结果待确认」也要恢复监控：它可能已被平台受理并生成完成，
+        // 只是提交时没抓到平台任务 ID（见 pollOnce 的同类修复）。
+        if (!isActive(task.status) && task.status !== STATUS.UNCONFIRMED) continue;
         if (task.status === STATUS.PENDING) continue;
         const last = Date.parse(task.poll?.lastAt || task.updatedAt || task.createdAt) || 0;
-        if (Date.now() - last > (options.staleMs ?? 5 * 60 * 1000)) {
-          stale.push(task.id);
-          await patch(projectId, task.id, (r) => {
-            r.poll = { ...r.poll, stale: true, message: "重启后长时间无更新，请人工核实" };
-            if (r.status !== STATUS.UNCONFIRMED && r.status !== STATUS.MANUAL) {
-              applyStatus(r, STATUS.MANUAL, "监控异常：重启后长时间无新状态");
-            }
-            return r;
-          });
-        } else {
+        const isUnconfirmed = task.status === STATUS.UNCONFIRMED;
+        // 待确认任务优先恢复监控：它没有任何轮询记录（lastAt 为空），
+        // 若按「长时间无更新」处理就永远不会再被核实，这正是实测踩到的坑。
+        if (isUnconfirmed || Date.now() - last <= (options.staleMs ?? 5 * 60 * 1000)) {
           resumed.push(task.id);
           schedulePoll(projectId, task.id, pollBaseMs);
+          continue;
         }
+        stale.push(task.id);
+        await patch(projectId, task.id, (r) => {
+          r.poll = { ...r.poll, stale: true, message: "重启后长时间无更新，请人工核实" };
+          if (r.status !== STATUS.UNCONFIRMED && r.status !== STATUS.MANUAL) {
+            applyStatus(r, STATUS.MANUAL, "监控异常：重启后长时间无新状态");
+          }
+          return r;
+        });
       }
     }
     return { resumed, stale };

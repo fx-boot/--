@@ -124,6 +124,23 @@ function main() {
   try {
     process.kill(child.pid);
   } catch {}
+  // 关键收尾：探针把 runtime/dev 打包成了「探针入口」，必须换回真实入口，
+  // 否则之后双击启动脚本/直接起 exe 跑的都是探针（2026-09-24 真实事故：
+  // 探针被以 isolation\stable 启动，覆盖了真实账号清单并造出夹具项目）。
+  try {
+    const restored = spawnSync(
+      process.execPath,
+      [path.join(__dirname, "pack-app.cjs"), "--entry-file", path.join(__dirname, "supervised-entry.cjs")],
+      { encoding: "utf8" }
+    );
+    console.log(
+      restored.status === 0
+        ? "── 已把运行时换回真实入口（supervised-entry.cjs） ──"
+        : `── 换回真实入口失败：${restored.stderr || restored.stdout} ──`
+    );
+  } catch (error) {
+    console.log(`── 换回真实入口失败：${error.message} ──`);
+  }
   if (!report) throw new Error(`等待 ${waitSeconds}s 未取得流程报告`);
 
   console.log("── 4/4 复查受监控目录 ──");

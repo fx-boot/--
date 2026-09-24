@@ -389,7 +389,10 @@ const refWarn = platform.validateParams({
   eq("核实不到时标记提交结果待确认", unconfirmedNow.status, "unconfirmed");
   eq("提交只发生一次（未盲目重复提交）", calls.submit, 1);
   eq("确实做了核实", calls.verify, 1);
-  check("没有安排轮询", unknownSched.size === 0, { size: unknownSched.size });
+  // 待确认任务必须继续被监控：平台可能已受理并生成完成，或已明确拒绝（额度用尽等）。
+  // 旧实现在这里不再安排轮询，任务就永远停在待确认（实测 2026-09-24）。
+  check("待确认任务继续被监控（安排了轮询）", unknownSched.size >= 1, { size: unknownSched.size });
+  eq("仍然只提交一次（监控不等于重发）", calls.submit, 1);
 
   console.log("── 编排：提交超时但核实到成功 ──");
   const verifyRunner = createRunner({
@@ -1192,6 +1195,13 @@ const refWarn = platform.validateParams({
     "This is a very long, highly specified 13-shot underwater narrative. I can generate it, but it's too extensive for a single turn.Please confirm one of these options: A. Generate a 15-second ..."
   );
   eq("提示词过长要求确认也被识别", needConfirm?.code, "NEED_CONFIRM");
+  // 实测（2026-09-24 真实提交 att_d56d75641fc4，Dola 004）：平台回
+  // 「今天的生成次数已经达到上限，明天再来免费生成吧」——必须判失败并带原文，
+  // 不能停在「提交结果待确认」，也不能自动重试。
+  const quota = platform.classifyPlatformReply("今天的生成次数已经达到上限，明天再来免费生成吧");
+  eq("平台额度用尽被识别为明确拒绝", quota?.code, "QUOTA_EXHAUSTED");
+  check("额度拒绝带上平台原文", /明天再来/.test(quota?.excerpt || ""), quota?.excerpt);
+  eq("额度不足的其它说法也能识别", platform.classifyPlatformReply("当前额度不足，请稍后再试")?.code, "QUOTA_EXHAUSTED");
   eq("正常回复不会被误判为拒绝", platform.classifyPlatformReply("正在为你生成视频，请稍候"), null);
   eq("空文本不臆断", platform.classifyPlatformReply(""), null);
 
@@ -1224,6 +1234,49 @@ const refWarn = platform.validateParams({
     /guidance-input/.test(driverSrc) && /image-wrapper/.test(driverSrc) && !/document\.querySelectorAll\('img'\)/.test(driverSrc)
   );
   check("逐张上传并等待每张完成，失败只补传缺失的那张", /files: \[item\.filePath\]/.test(driverSrc) && /failed\.push\(item\)/.test(driverSrc));
+
+  // 页面脚本是「HELPERS + STEP_xxx」拼成同一段脚本执行的，因此每个 STEP 脚本的顶层
+  // 声明都不能与 HELPERS 重名 —— 重名会让整段脚本抛 SyntaxError，而 executeJavaScript
+  // 只回一句「Script failed to execute」，实机极难定位。
+  // 实测 2026-09-24：STEP_READ_RESULT 里写了 const norm，与 HELPERS 的 norm 冲突，
+  // 导致 poll 一直失败、任务永远停在「提交结果待确认」。
+  {
+    const BT = String.fromCharCode(96);
+    const lines = driverSrc.split("\n");
+    const readBlock = (name) => {
+      const start = lines.findIndex((l) => l.startsWith("const " + name + " = " + BT));
+      if (start < 0) return null;
+      const body = [];
+      for (let i = start + 1; i < lines.length; i++) {
+        if (lines[i].trim() === BT + ";") return body.join("\n");
+        body.push(lines[i]);
+      }
+      return null;
+    };
+    // 只取「缩进不超过 2 空格」的顶层声明（IIFE 内部的更深缩进自动排除）
+    const topLevelNames = (src) => {
+      const names = new Set();
+      for (const line of String(src || "").split("\n")) {
+        const m = /^( {0,2})(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/.exec(line);
+        if (m) names.add(m[2]);
+      }
+      return names;
+    };
+    const helpersNames = topLevelNames(readBlock("HELPERS"));
+    check("能解析出 HELPERS 的顶层标识符（测试自身有效）", helpersNames.size >= 8, helpersNames.size);
+    const stepNames = lines
+      .filter((l) => /^const STEP_[A-Z_]+ = /.test(l))
+      .map((l) => l.slice("const ".length, l.indexOf(" = ")));
+    const conflicts = [];
+    for (const name of stepNames) {
+      const body = readBlock(name);
+      if (body === null) continue;
+      for (const declared of topLevelNames(body)) {
+        if (helpersNames.has(declared)) conflicts.push(`${name}.${declared}`);
+      }
+    }
+    check(`页面脚本不与 HELPERS 重名（检查了 ${stepNames.length} 段脚本）`, conflicts.length === 0, conflicts);
+  }
   check("同一账号的上传与提交有互斥锁（不同账号可并发）", /withAccountLock/.test(driverSrc));
   check("提交前复核附件数量/顺序/编号标注", /missingCount/.test(driverSrc) && /extraCount/.test(driverSrc) && /orderMatched/.test(driverSrc));
 
@@ -1459,6 +1512,144 @@ const refWarn = platform.validateParams({
   eq("只出现“消耗额度”时算弱信号", platform.classifyAcceptance("本次将消耗 1 个额度")?.strength, "hint");
   eq("普通回复不会被当成受理", platform.classifyAcceptance("有什么我可以帮你的吗"), null);
   eq("生成中字样被识别为强受理信号", platform.classifyAcceptance("正在生成视频，请稍候")?.strength, "accepted");
+
+  // 14.8 轮询自身出错不能让监控永久停摆
+  // 实测（2026-09-24 真实提交 att_d56d75641fc4）：该任务的 poll 在 20:46:20 之后
+  // 再无任何写入（nextAt 已过期、count 停在 43），界面永远停在「提交结果待确认」，
+  // 之后平台即使已经给出结果也永远不会被发现。旧实现只把异常写进日志、不再安排下一次轮询。
+  {
+    const errStore = task.createTaskStore((id) => path.join(root, "pollerr-" + id));
+    const errSched = createFakeScheduler();
+    let pollCalls = 0;
+    const errRunner = createRunner({
+      taskStore: errStore,
+      driver: {
+        async submit() {
+          return { outcome: "ok", platformTaskId: "pt_pollerr", accepted: true, state: "queued", message: "已取得任务 ID" };
+        },
+        async poll() {
+          pollCalls++;
+          if (pollCalls === 1) throw new Error("任务记录不存在");
+          return { state: "succeeded", result: { videoUrl: "https://example.com/pollerr.mp4" } };
+        },
+      },
+      capabilities: CAPS,
+      schedule: errSched.schedule,
+      cancelSchedule: errSched.cancel,
+      resolveAssets: async () => new Map(),
+      listProjectIds: async () => ["prj_pollerr"],
+      pollBaseMs: 0,
+      pollMaxMs: 0,
+    });
+    const errAttempt = await errRunner.enqueue({
+      projectId: "prj_pollerr",
+      storyboardId: "sb_pollerr",
+      accountId: "acc_1",
+      params: RETRY_PARAMS,
+      refs: [],
+    });
+    await errRunner.execute("prj_pollerr", errAttempt.id);
+    await errSched.flush(12);
+    const errNow = (await errStore.list("prj_pollerr")).find((t) => t.id === errAttempt.id);
+    check("轮询抛错后仍会继续轮询", pollCalls >= 2, pollCalls);
+    eq("轮询抛错不再让任务永远停在待确认", errNow.status, "succeeded");
+  }
+
+  // 14.9 轮询阶段读到平台明确拒绝：带上平台原文、不自动重试
+  {
+    const rejStore = task.createTaskStore((id) => path.join(root, "pollrej-" + id));
+    const rejSched = createFakeScheduler();
+    const rejectText = "今天的生成次数已经达到上限，明天再来免费生成吧";
+    const rule = platform.classifyPlatformReply(rejectText);
+    const rejRunner = createRunner({
+      taskStore: rejStore,
+      driver: {
+        async submit() {
+          return { outcome: "ok", platformTaskId: "pt_pollrej", accepted: true, state: "queued", message: "已取得任务 ID" };
+        },
+        async poll() {
+          return {
+            state: "failed",
+            errorCode: rule.code,
+            message: `${rule.label}；平台原文：${rule.excerpt}`,
+            evidence: { kind: "platform-reply", code: rule.code, excerpt: rule.excerpt },
+          };
+        },
+      },
+      capabilities: CAPS,
+      schedule: rejSched.schedule,
+      cancelSchedule: rejSched.cancel,
+      resolveAssets: async () => new Map(),
+      listProjectIds: async () => ["prj_pollrej"],
+      pollBaseMs: 0,
+      pollMaxMs: 0,
+    });
+    const rejAttempt = await rejRunner.enqueue({
+      projectId: "prj_pollrej",
+      storyboardId: "sb_pollrej",
+      accountId: "acc_quota",
+      params: RETRY_PARAMS,
+      refs: [],
+    });
+    await rejRunner.execute("prj_pollrej", rejAttempt.id);
+    await rejSched.flush(12);
+    const rejNow = (await rejStore.list("prj_pollrej")).find((t) => t.id === rejAttempt.id);
+    check("平台明确拒绝时任务离开监控态（不再停在待确认）", ["failed", "manual"].includes(rejNow.status), rejNow.status);
+    eq("错误码为额度用尽", rejNow.error?.code, "QUOTA_EXHAUSTED");
+    check("界面上能看到平台原文", /明天再来/.test(rejNow.error?.message || ""), rejNow.error);
+    eq("额度类拒绝不自动重试", rejNow.autoRetry?.count, undefined);
+    check("额度类拒绝会暂停该账号，避免继续消耗", rejRunner.status().blockedAccounts.some((b) => b.accountId === "acc_quota"), rejRunner.status().blockedAccounts);
+  }
+
+  // 14.10 监控窗口到期：待确认任务必须能收尾
+  // 实测（2026-09-24 真实提交 att_d56d75641fc4）：该任务停在「提交结果待确认」，
+  // 轮询次数冻结在 43、nextAt 早已过期，界面永远不再变化。
+  // 根因：pollOnce 的监控超时分支请求 unconfirmed → manual，而迁移表里没有这一条，
+  // applyStatus 每次都抛「不允许的状态迁移」，任务被永久卡在待确认。
+  {
+    check("待确认 → 需人工处理 是合法迁移", task.canTransition("unconfirmed", "manual"));
+    const toStore = task.createTaskStore((id) => path.join(root, "pollto-" + id));
+    const toSched = createFakeScheduler();
+    let toPollCalls = 0;
+    const toRunner = createRunner({
+      taskStore: toStore,
+      driver: {
+        async submit() {
+          return { outcome: "unknown", message: "响应超时，未取得任务 ID" };
+        },
+        async verifySubmission() {
+          return { found: false, message: "未在平台找到该任务" };
+        },
+        async poll() {
+          toPollCalls++;
+          return { state: "unknown", message: "消息里还没有视频" };
+        },
+      },
+      capabilities: CAPS,
+      schedule: toSched.schedule,
+      cancelSchedule: toSched.cancel,
+      resolveAssets: async () => new Map(),
+      listProjectIds: async () => ["prj_pollto"],
+      pollBaseMs: 0,
+      pollMaxMs: 0,
+      pollTimeoutMs: 0, // 立刻视为已超过监控窗口
+    });
+    const toAttempt = await toRunner.enqueue({
+      projectId: "prj_pollto",
+      storyboardId: "sb_pollto",
+      accountId: "acc_1",
+      params: RETRY_PARAMS,
+      refs: [],
+    });
+    await toRunner.execute("prj_pollto", toAttempt.id);
+    await toSched.flush(12);
+    const toNow = (await toStore.list("prj_pollto")).find((t) => t.id === toAttempt.id);
+    eq("监控窗口到期后待确认任务转入需人工处理", toNow.status, "manual");
+    check("不再停留在待确认", toNow.status !== "unconfirmed");
+    check("给出人工核实提示", /人工核实|监控超时/.test(toNow.history[toNow.history.length - 1]?.note || ""), toNow.history[toNow.history.length - 1]);
+    eq("到期后不再继续轮询", toPollCalls, 0);
+    eq("不自动重试", toNow.autoRetry?.count, undefined);
+  }
 
   // ══ 15. 多账号并行（第二/三项验收重点） ══
   console.log("── 多账号并行与账号隔离 ──");

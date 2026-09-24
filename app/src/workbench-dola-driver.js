@@ -823,35 +823,48 @@ const STEP_READ_REPLIES = `
  * 读取本次生成结果（用于「生成成功」的判定与下载源解析）。
  * 匹配规则刻意保守：只在消息文本里出现「本次写入平台的提示词」时才认，避免把历史视频算到本次头上。
  * 同时回报视频地址与消息标识；地址取不到就如实返回空，由上层标成「未取得结果地址」。
+ *
+ * ⚠ 必须用 IIFE 隔离作用域：HELPERS 里已经声明了 norm / SEL / editors 等顶层标识符，
+ *   直接写同名 const 会让整段页面脚本抛 SyntaxError（实测 2026-09-24：
+ *   poll 一直报「页面脚本执行失败」，真实原因是 `Identifier 'norm' has already been declared`）。
  */
 const STEP_READ_RESULT = `
-  const wanted = __TEXT__;
-  const norm = (s) => String(s || '').replace(/\\s+/g, '');
-  const key = norm(wanted).slice(0, 48);
-  const nodes = [...document.querySelectorAll('[data-message-id]')];
-  const hits = [];
-  for (const node of nodes) {
-    const text = norm(node.innerText || node.textContent || '');
-    if (!key || !text.includes(key)) continue;
-    const video = node.querySelector('video');
-    const src = video ? (video.currentSrc || video.src || video.querySelector('source')?.src || '') : '';
-    hits.push({
-      messageId: String(node.getAttribute('data-message-id') || '').slice(0, 60),
-      hasVideo: Boolean(video),
-      videoUrl: String(src || '').slice(0, 4000),
-      tail: String(node.innerText || '').replace(/\\s+/g, ' ').slice(-90),
+  return (() => {
+    const wanted = __TEXT__;
+    const normText = (s) => String(s || '').replace(/\\s+/g, '');
+    const key = normText(wanted).slice(0, 48);
+    const nodes = [...document.querySelectorAll('[data-message-id]')];
+    const items = nodes.map((node) => {
+      const video = node.querySelector('video');
+      return {
+        messageId: String(node.getAttribute('data-message-id') || '').slice(0, 60),
+        text: String(node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300),
+        hasVideo: Boolean(video),
+        videoUrl: String(video ? (video.currentSrc || video.src || video.querySelector('source')?.src || '') : '').slice(0, 4000),
+      };
     });
-  }
-  const withVideo = hits.filter(h => h.hasVideo);
-  const newest = (withVideo.length ? withVideo : hits).slice(-1)[0] || null;
-  return {
-    ok: true,
-    matched: hits.length,
-    withVideo: withVideo.length,
-    newest,
-    videoCount: document.querySelectorAll('video').length,
-    url: location.href,
-  };
+    // 本次提交对应的用户消息 = 最后一条包含本次提示词的消息；
+    // 其后的消息就是平台对本次请求的回复（视频、拒绝说明或生成中提示）。
+    let userIndex = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (key && normText(items[i].text).includes(key)) userIndex = i;
+    }
+    const replies = userIndex >= 0 ? items.slice(userIndex + 1) : [];
+    const scope = replies.length ? replies : items;
+    const withVideo = scope.filter(it => it.hasVideo);
+    const newest = withVideo.slice(-1)[0] || scope[scope.length - 1] || null;
+    return {
+      ok: true,
+      matched: userIndex >= 0 ? 1 : 0,
+      userIndex,
+      replies: replies.map(it => it.text).slice(0, 6),
+      hasVideo: withVideo.length > 0,
+      videoUrl: withVideo.length ? withVideo[withVideo.length - 1].videoUrl : '',
+      newest,
+      videoCount: document.querySelectorAll('video').length,
+      url: location.href,
+    };
+  })();
 `;
 
 /**
@@ -1759,7 +1772,7 @@ function createDolaDriver(options = {}) {
       };
     },
 
-    /** 读取本次生成结果：按「本次写入平台的提示词」在消息里匹配，取到视频地址才算数 */
+    /** 读取本次生成结果：按「本次写入平台的提示词」在消息里匹配，并带回平台对该请求的回复 */
     async readResult({ accountId, attempt }) {
       let contents;
       try {
@@ -1771,16 +1784,23 @@ function createDolaDriver(options = {}) {
       const text = prompt ? toPlatformText(buildSegments(prompt, attempt?.refs || [], new Map())) : "";
       const step = await evaluate(contents, STEP_READ_RESULT.replace("__TEXT__", JSON.stringify(text || ""))).catch(() => null);
       if (!step?.ok) return { found: false, reason: step?.reason || "页面状态不可读取" };
-      const newest = step.newest || null;
       return {
-        found: Boolean(newest?.hasVideo && newest?.videoUrl),
+        found: Boolean(step.hasVideo && step.videoUrl),
         matched: step.matched,
-        withVideo: step.withVideo,
+        userIndex: step.userIndex,
+        replies: step.replies || [],
+        hasVideo: Boolean(step.hasVideo),
         videoCount: step.videoCount,
-        videoUrl: String(newest?.videoUrl || ""),
-        messageId: String(newest?.messageId || ""),
-        tail: String(newest?.tail || ""),
-        reason: newest ? (newest.hasVideo ? "找到本次提示词对应的视频" : "消息里还没有视频") : "页面上没有找到本次提示词对应的消息",
+        videoUrl: String(step.videoUrl || ""),
+        messageId: String(step.newest?.messageId || ""),
+        tail: String(step.newest?.text || ""),
+        reason: step.matched
+          ? step.hasVideo
+            ? "找到本次提示词对应的视频"
+            : (step.replies || []).length
+              ? "本次消息之后有平台回复，但没有视频"
+              : "本次消息之后平台还没有回复"
+          : "页面上没有找到本次提示词对应的消息",
       };
     },
 
@@ -1802,14 +1822,26 @@ function createDolaDriver(options = {}) {
           evidence: { kind: "result-visible", messageId: result.messageId, matched: result.matched },
         };
       }
+      // 平台对本次请求的明确回复优先于页面泛文本：拒绝类必须标失败并带原文，
+      // 实测（2026-09-24）：平台回「今天的生成次数已经达到上限」，旧逻辑会一直停在「待确认」。
+      const replyText = (result?.replies || []).join("\n");
+      const replyRule = replyText ? classifyPlatformReply(replyText) : null;
+      if (replyRule) {
+        return {
+          state: "failed",
+          errorCode: replyRule.code,
+          message: `${replyRule.label}；平台原文：${replyRule.excerpt}`,
+          evidence: { kind: "platform-reply", code: replyRule.code, excerpt: replyRule.excerpt },
+        };
+      }
+      if (/生成中|排队|正在生成|马上就好|请稍等/.test(replyText)) {
+        return { state: "generating", message: "平台回复显示正在生成", canCancel: false };
+      }
       const read = await evaluate(contents, STEP_READ_STATE).catch(() => null);
       if (!read?.ok) return { state: "unknown", message: "页面状态不可读取" };
       const pageText = String(read.text || "");
-      if (/生成失败|失败|违规|未通过/.test(pageText) && !/生成中|排队/.test(pageText)) {
+      if (/生成失败|违规|未通过/.test(pageText) && !/生成中|排队/.test(pageText)) {
         return { state: "failed", message: "页面显示生成失败", errorCode: "GENERATE_FAILED" };
-      }
-      if (/生成中|排队/.test(pageText)) {
-        return { state: "generating", message: "页面显示正在生成", canCancel: false };
       }
       return {
         state: "unknown",

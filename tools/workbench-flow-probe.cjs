@@ -21,6 +21,15 @@ const exeDir = path.dirname(process.execPath);
 const isolatedRoot = path.resolve(
   process.env.DBM_ISOLATED_ROOT || path.join(exeDir, "flow-probe-data")
 );
+
+// 护栏（2026-09-24 真实事故）：本探针会把占位账号写进 appDataDir。
+// 一旦它被以「正式隔离根」（isolation\stable）启动（例如探针打包后未换回真实入口，
+// 又用启动脚本拉起），就会覆盖用户真实账号清单、并在真实数据里造夹具项目。
+// 因此：显式指定隔离根时，只允许 flow-*/probe-* 这类一次性目录。
+if (process.env.DBM_ISOLATED_ROOT && !/[/\\](flow|probe)-[^/\\]+$/.test(isolatedRoot)) {
+  console.error(`[探针护栏] 拒绝在非一次性隔离根运行：${isolatedRoot}（会覆盖真实账号清单）`);
+  process.exit(2);
+}
 const appDataDir = path.join(isolatedRoot, "DoubaoAccountManager");
 const reportPath = path.join(exeDir, "flow-probe-report.json");
 
