@@ -39,7 +39,10 @@ function classifyBlock(message) {
 /** 每一步的可见说明：优先取失败原因 / 实际命中项，并补上主进程侧的页面事实 */
 function stepDetail(s) {
   const bits = [];
-  if (s?.reason) bits.push(String(s.reason));
+  // panelStage / 显式带 detail 的步骤：原样展示（六控件状态、阶段、耗时），
+  // 否则下面规则认不出 panelStage 会落成空串。
+  if (s?.detail) bits.push(String(s.detail));
+  else if (s?.reason) bits.push(String(s.reason));
   else if (s?.skipped) bits.push("已跳过");
   else if (s?.clicked) bits.push(`命中控件：${s.clicked}`);
   else if (s?.picked && s?.after) bits.push(`已选择 ${s.picked}（回读 ${s.after}）`);

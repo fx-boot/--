@@ -120,7 +120,9 @@
           accountsError: snapshot.accountsError || null,
           tasks: snapshot.tasks || [],
           queue: snapshot.queue || null,
+          appVersion: snapshot.appVersion || null,
         });
+        applyVersion();
       } catch (error) {
         toast(`读取工作台数据失败：${error.message}`, "error");
         return;
@@ -787,9 +789,15 @@
   const STEP_LABEL = {
     openPage: "定位账号页面",
     waitReady: "等待页面就绪",
+    reactivatePage: "重新激活隐藏页面",
+    webviewGone: "页面被卸载，等待恢复",
+    panelStage: "面板加载阶段",
     enterVideoMode: "进入视频生成模式",
+    waitComposer: "等待面板控件齐全",
+    attachmentsPre: "读取输入区状态",
     clearAttachments: "清空残留参考图",
     setPrompt: "写入提示词",
+    setPromptAfterUpload: "上传后重新写入提示词",
     chooseModel: "选择模型",
     chooseDuration: "选择时长",
     chooseRatio: "设置比例",
@@ -1728,6 +1736,10 @@
       applyLayout({ tasksCollapsed: collapsed });
     });
     bindSplitters();
+    $("workbenchVersionLog")?.addEventListener("click", () => {
+      renderChangelog();
+      $("workbenchChangelogModal")?.classList.remove("hidden");
+    });
   }
 
   // ── 三栏布局：拖拽分隔条 + 折叠状态本地保存 ────────────────
@@ -1747,7 +1759,7 @@
     return next;
   };
 
-  /** 应用（并记住）栏宽与折叠状态；默认 264 / 336，与既有观感一致 */
+  /** 应用（并记住）栏宽与折叠状态；默认 280 / 372（可拖拽、双击复位） */
   function applyLayout(patch = {}) {
     const body = document.querySelector(".workbench-body");
     if (!body) return;
@@ -1767,8 +1779,8 @@
     const body = document.querySelector(".workbench-body");
     if (!body) return;
     for (const [id, side, min, max] of [
-      ["workbenchSplitAssets", "left", 180, 460],
-      ["workbenchSplitTasks", "right", 260, 560],
+      ["workbenchSplitAssets", "left", 200, 520],
+      ["workbenchSplitTasks", "right", 280, 640],
     ]) {
       const bar = $(id);
       if (!bar || bar.dataset.bound === "1") continue;
@@ -1790,7 +1802,7 @@
         const computed = getComputedStyle(body).gridTemplateColumns.split(" ").map((v) => parseFloat(v) || 0);
         // 以实际渲染宽度落盘（第 1 列=素材，第 5 列=任务）
         applyLayout(
-          side === "left" ? { assetsWidth: Math.round(computed[0] || 264) } : { tasksWidth: Math.round(computed[4] || 336) }
+          side === "left" ? { assetsWidth: Math.round(computed[0] || 280) } : { tasksWidth: Math.round(computed[4] || 372) }
         );
       };
       bar.addEventListener("pointerdown", (event) => {
@@ -1802,12 +1814,12 @@
       bar.addEventListener("pointermove", move);
       bar.addEventListener("pointerup", up);
       bar.addEventListener("pointercancel", up);
-      bar.addEventListener("dblclick", () => applyLayout(side === "left" ? { assetsWidth: 264 } : { tasksWidth: 336 }));
+      bar.addEventListener("dblclick", () => applyLayout(side === "left" ? { assetsWidth: 280 } : { tasksWidth: 372 }));
       bar.addEventListener("keydown", (event) => {
         // 键盘可达性：左右方向键微调 16px
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
         const layout = readLayout();
-        const current = Number(side === "left" ? layout.assetsWidth : layout.tasksWidth) || (side === "left" ? 264 : 336);
+        const current = Number(side === "left" ? layout.assetsWidth : layout.tasksWidth) || (side === "left" ? 280 : 372);
         const delta = (event.key === "ArrowRight" ? 16 : -16) * (side === "left" ? 1 : -1);
         event.preventDefault();
         applyLayout(side === "left" ? { assetsWidth: Math.max(min, Math.min(max, current + delta)) } : { tasksWidth: Math.max(min, Math.min(max, current + delta)) });
@@ -1817,6 +1829,66 @@
 
   function renderAssetsCollapse() {
     applyLayout({ assetsCollapsed: state.assetsCollapsed === true });
+  }
+
+  // ── 版本号与更新日志 ───────────────────────────────────────
+  const escapeVersionText = (value) =>
+    String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  /** 标题处版本徽标：固定展示 v主.次.补丁，悬停查看渠道/发布/Git/构建信息 */
+  function applyVersion() {
+    const info = state.appVersion;
+    const badge = $("workbenchVersion");
+    if (!badge) return;
+    badge.textContent = info?.display || "v—";
+    const facts = [];
+    if (info?.channel) facts.push(`渠道：${info.channel}`);
+    if (info?.releasedAt) facts.push(`发布：${info.releasedAt}`);
+    if (info?.gitCommit) facts.push(`Git 提交：${info.gitCommit}`);
+    if (info?.buildAt) facts.push(`构建时间：${info.buildAt}`);
+    badge.title = info
+      ? `当前版本 ${info.display}${facts.length ? `\n${facts.join("\n")}` : ""}`
+      : "当前版本（语义化版本）";
+  }
+
+  /** 更新日志弹窗：当前版本更新摘要 + 构建信息 + 历史版本记录 */
+  function renderChangelog() {
+    const host = $("workbenchChangelogBody");
+    if (!host) return;
+    const info = state.appVersion;
+    if (!info) {
+      host.textContent = "版本信息不可用";
+      return;
+    }
+    const listItems = (items) =>
+      (items || []).map((text) => `<li>${escapeVersionText(text)}</li>`).join("");
+    const meta = [
+      `发布日期：${info.releasedAt || "—"}`,
+      `渠道：${info.channel || "—"}`,
+    ];
+    if (info.gitCommit) meta.push(`Git 提交：${info.gitCommit}`);
+    if (info.buildAt) meta.push(`构建时间：${info.buildAt}`);
+    if (info.buildChannel) meta.push(`构建渠道：${info.buildChannel}`);
+    const history = (info.history || [])
+      .map(
+        (entry) =>
+          `<section class="workbench-changelog-entry">
+             <h3>v${escapeVersionText(entry.version || "")}<em>${escapeVersionText(entry.date || "")}</em></h3>
+             <ul>${listItems(entry.notes)}</ul>
+           </section>`
+      )
+      .join("");
+    host.innerHTML =
+      `<section class="workbench-changelog-entry is-current">
+         <h3>${escapeVersionText(info.display)}<em>当前版本</em></h3>
+         <p class="workbench-changelog-meta">${meta.map(escapeVersionText).join(" · ")}</p>
+         <ul>${listItems(info.notes)}</ul>
+       </section>` + history;
   }
 
   // ── 分镜 ─────────────────────────────────────────────────

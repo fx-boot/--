@@ -23,6 +23,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { execSync } = require("node:child_process");
 
 const args = process.argv.slice(2);
 function argValue(flag, fallback = "") {
@@ -38,6 +39,8 @@ const targetDir = argValue("--target", "") ? path.resolve(argValue("--target")) 
 const entry = argValue("--entry", "");
 const entryFile = argValue("--entry-file", "");
 const patchExe = has("--patch-exe");
+// 构建渠道：dev（隔离开发版，默认）/ release（正式发布版）；仅写入包内副本，不污染源码
+const buildChannel = argValue("--channel", "dev");
 
 const EXE_NAME = "豆包管理器.exe";
 const INTEGRITY_MARKER = '[{"file":"resources\\\\app.asar","alg":"SHA256","value":"';
@@ -49,6 +52,18 @@ const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 function assertNotInstallDir(dir) {
   if (/完整便携版/.test(dir) || /安装版/.test(dir)) {
     throw new Error(`拒绝写入疑似安装版目录：${dir}（请使用 runtime/dev 等副本目录）`);
+  }
+}
+
+/** 读取当前 Git 短提交号（失败时返回空串，不阻断打包） */
+function gitShortCommit() {
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).toString("utf8").trim();
+  } catch {
+    return "";
   }
 }
 
@@ -79,7 +94,7 @@ function buildTree(files) {
   return root;
 }
 
-function buildArchive({ files, unpackedDir, entryOverride }) {
+function buildArchive({ files, unpackedDir, entryOverride, stamp }) {
   const embedded = [];
   const index = { files: {} };
   let offset = 0;
@@ -99,6 +114,16 @@ function buildArchive({ files, unpackedDir, entryOverride }) {
       const pkg = JSON.parse(data.toString("utf8"));
       pkg.main = entryOverride;
       data = Buffer.from(JSON.stringify(pkg), "utf8");
+      f.rewritten = true;
+    }
+    // 版本构建戳：只改包内副本，源码 app/version.json 保持干净。
+    // 界面通过 snapshot 读到 buildAt / buildChannel / gitCommit，可区分不同构建包。
+    if (stamp && f.rel === "version.json") {
+      const info = JSON.parse(data.toString("utf8"));
+      info.buildAt = stamp.buildAt;
+      info.buildChannel = stamp.buildChannel;
+      if (stamp.gitCommit) info.gitCommit = stamp.gitCommit;
+      data = Buffer.from(JSON.stringify(info, null, 2), "utf8");
       f.rewritten = true;
     }
     f.data = data;
@@ -204,7 +229,12 @@ function main() {
 
   // node_modules 必须随包发布；png/pem 等一并包含，不做白名单
   const unpackedDir = path.join(runtimeDir, "resources", "app.asar.unpacked");
-  const { archive, headerBuf, count } = buildArchive({ files: all, unpackedDir, entryOverride });
+  const stamp = {
+    buildAt: new Date().toISOString(),
+    buildChannel,
+    gitCommit: gitShortCommit(),
+  };
+  const { archive, headerBuf, count } = buildArchive({ files: all, unpackedDir, entryOverride, stamp });
 
   // 结构自检先于落盘：一旦偏移/内容不一致就直接失败，不产出坏包
   const selfCheck = verifyArchive(archive, { files: all });
@@ -218,7 +248,14 @@ function main() {
   fs.writeFileSync(temp, archive);
   fs.renameSync(temp, outAsar);
 
+  const sourceVersion = JSON.parse(
+    fs.readFileSync(path.join(sourceDir, "version.json"), "utf8")
+  );
   const result = {
+    version: `v${sourceVersion.version}`,
+    channel: buildChannel,
+    gitCommit: stamp.gitCommit || "(无)",
+    buildAt: stamp.buildAt,
     source: sourceDir,
     asar: outAsar,
     files: count,

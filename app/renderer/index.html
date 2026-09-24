@@ -224,13 +224,14 @@
       <div class="modal-title">
         <div>
           <span class="eyebrow">STORYBOARD WORKBENCH</span>
-          <h2>视频分镜工作台</h2>
+          <h2>视频分镜工作台 <span class="workbench-version-badge" id="workbenchVersion" title="当前版本（语义化版本）">v—</span></h2>
           <p id="workbenchStorage">数据目录读取中…</p>
         </div>
         <div class="workbench-title-actions">
           <select id="workbenchProjectSelect" aria-label="选择项目"></select>
           <button type="button" class="secondary-action compact" id="workbenchProjectNew">新建项目</button>
           <button type="button" class="secondary-action compact" id="workbenchProjectRename">重命名</button>
+          <button type="button" class="text-button workbench-changelog-btn" id="workbenchVersionLog">更新日志</button>
           <button type="button" class="modal-close" data-close="workbenchModal">×</button>
         </div>
       </div>
@@ -410,6 +411,17 @@
         <button type="button" class="secondary-action" data-close="workbenchImpactModal">取消</button>
         <button type="button" class="danger-action" id="workbenchImpactConfirm">解除引用并删除</button>
       </div>
+    </section>
+  </div>
+
+  <!-- 版本更新日志（简易记录：当前版本更新摘要 + 构建信息） -->
+  <div class="overlay hidden" id="workbenchChangelogModal">
+    <section class="modal workbench-changelog-modal">
+      <div class="modal-title">
+        <h2>版本更新日志</h2>
+        <button type="button" class="modal-close" data-close="workbenchChangelogModal">×</button>
+      </div>
+      <div class="workbench-changelog-body" id="workbenchChangelogBody">读取中…</div>
     </section>
   </div>
 

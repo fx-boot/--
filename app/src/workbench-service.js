@@ -28,6 +28,23 @@ const { createAssets, MAX_BYTES } = require("./workbench-assets");
 const { createTaskService } = require("./workbench-task-service");
 const { DOWNLOAD_LABEL, STATUS_LABEL } = require("./workbench-task-store");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
+
+// 版本信息：源码内置 app/version.json；打包 app.asar 时 pack-app.cjs 会在包内副本上
+// 追加 buildAt / buildChannel / gitCommit（源码文件保持干净），require 直接拿到嵌入结果。
+const VERSION_INFO = require("../version.json");
+function appVersion() {
+  return {
+    version: String(VERSION_INFO.version || "0.0.0"),
+    display: `v${String(VERSION_INFO.version || "0.0.0")}`,
+    channel: String(VERSION_INFO.channel || "dev"),
+    releasedAt: String(VERSION_INFO.releasedAt || ""),
+    notes: Array.isArray(VERSION_INFO.notes) ? VERSION_INFO.notes : [],
+    history: Array.isArray(VERSION_INFO.history) ? VERSION_INFO.history : [],
+    buildAt: VERSION_INFO.buildAt ? String(VERSION_INFO.buildAt) : "",
+    buildChannel: VERSION_INFO.buildChannel ? String(VERSION_INFO.buildChannel) : "",
+    gitCommit: VERSION_INFO.gitCommit ? String(VERSION_INFO.gitCommit) : "",
+  };
+}
 const { describeCapabilities, ratioOptionsFor } = require("./workbench-platform");
 
 const CHANGED = "workbench:changed";
@@ -218,6 +235,8 @@ async function snapshot() {
     project,
     assets: assetList,
     capabilities: VIDEO_CAPABILITIES,
+    // 版本信息随快照下发：界面固定展示版本号，更新日志弹窗读取同一份数据
+    appVersion: appVersion(),
     // 能力视图：模型菜单文案、实测时间、哪些项仍未核实，界面直接用它渲染，避免前端自己判断
     capabilityView: describeCapabilities(VIDEO_CAPABILITIES, "dola"),
     // 比例候选：来自实测的 platform.ratios，不再是「常见值」

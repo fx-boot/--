@@ -42,19 +42,42 @@
  */
 
 const { webContents, session } = require("electron");
-const { DOLA_SELECTORS, buildSegments, classifyAcceptance, classifyPlatformReply, toPlatformText } = require("./workbench-platform");
+const {
+  DOLA_SELECTORS,
+  PLATFORM_REPLY_PATTERNS,
+  buildSegments,
+  classifyAcceptance,
+  classifyPlatformReply,
+  toPlatformText,
+} = require("./workbench-platform");
 
 const PARTITION_PREFIX = "persist:doubao-manager-";
+// 环境变量可覆盖所有等待上限（不再硬编码）：数值必须为正整数，单位毫秒。
+// 例：DBM_EVAL_TIMEOUT_MS=60000
+const envNumber = (name, fallback) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? Math.round(v) : fallback;
+};
 // 提交请求通常很快就能在响应里看到任务 ID；超时给太长会让用户以为「点了没反应」
-const SEND_TIMEOUT_MS = 45 * 1000;
+const SEND_TIMEOUT_MS = envNumber("DBM_SEND_TIMEOUT_MS", 45 * 1000);
 // 每个环节都必须有上限：页面没就绪或脚本挂起时，绝不能把整个提交无限期卡住
-const EVAL_TIMEOUT_MS = 15 * 1000;
-const IMAGE_TIMEOUT_MS = 20 * 1000;
-// 选页前先做一次极轻量的脚本探测：同一个账号分区下可能有多个 webview，
+const EVAL_TIMEOUT_MS = envNumber("DBM_EVAL_TIMEOUT_MS", 30 * 1000);
+// 参考图上传：慢盘+多图时原 20 秒偏紧
+const IMAGE_TIMEOUT_MS = envNumber("DBM_IMAGE_TIMEOUT_MS", 60 * 1000);
+// 选页前先做一次轻量脚本探测：同一个账号分区下可能有多个 webview，
 // 必须挑出脚本通道真正可用的那个，否则后面每步都会白白超时。
-const PROBE_TIMEOUT_MS = 5 * 1000;
+const PROBE_TIMEOUT_MS = envNumber("DBM_PROBE_TIMEOUT_MS", 8 * 1000);
 // 等页面就绪：完全由主进程事件与 is-loading 事实判定，不靠脚本探测
-const READY_TIMEOUT_MS = 25 * 1000;
+const READY_TIMEOUT_MS = envNumber("DBM_READY_TIMEOUT_MS", 45 * 1000);
+// 视频生成面板加载总预算（点击「视频生成」→ 模型/时长/比例控件齐全）
+const PANEL_TIMEOUT_MS = envNumber("DBM_PANEL_TIMEOUT_MS", 30 * 1000);
+// 面板加载阶段的护栏：1 次初次尝试 + 有限次数重试
+const PANEL_MAX_ATTEMPTS = envNumber("DBM_PANEL_MAX_ATTEMPTS", 3);
+// 参数项之间的稳定等待：切换模型后平台会延迟重渲染并自动聚焦编辑器，
+// 立刻开下一个下拉会被顶掉；先让平台的重渲染/自动聚焦风暴过去
+const PARAM_SETTLE_MS = envNumber("DBM_PARAM_SETTLE_MS", 800);
+// 下拉菜单内容挂载等待：平台负载高时点击后菜单可能 5—8 秒才渲染出来
+const MENU_OPEN_TIMEOUT_MS = envNumber("DBM_MENU_OPEN_TIMEOUT_MS", 10 * 1000);
 const DOLA_HOST_RE = /(^|\.)dola\.com$/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -208,6 +231,88 @@ async function ensurePageActive(contents) {
   return result;
 }
 
+/** 账号 webview 被应用卸载/重建（删除账号、页面重挂）时，旧 webContents 的调用会报这些错 */
+function isGoneError(error) {
+  const message = String(error?.message || error || "");
+  return /Object has been destroyed|Render frame was disposed|WebContents was destroyed/.test(message);
+}
+
+/**
+ * 通过调试通道派发「可信」鼠标事件（isTrusted=true）。
+ * 实测（2026-09-24）：Dola 的 radix 下拉对页面内合成事件（dispatchEvent，isTrusted=false）
+ * 不弹菜单；真实点击与 CDP Input 才行。坐标为页面视口坐标。
+ */
+async function trustedClickAt(contents, x, y) {
+  const dbg = contents.debugger;
+  const owned = !dbg.isAttached();
+  try {
+    if (owned) dbg.attach("1.3");
+    await dbg.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+    await dbg.sendCommand("Input.dispatchMouseEvent", {
+      type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
+    });
+    await dbg.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error) };
+  } finally {
+    if (owned) {
+      try {
+        if (dbg.isAttached()) dbg.detach();
+      } catch {}
+    }
+  }
+}
+
+/**
+ * 对已聚焦元素派发可信回车键（keyDown/keyUp，isTrusted=true）。
+ * 实测（2026-09-24）：Dola 参数下拉菜单唯一可靠的打开方式 = 触发器 focus + 可信 Enter。
+ */
+async function trustedPressEnter(contents) {
+  const dbg = contents.debugger;
+  const owned = !dbg.isAttached();
+  try {
+    if (owned) dbg.attach("1.3");
+    const base = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", ...base });
+    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error) };
+  } finally {
+    if (owned) {
+      try {
+        if (dbg.isAttached()) dbg.detach();
+      } catch {}
+    }
+  }
+}
+
+/**
+ * 派发可信 Escape（关闭卡在残留态的下拉/浮层）。
+ */
+async function trustedPressEscape(contents) {
+  const dbg = contents.debugger;
+  const owned = !dbg.isAttached();
+  try {
+    if (owned) dbg.attach("1.3");
+    const base = { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 };
+    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", ...base });
+    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error) };
+  } finally {
+    if (owned) {
+      try {
+        if (dbg.isAttached()) dbg.detach();
+      } catch {}
+    }
+  }
+}
+
 /** 给一个可能挂起的 Promise 加上上限；超时返回 timeoutValue 而不是一直等 */
 function withTimeout(promise, ms, timeoutValue) {
   let timer;
@@ -322,15 +427,17 @@ const HELPERS = `
   });
 `;
 
-async function evaluate(contents, source) {
+async function evaluate(contents, source, options = {}) {
+  const timeoutMs = options.timeoutMs || EVAL_TIMEOUT_MS;
+  const stage = options.stage ? `${options.stage}：` : "";
   const result = await withTimeout(
     contents
       .executeJavaScript(pageScript(`${HELPERS}\n${source}`), true)
-      .catch((error) => ({ ok: false, reason: `页面脚本执行失败：${error?.message || error}` })),
-    EVAL_TIMEOUT_MS,
+      .catch((error) => ({ ok: false, reason: `${stage}页面脚本执行失败：${error?.message || error}` })),
+    timeoutMs,
     {
       ok: false,
-      reason: `页面脚本执行超时（${EVAL_TIMEOUT_MS / 1000} 秒无响应）`,
+      reason: `${stage}页面脚本执行超时（${timeoutMs / 1000} 秒无响应）`,
       // 超时时补上主进程侧的页面事实，否则只剩一句「超时」无法判断
       ...describeView(contents),
     }
@@ -358,8 +465,9 @@ async function probeView(contents) {
  * 处理：先等到页面不在导航中，再用 1+1 探测通道可用性，然后重试同一段幂等写入；
  * 重试过程落到证据里；两次都不行才判失败，绝不静默继续。
  */
-async function evaluateIdempotent(contents, source) {
-  const first = await evaluate(contents, source);
+async function evaluateIdempotent(contents, source, options = {}) {
+  const stage = options.stage || "";
+  const first = await evaluate(contents, source, { stage });
   if (first?.ok) return { ...first, retried: false };
   const reason = String(first?.reason || "");
   if (!/超时|无响应/.test(reason)) return { ...first, retried: false };
@@ -367,41 +475,85 @@ async function evaluateIdempotent(contents, source) {
   while (readSafe(() => contents.isLoading()) && Date.now() < waitUntil) await sleep(300);
   const probe = await probeView(contents);
   if (!probe.ok) return { ...first, retried: true, retryProbe: probe.reason || "脚本通道仍无响应" };
-  const second = await evaluate(contents, source);
+  const second = await evaluate(contents, source, { stage });
   return { ...second, retried: true, firstReason: reason };
 }
 
-/** 组合就绪检查：可用的编辑器 + 文件入口 + 发送按钮都在（进入视频模式后页面会重渲染） */
-const STEP_COMPOSER_READY = `
-  const editor = editors()[0] || null;
-  const input = document.querySelector(SEL.fileInput);
-  const send = document.querySelector(SEL.sendButton);
-  const anyEditor = document.querySelector(SEL.editor);
-  return {
-    ok: Boolean(editor && input && send),
-    hasEditor: Boolean(editor),
-    editorCount: editors().length,
-    anyEditorPresent: Boolean(anyEditor),
-    hasFileInput: Boolean(input),
-    hasSend: Boolean(send),
-    ...pageInfo(),
-  };
-`;
-
-/** 等输入区就绪：每次 4 秒上限，最多等 timeoutMs，避免一步吃掉整段预算 */
-async function waitForComposer(contents, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+/**
+ * 渐进式轮询视频面板：每轮 eval 独立小预算，整体不超过 totalMs。
+ * 每 ~2 秒输出一次元素检测状态（阶段日志），定位卡在哪个控件。
+ */
+async function pollPanel(contents, totalMs, emit) {
+  const deadline = Date.now() + totalMs;
+  let lastLog = 0;
   let last = null;
   for (;;) {
-    last = await withTimeout(evaluate(contents, STEP_COMPOSER_READY), 4000, {
-      ok: false,
-      reason: "页面脚本 4 秒无响应",
-    });
+    last = await evaluate(contents, STEP_PANEL_STATE, { stage: "检测视频面板", timeoutMs: 8000 });
     if (last?.ok) return last;
-    if (Date.now() >= deadline) return { ...last, reason: last?.reason || "输入区未就绪（编辑器/上传入口/发送按钮不全）" };
-    await sleep(400);
+    const now = Date.now();
+    if (emit && now - lastLog >= 2000) {
+      lastLog = now;
+      emit({
+        elapsedMs: totalMs - Math.max(0, deadline - now),
+        checks: last?.checks || null,
+        reason: last?.reason || "等待面板控件",
+      });
+    }
+    if (now >= deadline) return last;
+    await sleep(500);
   }
 }
+
+/** 内容审核 / 额度不足类平台拒绝：命中即不可重试 */
+function platformRefusal(text) {
+  const body = String(text || "");
+  for (const p of PLATFORM_REPLY_PATTERNS) {
+    if (p.re.test(body)) {
+      return { code: p.code, label: p.label, match: body.match(p.re)?.[0] || "" };
+    }
+  }
+  return null;
+}
+
+/**
+ * 面板加载阶段（点击「视频生成」→ 面板完全加载）：
+ * 渐进轮询 + 有限次数重试（默认共 3 次尝试）。
+ * 点击失败/控件未加载会重试；一旦页面出现内容审核或额度不足拒绝，立即停止不重试。
+ */
+async function ensureVideoPanel(contents, emit) {
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= PANEL_MAX_ATTEMPTS; attempt++) {
+    if (emit) emit({ phase: "enterVideo", attempt });
+    const mode = await evaluate(contents, STEP_ENTER_VIDEO, { stage: "进入视频模式" });
+    if (!mode?.ok) {
+      lastFailure = { kind: "click", mode };
+      // 「找不到入口」属于选择器/平台结构问题，重试无意义
+      if (/找不到「视频生成」入口/.test(String(mode.reason))) {
+        return { ok: false, fatal: true, ...lastFailure };
+      }
+      if (attempt < PANEL_MAX_ATTEMPTS && emit) emit({ phase: "retryClick", attempt, reason: mode.reason });
+      if (attempt < PANEL_MAX_ATTEMPTS) continue;
+      return { ok: false, ...lastFailure };
+    }
+
+    if (emit) emit({ phase: "waitPanel", attempt, skipped: mode.skipped === true });
+    const panel = await pollPanel(contents, PANEL_TIMEOUT_MS, (p) => emit?.({ phase: "panelPoll", attempt, ...p }));
+    if (panel?.ok) return { ok: true, attempt, mode, panel };
+
+    // 拒绝护栏：审核/额度不足不重试。只认面板状态里的定向摘录，
+    // 不退回 pageInfo 的整页 innerText（避免静态文案误判）。
+    const refusal = platformRefusal(panel?.pageExcerpt);
+    if (refusal) {
+      return { ok: false, fatal: true, kind: "refusal", refusal, panel };
+    }
+    lastFailure = { kind: "panel", mode, panel };
+    if (attempt < PANEL_MAX_ATTEMPTS && emit) {
+      emit({ phase: "retryPanel", attempt, checks: panel?.checks, reason: panel?.reason });
+    }
+  }
+  return { ok: false, ...lastFailure };
+}
+
 
 /**
  * 等页面就绪：只看主进程事实（isLoading / did-fail-load / 崩溃），不靠脚本探测，
@@ -443,7 +595,8 @@ async function waitForPageReady(contents, timeoutMs = READY_TIMEOUT_MS) {
 }
 
 /**
- * 幂等进入视频生成模式。
+ * 进入视频生成模式（仅负责点击）。
+ * 面板等待由外层 STEP_PANEL_STATE 渐进轮询完成，避免步骤内部硬编码 10 秒。
  * 聊天模式下工具栏控件计数为 0，必须先点「视频生成」再操作参数控件。
  */
 const STEP_ENTER_VIDEO = `
@@ -460,92 +613,237 @@ const STEP_ENTER_VIDEO = `
       .slice(0, 20);
     return { ok: false, reason: '找不到「视频生成」入口，无法切换到视频模式', skills, ...pageInfo() };
   }
-  pointerClick(button);
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 200));
-    if (toolbarState().inVideoMode) return { ok: true, picked: textOf(button) || attr(button, 'data-skill-id'), ...toolbarState() };
-  }
-  return { ok: false, reason: '已经点击「视频生成」，但模型/时长控件始终没有出现', ...toolbarState(), ...pageInfo() };
+  const clicked = pointerClick(button);
+  if (!clicked) return { ok: false, reason: '点击「视频生成」按钮失败（指针事件派发未成功）', ...before, ...pageInfo() };
+  return { ok: true, picked: textOf(button) || attr(button, 'data-skill-id'), clickedAt: Date.now(), ...before };
 `;
 
 /**
- * 打开某个 radix 下拉并选择目标项，随后回读控件文本。
- * 回读不一致即视为「参数未生效」，交由调用方阻断提交。
+ * 视频生成面板完整状态：除 inVideoMode 外，逐个核实模型/时长/比例控件、编辑器、发送按钮。
+ * 外层据此做渐进轮询；任何一项缺失都体现在检测结果里，定位卡在哪一步。
  */
-const STEP_CHOOSE = `
-  const controlSelector = __SELECTOR__;
-  const wantKey = __KEY__;
-  const wanted = __WANTED__;     // 菜单项里要匹配的文案
-  const readback = __READBACK__; // 选完后触发器上应能看到的文本（模型只显示短名）
-  const control = document.querySelector(controlSelector);
-  if (!control) return { ok: false, reason: '页面上找不到该控件（可能未进入视频模式）', wanted, ...toolbarState(), ...pageInfo() };
-  const before = triggerState(wantKey);
-  const beforeSet = new Set(menuRoots());
-  pointerClick(control);
+const STEP_PANEL_STATE = `
+  const state = toolbarState();
+  const modelEl = controlFor('video-model');
+  const durationEl = controlFor('video-duration');
+  const ratioEl = controlFor('video-ratio');
+  const editorEl = editors()[0] || document.querySelector(SEL.editor);
+  const fileEl = document.querySelector(SEL.fileInput);
+  const sendEl = document.querySelector(SEL.sendButton);
+  const checks = {
+    inVideoMode: state.inVideoMode,
+    modelControl: Boolean(modelEl),
+    durationControl: Boolean(durationEl),
+    ratioControl: Boolean(ratioEl),
+    editor: Boolean(editorEl),
+    fileInput: Boolean(fileEl),
+    sendButton: Boolean(sendEl),
+  };
+  // 面板完全加载：三项参数控件 + 编辑器 + 文件入口 + 发送按钮齐全
+  const ok = checks.modelControl && checks.durationControl && checks.editor && checks.fileInput && checks.sendButton;
+  // 拒绝护栏只读「可能出现平台反馈」的可见区域：弹窗/Toast/通知 + 会话区最后几条消息。
+  // 实测（2026-09-24）：用 body.innerText 前 500 字会把页面无关的「请确认」类静态文案
+  // 误判成平台拒绝（NEED_CONFIRM），故不再扫描整页。
+  const refusalExcerpt = () => {
+    const parts = [];
+    const push = (el) => {
+      if (!el || !visible(el)) return;
+      const t = textOf(el);
+      if (t) parts.push(t);
+    };
+    document.querySelectorAll(
+      '[role="dialog"],[role="alert"],[role="status"],[class*="modal"],[class*="dialog"],[class*="toast"],[class*="notification"],[class*="alert"]'
+    ).forEach(push);
+    const messages = document.querySelectorAll('[data-message-id],[class*="message-item"],[class*="message-list"] > *');
+    Array.from(messages).slice(-4).forEach(push);
+    return parts.join(' ').replace(/\\s+/g, ' ').slice(0, 600);
+  };
+  return {
+    ok,
+    checks,
+    model: state.model,
+    duration: state.duration,
+    ratio: state.ratio,
+    pageExcerpt: refusalExcerpt(),
+    ...pageInfo(),
+  };
+`;
+
+/**
+ * 参数下拉流程拆成三段，由主进程 chooseOption 编排：
+ *   locate（定位/聚焦触发器）→ 主进程派发可信 Enter 打开 → pick（等菜单、定位目标项坐标）
+ *   → 主进程可信点击目标项 → readback（回读触发器确认生效）。
+ * 实测：鼠标（含 CDP 可信点击）只切 data-state、不渲染菜单；聚焦+Enter 才行。
+ */
+const STEP_CHOOSE_LOCATE = `
+  const control = document.querySelector(__SELECTOR__);
+  if (!control) return { ok: false, reason: '页面上找不到该控件（可能未进入视频模式）', ...toolbarState(), ...pageInfo() };
+  try { control.scrollIntoView?.({ block: 'nearest' }); } catch {}
+  // 聚焦触发器：键盘兜底路径需要焦点；鼠标点击路径也要求元素已滚动到可视位置。
+  try { control.focus(); } catch {}
+  const rect = control.getBoundingClientRect();
+  // 必须同时核实「触发器 open」与「菜单内容真实挂载且可见」：
+  // 实测会出现 trigger 卡在 data-state=open、但 dropdown-menu-content 根本不存在的残留态。
+  const menuReallyOpen = () =>
+    [...document.querySelectorAll('[data-slot="dropdown-menu-content"],[role="menu"],[role="listbox"]')].some(visible);
+  const stateOpen = attr(control, 'data-state') === 'open';
+  return {
+    ok: true,
+    stateOpen,
+    menuReallyOpen: menuReallyOpen(),
+    open: stateOpen && menuReallyOpen(),
+    focused: document.activeElement === control,
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+    text: textOf(control),
+  };
+`;
+
+const STEP_CHOOSE_PICK = `
+  const wanted = __WANTED__;
+  const dropdownRoots = () =>
+    [...document.querySelectorAll('[data-slot="dropdown-menu-content"],[role="menu"],[role="listbox"]')].filter(visible);
+  const optionEls = (root) => {
+    const items = [...root.querySelectorAll('[role="menuitem"],[role="option"]')].filter(el => visible(el) && textOf(el));
+    if (items.length) return items;
+    return [...root.querySelectorAll('li,button,div')].filter(el => el !== root && visible(el) && textOf(el));
+  };
+  const deadline = Date.now() + __MENU_TIMEOUT__;
   let root = null;
-  const deadline = Date.now() + 5000;
+  let flashed = false; // 等待窗口内是否曾出现过菜单（哪怕后来被页面自动关掉）
   while (Date.now() < deadline) {
-    root = pickMenu(beforeSet);
-    if (root) break;
-    await new Promise(r => setTimeout(r, 120));
+    const found = dropdownRoots().find(el => optionEls(el).length >= 1) || null;
+    if (found) { root = found; break; }
+    if (menuRoots().length) flashed = true;
+    await new Promise(r => setTimeout(r, 80));
   }
   if (!root) {
     return {
       ok: false,
-      reason: '点击控件后没有出现菜单（radix 只认真实指针事件）',
-      wanted, before: before.text, triggerOpen: triggerState(wantKey).open,
-      openedMenuTexts: menuTexts(), ...pageInfo(),
+      flashed,
+      reason: flashed ? '菜单打开后又被页面自动关闭（疑似平台自动聚焦输入框）' : '点击控件后没有出现菜单',
+      openedMenuTexts: menuRoots().map(r => textOf(r).slice(0, 80)).slice(0, 3),
+      ...pageInfo(),
     };
   }
-  const options = menuOptions(root);
+  const options = optionEls(root);
   const labels = [...new Set(options.map(textOf).filter(Boolean))].slice(0, 40);
   const exact = options.find(o => compact(textOf(o)) === compact(wanted));
   const target = exact || options.find(o => norm(textOf(o)).includes(norm(wanted)));
   if (!target) {
-    pointerClick(control);
     return { ok: false, reason: '菜单里没有匹配项', wanted, available: labels, ...pageInfo() };
   }
-  const picked = textOf(target);
-  pointerClick(target);
-  await new Promise(r => setTimeout(r, 600));
-  const after = triggerState(wantKey);
-  const applied = norm(after.text).includes(norm(readback));
+  const rect = target.getBoundingClientRect();
+  return {
+    ok: true,
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+    picked: textOf(target),
+    available: labels,
+  };
+`;
+
+const STEP_CHOOSE_READBACK = `
+  await new Promise(r => setTimeout(r, 300));
+  const control = document.querySelector(__SELECTOR__);
+  const text = control ? textOf(control) : '';
+  const readback = __READBACK__;
+  const applied = norm(text).includes(norm(readback));
   return {
     ok: applied,
-    picked,
-    before: before.text,
-    after: after.text,
-    available: labels,
+    after: text,
     reason: applied ? undefined : '已点选菜单项，但触发器回读不一致，参数可能没有真正生效',
+  };
+`;
+
+/** 菜单迟迟不出现时的现场取证：只在失败路径调用，一次拿足排查信息 */
+const STEP_CHOOSE_DIAGNOSTIC = `
+  const control = document.querySelector(__SELECTOR__);
+  const rect = control ? control.getBoundingClientRect() : null;
+  const rawMenus = [...document.querySelectorAll('[data-slot="dropdown-menu-content"],[data-slot="dropdown-content"],[role="menu"],[role="listbox"]')]
+    .map(e => ({ slot: e.getAttribute && e.getAttribute("data-slot"), role: e.getAttribute && e.getAttribute("role"),
+      size: (() => { const r = e.getBoundingClientRect(); return Math.round(r.width) + "x" + Math.round(r.height); })(),
+      display: getComputedStyle(e).display, text: textOf(e).slice(0, 120) }));
+  const overlays = [...document.querySelectorAll('[role="dialog"],[class*="toast"],[class*="modal"]')]
+    .filter(visible).map(e => textOf(e).slice(0, 150));
+  return {
+    triggerState: control ? attr(control, 'data-state') : null,
+    triggerRect: rect ? { top: Math.round(rect.top), left: Math.round(rect.left), w: Math.round(rect.width), h: Math.round(rect.height) } : null,
+    activeTag: document.activeElement ? document.activeElement.tagName : null,
+    activeSlot: document.activeElement && document.activeElement.getAttribute ? (document.activeElement.getAttribute("data-slot") || document.activeElement.getAttribute("data-input-engine-actionbar-control-key")) : null,
+    hasFocus: document.hasFocus(),
+    hidden: document.hidden,
+    visibility: document.visibilityState,
+    viewport: { w: window.innerWidth, h: window.innerHeight },
+    rawMenus,
+    overlays,
   };
 `;
 
 /**
  * 写入提示词：直接写入「平台可用的纯文本」（@图N 已在主进程转成参考图N）。
- * 实测：平台视频编辑器不支持内联图片节点，写入 U+FFFC 只会被当成普通文本，
- * 提交后消息里显示为方框（用户截图里的 OBJ）。因此这里不再写任何占位符。
+ * 实测（2026-09-24 真实页面）：
+ *   document.execCommand('insertText') 在 Dola 当前 Tiptap/ProseMirror 编辑器上
+ *   处理病态——12,713 字真实提示词在已激活页面上 25 秒仍未完成（多次观测近无限循环）；
+ *   而走编辑器自身的 ProseMirror 事务 view.dispatch(tr.insertText(...)) 同样文本仅 44ms。
+ * 因此优先用 PM 事务；只有拿不到编辑器实例时才退回 execCommand。
+ * 平台视频编辑器不支持内联图片节点，不写 U+FFFC 占位符。
  */
 const STEP_SET_TEXT = `
+  const value = __VALUE__;
   const list = editors();
   if (!list.length) return { ok: false, reason: '找不到提示词输入框（可能未登录、页面未加载完成或页面结构已变化）', ...pageInfo() };
   const editor = list[0];
-  const value = __VALUE__;
-  editor.focus();
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  const selection = getSelection();
-  selection.removeAllRanges();
-  selection.addRange(range);
-  document.execCommand('delete');
-  if (value && !document.execCommand('insertText', false, value)) {
-    return { ok: false, reason: '输入框拒绝写入文本', ...pageInfo() };
+
+  // 路径一：Tiptap 挂在 DOM 节点上的 editor 实例 → PM 事务整段替换
+  const writeViaTransaction = () => {
+    const tip = editor.editor;
+    const view = tip && (tip.view || tip.editorView);
+    if (!view || typeof view.dispatch !== 'function' || !view.state || !view.state.tr) return null;
+    const docEnd = view.state.doc.content.size;
+    view.dispatch(view.state.tr.insertText(value || '', 0, docEnd));
+    return 'prosemirror-transaction';
+  };
+
+  // 路径二：execCommand 兜底（非 Tiptap 结构的极少数情况）
+  const writeViaExecCommand = () => {
+    editor.focus();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.execCommand('delete');
+    if (value && !document.execCommand('insertText', false, value)) {
+      return { error: '输入框拒绝写入文本' };
+    }
+    return 'exec-command';
+  };
+
+  let writeMethod = '';
+  try {
+    writeMethod = writeViaTransaction();
+  } catch (error) {
+    return { ok: false, reason: '通过编辑器事务写入失败：' + (error && error.message), ...pageInfo() };
   }
-  await new Promise(r => setTimeout(r, 300));
+  if (!writeMethod) {
+    let fallback;
+    try {
+      fallback = writeViaExecCommand();
+    } catch (error) {
+      return { ok: false, reason: '写入提示词失败：' + (error && error.message), ...pageInfo() };
+    }
+    if (fallback && fallback.error) return { ok: false, reason: fallback.error, ...pageInfo() };
+    writeMethod = fallback;
+  }
+
+  await new Promise(r => setTimeout(r, 150));
   const readback = String(editor.innerText || editor.textContent || '');
   const strip = (s) => String(s || '').replace(/\\s+/g, '');
+  const matched = strip(readback) === strip(value);
   return {
-    ok: strip(readback) === strip(value),
+    ok: matched,
+    writeMethod,
     // 不一致时给出两边开头，便于实机校准（不是猜）
     actualText: strip(readback).slice(0, 120),
     expectedText: strip(value).slice(0, 120),
@@ -1089,11 +1387,84 @@ function createDolaDriver(options = {}) {
   }
 
   async function chooseOption(contents, selector, key, wanted, readback) {
-    const code = STEP_CHOOSE.replace("__SELECTOR__", JSON.stringify(selector))
-      .replace("__KEY__", JSON.stringify(key))
-      .replace("__WANTED__", JSON.stringify(wanted))
-      .replace("__READBACK__", JSON.stringify(readback));
-    return evaluate(contents, code);
+    // 实测（2026-09-24 真实页面）：切换模型后平台会延迟重渲染 composer 并自动 editor.focus()，
+    // 若紧接着打开时长/比例菜单，菜单会被「页面自动聚焦」在 ~100ms 内顶掉（没有任何点击）。
+    // 因此整个「聚焦 → Enter → 等菜单 → 点项 → 回读」流程支持有限次数重开；
+    // 菜单“闪现又消失”与“根本没出现”分别上报。
+    const MAX_ATTEMPTS = 3;
+    let lastFailure = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // 1) 定位触发器并真正聚焦（focus 是键盘打开菜单的前提）
+      const locate = STEP_CHOOSE_LOCATE.replace("__SELECTOR__", JSON.stringify(selector));
+      const located = await evaluate(contents, locate, { stage: "聚焦参数控件" });
+      if (!located?.ok) return located;
+
+      // 残留态复位：trigger 显示 open 但菜单内容不在 → 先 Escape 关掉，再重新打开
+      let reallyOpen = located.open;
+      if (located.stateOpen && !located.menuReallyOpen) {
+        await trustedPressEscape(contents);
+        await sleep(350);
+        reallyOpen = false;
+      }
+
+      // 2) 未开 → 打开菜单。实测（2026-09-24 复核）鼠标 CDP 完整点击稳定出菜单，
+      //    键盘 Enter 在部分页面状态下被平台吞掉，因此鼠标优先、Enter 兜底（交替尝试）。
+      if (!reallyOpen) {
+        const useMouse = attempt % 2 === 1;
+        const opened = useMouse
+          ? await trustedClickAt(contents, located.x, located.y)
+          : await trustedPressEnter(contents);
+        if (!opened.ok) {
+          lastFailure = {
+            ok: false,
+            reason: `${useMouse ? "鼠标" : "键盘"}打开下拉失败：${opened.reason}`,
+          };
+          await sleep(450);
+          continue;
+        }
+        // 给菜单一点弹出时间再进入 pick
+        await sleep(180);
+      }
+
+      // 3) 等菜单出现并定位目标项（内部窗口与外部 eval 超时都要留足慢加载余量）
+      const pick = STEP_CHOOSE_PICK.replace("__WANTED__", JSON.stringify(wanted))
+        .replace("__MENU_TIMEOUT__", String(MENU_OPEN_TIMEOUT_MS));
+      const picked = await evaluate(contents, pick, { stage: "选择参数项", timeoutMs: MENU_OPEN_TIMEOUT_MS + 4000 });
+      if (!picked?.ok) {
+        // 最后一次失败才做现场取证，避免无谓调用
+        const diagnostic =
+          attempt === MAX_ATTEMPTS
+            ? await evaluate(
+                contents,
+                STEP_CHOOSE_DIAGNOSTIC.replace("__SELECTOR__", JSON.stringify(selector)),
+                { stage: "菜单失败取证" }
+              ).catch((e) => ({ diagnosticError: String(e?.message || e) }))
+            : undefined;
+        lastFailure = { ok: false, reason: picked.reason, attempt, diagnostic, flashed: picked.flashed };
+        // 仅「菜单没出现 / 闪现后被页面自动关闭」才重开；“没有匹配项”重开也无益
+        if (!/没有出现菜单|自动关闭/.test(picked.reason || "")) return lastFailure;
+        await sleep(500);
+        continue;
+      }
+
+      // 4) 可信点击目标项（菜单项鼠标点击实测有效）
+      const optionClick = await trustedClickAt(contents, picked.x, picked.y);
+      if (!optionClick.ok) {
+        return { ok: false, picked: picked.picked, reason: `点击菜单项失败：${optionClick.reason}` };
+      }
+
+      // 5) 回读触发器，确认参数真的生效
+      const readbackCode = STEP_CHOOSE_READBACK.replace("__SELECTOR__", JSON.stringify(selector))
+        .replace("__READBACK__", JSON.stringify(readback));
+      const after = await evaluate(contents, readbackCode, { stage: "回读参数" });
+      if (!after?.ok && attempt < MAX_ATTEMPTS) {
+        lastFailure = { picked: picked.picked, ...after, attempt };
+        await sleep(500);
+        continue;
+      }
+      return { picked: picked.picked, attempt, ...after };
+    }
+    return lastFailure || { ok: false, reason: "参数选择失败" };
   }
 
   /**
@@ -1386,18 +1757,69 @@ function createDolaDriver(options = {}) {
 
     async _submit({ accountId, plan, onStep, dryRun = false }) {
       const steps = [];
-      // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果
+      // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果。
+      // panelStage 是高频进度心跳：折叠进上一条 panelStage，避免刷屏并挤占落库的 20 条步骤上限。
       const record = (step, result) => {
-        steps.push({ step, ...result });
+        const prev = steps[steps.length - 1];
+        if (step === "panelStage" && prev && prev.step === "panelStage") {
+          Object.keys(prev).forEach((k) => {
+            if (k !== "step") delete prev[k];
+          });
+          Object.assign(prev, result);
+        } else {
+          steps.push({ step, ...result });
+        }
         if (typeof onStep === "function") {
           try {
-            onStep({ step, ...result });
+            onStep({ step, ...result, replace: step === "panelStage" });
           } catch {}
         }
       };
       const fail = (message, extra = {}) => ({ outcome: "failed", message, steps, ...extra });
 
       let contents;
+
+      // webview 可能在执行期间被应用卸载/重建（实测删除账号时旧 webContents 立即失效，
+      // 调用报 Object has been destroyed）。整条管线共用同一 contents 引用：捕获一次失效、
+      // 重新解析到新 webview 后重试同一操作；新页面恢复不出来就返回明确失败。
+      let goneRecovered = false;
+      const isDead = () => readSafe(() => contents.isDestroyed());
+      async function withGoneGuard(operation) {
+        for (;;) {
+          try {
+            return await operation();
+          } catch (error) {
+            if ((!isGoneError(error) && !isDead()) || goneRecovered) throw error;
+            goneRecovered = true;
+            record("webviewGone", {
+              ok: false,
+              reason: String(error?.message || error),
+              at: new Date().toISOString(),
+            });
+            state.pages.delete(accountId);
+            try {
+              contents = await pageFor(accountId);
+            } catch (pageError) {
+              throw new Error(
+                `账号页面在执行过程中被关闭，且 ${Math.round(READY_TIMEOUT_MS / 1000)} 秒内没有恢复：${
+                  pageError?.message || pageError
+                }`
+              );
+            }
+            const activation = await withTimeout(ensurePageActive(contents), 15000, {
+              lifecycle: "",
+              focusEmulated: false,
+              errors: ["恢复后激活超过 15 秒未完成（继续后续步骤）"],
+            }).catch(() => null);
+            if (activation) state.activation.set(accountId, activation);
+            log("dola-webview-recovered", { accountId, ...describeView(contents) });
+          }
+        }
+      }
+      const ev = (source, options) => withGoneGuard(() => evaluate(contents, source, options));
+      const evIdem = (source, options) => withGoneGuard(() => evaluateIdempotent(contents, source, options));
+      const choose = (...args) => withGoneGuard(() => chooseOption(contents, ...args));
+
       try {
         contents = await pageFor(accountId);
       } catch (error) {
@@ -1433,25 +1855,80 @@ function createDolaDriver(options = {}) {
       record("waitReady", ready);
       if (!ready.ok) return fail(`页面未就绪：${ready.reason}`);
 
-      // 2) 进入视频生成模式（聊天模式下三个参数控件根本不存在）
-      const mode = await evaluate(contents, STEP_ENTER_VIDEO);
-      record("enterVideoMode", mode);
-      if (!mode?.ok) {
-        return fail(`无法进入视频生成模式：${mode?.reason || "未知原因"}`);
+      // 1b) 每次尝试都重新拉回 active：pageFor 只在首次解析页面时激活一次，
+      //     排队较久的隐藏页会被重新冻结（实测脚本通道因此无响应）。
+      try {
+        const activation = await withTimeout(ensurePageActive(contents), 15000, {
+          lifecycle: "",
+          focusEmulated: false,
+          errors: ["激活超过 15 秒未完成（继续后续步骤）"],
+        });
+        state.activation.set(accountId, activation);
+        record("reactivatePage", { ok: activation.lifecycle === "active", ...activation });
+      } catch (error) {
+        record("reactivatePage", { ok: false, reason: error?.message || String(error) });
       }
 
-      // 2b) 等输入区就绪：进入视频模式后页面会重渲染，实测出现过「找不到输入框」与「脚本 15 秒无响应」
-      //     （真实提交 att_47716bb2e812 / att_de77d7a10f0f），所以先等编辑器/上传入口/发送按钮齐全
-      const composer = await waitForComposer(contents);
-      record("waitComposer", composer);
-      if (!composer?.ok) return fail(`输入区未就绪：${composer?.reason || "编辑器/上传入口/发送按钮不全"}`);
+      // 2) 进入视频生成模式并等待面板完全加载：
+      //    渐进轮询 + 阶段日志 + 面板阶段有限重试；审核/额度拒绝不重试
+      const panelDetail = (p) => {
+        const parts = [];
+        if (p.phase) parts.push(p.phase);
+        if (p.attempt) parts.push(`第${p.attempt}次尝试`);
+        if (p.elapsedMs != null) parts.push(`${Math.round(p.elapsedMs / 1000)}s`);
+        if (p.checks) {
+          const c = p.checks;
+          parts.push(
+            `模型控件${c.modelControl ? "✓" : "✗"} 时长控件${c.durationControl ? "✓" : "✗"} 比例控件${
+              c.ratioControl ? "✓" : "✗"
+            } 编辑器${c.editor ? "✓" : "✗"} 文件入口${c.fileInput ? "✓" : "✗"} 发送按钮${c.sendButton ? "✓" : "✗"}`
+          );
+        }
+        if (p.reason) parts.push(String(p.reason));
+        return parts.join(" · ");
+      };
+      const emitPanel = (payload) => {
+        log("dola-panel-stage", { accountId, ...payload });
+        // 同时进任务步骤（record 会自动回报 onStep 并留在最终 steps 里）：
+        // 界面任务日志区能直接看到「现在卡在哪个控件」，
+        // 不依赖 DBM_WORKBENCH_DEBUG 环境变量。
+        record("panelStage", { ok: true, detail: panelDetail(payload) });
+      };
+      const panelResult = await withGoneGuard(() => ensureVideoPanel(contents, emitPanel));
+      record("enterVideoMode", {
+        ok: panelResult.ok,
+        picked: panelResult.mode?.picked,
+        skipped: panelResult.mode?.skipped,
+        attempts: panelResult.attempt,
+        reason: panelResult.mode?.reason,
+      });
+      record("waitComposer", { ok: panelResult.ok, checks: panelResult.panel?.checks, reason: panelResult.panel?.reason });
+      if (!panelResult.ok) {
+        if (panelResult.kind === "refusal") {
+          return fail(`平台拒绝：${panelResult.refusal.label}（命中：${panelResult.refusal.match}）`, {
+            errorCode: panelResult.refusal.code,
+            retryable: false,
+            needsUser: true,
+          });
+        }
+        if (panelResult.kind === "click") {
+          return fail(`点击视频生成按钮失败：${panelResult.mode?.reason || "未知原因"}`);
+        }
+        const checks = panelResult.panel?.checks;
+        const detail = checks
+          ? `模型控件=${checks.modelControl ? "✓" : "✗"} 时长控件=${checks.durationControl ? "✓" : "✗"} 比例控件=${checks.ratioControl ? "✓" : "✗"} 编辑器=${checks.editor ? "✓" : "✗"} 文件入口=${checks.fileInput ? "✓" : "✗"} 发送按钮=${checks.sendButton ? "✓" : "✗"}`
+          : String(panelResult.panel?.reason || "面板状态未知");
+        return fail(
+          `视频生成面板加载超时（${PANEL_MAX_ATTEMPTS} 次尝试均未在 ${PANEL_TIMEOUT_MS / 1000} 秒内加载完成）：${detail}`
+        );
+      }
 
       // 3) 先读输入区已有附件：本工具传过的（本次会话的 URL 映射，或文件名对得上）会被复用；
       //    来源不明的停下报告冲突（绝不擅自清空）
       const attachKey = `${accountId}|${plan.storyboardId}`;
       const knownAttachments = state.attachments.get(attachKey) || [];
       const ourFileNames = new Set((plan.references || []).map((item) => baseNameOf(item.filePath)).filter(Boolean));
-      const preAttach = await evaluate(contents, STEP_ATTACHMENTS_STATE);
+      const preAttach = await ev(STEP_ATTACHMENTS_STATE);
       record("attachmentsPre", {
         ok: preAttach?.ok,
         count: preAttach?.count ?? 0,
@@ -1482,30 +1959,38 @@ function createDolaDriver(options = {}) {
       }
 
       // 4) 写入提示词：@图N 已在主进程转成「参考图N」，不再写入任何占位符
-      const textStep = await evaluateIdempotent(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
+      const textStep = await evIdem(
+        STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")),
+        { stage: "填入提示词" }
+      );
       record("setPrompt", textStep);
       if (!textStep?.ok) {
         return fail(`写入提示词失败：${textStep?.reason || "编辑器回读与预期不一致"}`);
       }
+      // 长提示词事务后浏览器仍在 layout/paint，先让渲染稳定，避免 radix 菜单只切状态不挂载内容
+      await sleep(PARAM_SETTLE_MS);
 
       // 5) 参数必须在平台上真正生效：任何一项设不上就阻断，绝不用平台默认值继续
       const target = plan.params;
-      const modelStep = await chooseOption(
-        contents,
+      const modelStep = await choose(
         DOLA_SELECTORS.modelControl,
         "video-model",
         target.modelLabel,
         target.modelTrigger
       );
       record("chooseModel", modelStep);
-      if (!modelStep?.ok) return fail(`模型未生效：${modelStep?.reason || "选择失败"}（期望 ${target.modelLabel}）`);
+      if (!modelStep?.ok) {
+        const diag = modelStep.diagnostic ? ` · 现场：${JSON.stringify(modelStep.diagnostic).slice(0, 700)}` : "";
+        return fail(`模型未生效：${modelStep?.reason || "选择失败"}（期望 ${target.modelLabel}）${diag}`);
+      }
+      // 等平台模型切换后的重渲染/自动聚焦完成，再开时长菜单（实测不等待菜单必被顶掉）
+      await sleep(PARAM_SETTLE_MS);
 
       // 5b) 时长：原生档位直接设置；16—30 秒属于增强，先把平台档位设成原生基线，
       //     再由应用自带的增强器在请求体里改写成目标秒数（实际时长以请求体回读为准）
       const isEnhanced = target.durationMode === "enhanced";
       const baseDuration = isEnhanced ? "10" : target.duration;
-      const durationStep = await chooseOption(
-        contents,
+      const durationStep = await choose(
         DOLA_SELECTORS.durationControl,
         "video-duration",
         `${baseDuration}s`,
@@ -1518,8 +2003,7 @@ function createDolaDriver(options = {}) {
 
       if (isEnhanced) {
         const spec = plan.durationEnhancement || {};
-        const enhanceStep = await evaluate(
-          contents,
+        const enhanceStep = await ev(
           STEP_SET_DURATION_ENHANCEMENT.replace("__SECONDS__", JSON.stringify(String(target.duration)))
             .replace("__ENABLE_KEY__", JSON.stringify("dbm_dola_enable_30s_v1"))
             .replace("__SECONDS_KEY__", JSON.stringify("dbm_dola_duration_seconds_v2"))
@@ -1535,8 +2019,9 @@ function createDolaDriver(options = {}) {
       }
 
       if (target.ratio) {
-        const ratioStep = await chooseOption(
-          contents,
+        // 同样先让时长切换的重渲染/自动聚焦过去，再开比例菜单
+        await sleep(PARAM_SETTLE_MS);
+        const ratioStep = await choose(
           DOLA_SELECTORS.ratioControl,
           "video-ratio",
           target.ratio,
@@ -1551,10 +2036,12 @@ function createDolaDriver(options = {}) {
       // 6) 逐张上传参考图（已传过的复用，只补缺失），再按「附件标识 + 顺序 + 文本编号」三重复核
       const refList = plan.references || [];
       const refLabels = refList.map((item) => item.label).filter(Boolean);
-      const uploadStep = await withTimeout(attachImages(contents, refList, knownAttachments), IMAGE_TIMEOUT_MS, {
-        ok: false,
-        reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
-      });
+      const uploadStep = await withGoneGuard(() =>
+        withTimeout(attachImages(contents, refList, knownAttachments), IMAGE_TIMEOUT_MS, {
+          ok: false,
+          reason: `附加参考图超时（${IMAGE_TIMEOUT_MS / 1000} 秒）`,
+        })
+      );
       record("attachImages", {
         ok: uploadStep.ok,
         count: uploadStep.count,
@@ -1574,14 +2061,16 @@ function createDolaDriver(options = {}) {
 
       // 实测（2026-09-23）：平台在上传参考图的过程中可能重渲染并清空输入框里的文本，
       // 因此上传完成后重新写入一次提示词（幂等），否则后面「文本里有没有参考图N」会被误判成失败。
-      const textStep2 = await evaluateIdempotent(contents, STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")));
+      const textStep2 = await evIdem(
+        STEP_SET_TEXT.replace("__VALUE__", JSON.stringify(plan.platformText || "")),
+        { stage: "上传后重新填入提示词" }
+      );
       record("setPromptAfterUpload", { ok: textStep2?.ok, retried: textStep2?.retried, actualText: textStep2?.actualText, reason: textStep2?.reason });
       if (!textStep2?.ok) {
         return fail(`上传后重新写入提示词失败：${textStep2?.reason || "编辑器回读与预期不一致"}`);
       }
 
-      const refsStep = await evaluate(
-        contents,
+      const refsStep = await ev(
         STEP_VERIFY_REFS.replace("__URLS__", JSON.stringify(mapping.map((item) => item.url)))
           .replace("__ALTS__", JSON.stringify(mapping.map((item) => baseNameOf(item.filePath) || "")))
           .replace("__LABELS__", JSON.stringify(refLabels))
@@ -1608,7 +2097,7 @@ function createDolaDriver(options = {}) {
       }
 
       // 7) 发送前回读：三个参数 + 发送按钮可用性
-      const preflight = await evaluate(contents, STEP_READ_STATE);
+      const preflight = await ev(STEP_READ_STATE);
       record("readState", preflight);
       if (!preflight?.ok) return fail("提交前无法读取页面状态");
 
@@ -1652,7 +2141,7 @@ function createDolaDriver(options = {}) {
       // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
       const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
 
-      const sendStep = await evaluate(contents, STEP_SEND);
+      const sendStep = await ev(STEP_SEND);
       record("send", sendStep);
       if (!sendStep?.ok) {
         return fail(

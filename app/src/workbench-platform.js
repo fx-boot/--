@@ -101,6 +101,14 @@ function assignStoryboards({ storyboardIds = [], accountIds = [], mode = "distri
  */
 const PLATFORM_REPLY_PATTERNS = Object.freeze([
   {
+    // 实测（2026-09-24 005/008）：会话失效后页面弹出可见登录框，标题就是
+    // 「登录以解锁更多功能」。此时点任何入口都不会出现控件，必须让用户重新登录，
+    // 不能误判成 NEED_CONFIRM，也绝不能自动重试。该规则放在最前优先命中。
+    code: "SESSION_EXPIRED",
+    re: /登录以解锁更多功能|请先登录|登录后(?:继续|再|即可)|登录状态(?:已经)?(?:过期|失效|超时)|未登录/i,
+    label: "账号登录态已失效，请重新登录该账号后再执行",
+  },
+  {
     // 实测（2026-09-24 真实提交 att_d56d75641fc4，Dola 004）：平台在会话里直接回
     // 「今天的生成次数已经达到上限，明天再来免费生成吧」。这属于「平台明确拒绝」，
     // 必须标失败并显示原文，绝不自动重试、也不换模型/换账号重发。
@@ -119,8 +127,10 @@ const PLATFORM_REPLY_PATTERNS = Object.freeze([
     label: "平台拒绝：内容未通过平台规则",
   },
   {
+    // 实测原文是「Please confirm one of these options」。
+    // 不能只匹配孤零零的「请确认/过长」——那会把页面静态文案、历史会话残留全部误判。
     code: "NEED_CONFIRM",
-    re: /请确认|Please confirm|too extensive|too long|过长/i,
+    re: /Please confirm|请确认[^。\n]{0,40}(?:选项|方式|模型|参数|生成)|提示词过长[^。\n]{0,40}(?:确认|选项)|too extensive/i,
     label: "平台要求先确认生成方式，本次没有开始生成",
   },
 ]);
