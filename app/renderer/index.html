@@ -309,7 +309,11 @@
           </div>
           <div class="workbench-task-controls">
             <div class="workbench-field workbench-account-field">
-              <span>执行账号（可多选）</span>
+              <div class="workbench-account-head">
+                <span>执行账号（可多选）</span>
+                <button type="button" class="secondary-action compact" id="workbenchAccountsRefresh"
+                  title="重新从应用读取最新账号列表（保留已勾选状态）">刷新账号</button>
+              </div>
               <div class="workbench-account-picks" id="workbenchAccountPicks"></div>
             </div>
             <div class="workbench-task-buttons">

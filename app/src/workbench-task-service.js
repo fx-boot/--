@@ -22,10 +22,16 @@ const { VIDEO_CAPABILITIES } = require("./video-capabilities");
 
 const ACCOUNTS_FILE = "accounts.json";
 
+// 账号读取的最近一次错误（诊断用，旧实现在 catch 里直接 return [] 把真实原因吞了，
+// 界面只看到「没有可执行账号」，无法区分「真的没账号」还是「读文件失败/JSON 损坏」）。
+let accountsReadError = Object.freeze({ message: "", at: "", dir: "" });
+
 function readAccounts(userDataDir) {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(userDataDir, ACCOUNTS_FILE), "utf8"));
+    const file = path.join(userDataDir, ACCOUNTS_FILE);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     const list = Array.isArray(raw) ? raw : Array.isArray(raw?.accounts) ? raw.accounts : [];
+    accountsReadError = Object.freeze({ message: "", at: "", dir: "" });
     return list
       .filter((a) => a && typeof a.id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(a.id))
       .map((a) => ({
@@ -36,12 +42,17 @@ function readAccounts(userDataDir) {
         remark: String(a.remark || ""),
         sessionPartition: `${PARTITION_PREFIX}${a.id}`,
       }));
-  } catch {
+  } catch (error) {
+    accountsReadError = Object.freeze({
+      message: error?.message || String(error),
+      at: new Date().toISOString(),
+      dir: String(userDataDir || ""),
+    });
     return [];
   }
 }
 
-function createTaskService({ store, assets, userDataDir, log = () => {}, onChanged = () => {} }) {
+function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, onChanged = () => {} }) {
   const taskStore = createTaskStore((projectId) => store.attachmentsDir(projectId));
   const capabilities = VIDEO_CAPABILITIES;
 
@@ -135,7 +146,7 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
     const project = await store.readProject(projectId);
     const boards = (project?.storyboards || []).map((s) => s.id);
     const storyboardIndex = Math.max(1, boards.indexOf(record.storyboardId) + 1);
-    const account = readAccounts(userDataDir).find((a) => a.id === record.accountId);
+    const account = readAccounts(resolveUserDataDir()).find((a) => a.id === record.accountId);
     return downloader.download({
       projectId,
       attemptId,
@@ -150,8 +161,8 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
     });
   }
 
-  async function accountView() {
-    const accounts = readAccounts(userDataDir);
+  async function accountStatus() {
+    const accounts = readAccounts(resolveUserDataDir());
     const blocked = new Map(runner.status().blockedAccounts.map((b) => [b.accountId, b]));
     const counts = new Map();
     const index = await store.readIndex();
@@ -161,7 +172,7 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
         counts.set(task.accountId, (counts.get(task.accountId) || 0) + 1);
       }
     }
-    return accounts.map((account) => ({
+    const decorated = accounts.map((account) => ({
       ...account,
       activeTasks: counts.get(account.id) || 0,
       blocked: blocked.get(account.id) || null,
@@ -169,6 +180,18 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
       quota: { known: false, label: "未知" },
       loginState: { known: false, label: "未知" },
     }));
+    return {
+      accounts: decorated,
+      // 读取失败时必须带具体原因，界面据此显示错误与「重试」，而不是静默空白
+      error: accountsReadError.message
+        ? { message: accountsReadError.message, at: accountsReadError.at, dir: accountsReadError.dir }
+        : null,
+      loadedAt: new Date().toISOString(),
+    };
+  }
+
+  async function accountView() {
+    return (await accountStatus()).accounts;
   }
 
   async function tasksFor(projectId) {
@@ -284,6 +307,8 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
   function handlers() {
     return {
       "workbench:accounts": () => accountView(),
+      // 账号刷新：重新读取并带上错误原因（渲染层「刷新账号」按钮使用）
+      "workbench:account-status": () => accountStatus(),
 
       "workbench:task-preview": (_e, projectId, storyboardId, accountId) =>
         previewPlan(projectId, storyboardId, accountId),
@@ -393,6 +418,7 @@ function createTaskService({ store, assets, userDataDir, log = () => {}, onChang
     driver,
     taskStore,
     accountView,
+    accountStatus,
     dispose: () => {
       try {
         driver.dispose();

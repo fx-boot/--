@@ -149,6 +149,7 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   },
   account: {
     list: () => ipcRenderer.invoke("workbench:accounts"),
+    status: () => ipcRenderer.invoke("workbench:account-status"),
     clearBlock: (accountId) => ipcRenderer.invoke("workbench:account-clear-block", accountId),
   },
   task: {

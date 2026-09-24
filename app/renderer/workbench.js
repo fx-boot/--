@@ -23,6 +23,9 @@
     ratioOptions: [],
     limits: null,
     accounts: [],
+    // 账号列表加载状态：刷新按钮期间显示 loading；读取失败保留旧列表并显示具体错误
+    accountsLoading: false,
+    accountsError: null,
     tasks: [],
     queue: null,
     // 执行账号可多选：一次为每个勾选账号各建一条尝试
@@ -114,6 +117,7 @@
           ratioOptions: snapshot.ratioOptions || [],
           limits: snapshot.limits,
           accounts: snapshot.accounts || [],
+          accountsError: snapshot.accountsError || null,
           tasks: snapshot.tasks || [],
           queue: snapshot.queue || null,
         });
@@ -804,16 +808,77 @@
     return Object.assign(document.createElement("div"), { className: "workbench-empty", textContent: message });
   }
 
+  /**
+   * 「刷新账号」：重新从应用数据目录读取最新账号列表。
+   * - 成功：用新列表渲染，已勾选状态由 renderAccounts 按「id 仍存在则保留」规则处理；
+   * - 失败（IPC 异常或读文件/JSON 错误）：保留旧列表，错误条显示具体原因并给「重试」。
+   */
+  async function refreshAccounts() {
+    if (state.accountsLoading) return;
+    state.accountsLoading = true;
+    state.accountsError = null;
+    renderAccounts();
+    try {
+      const result = await api.account.status();
+      if (result && result.error) {
+        // 主进程读到了错误（ENOENT/JSON 损坏等），保留当前列表不清空
+        state.accountsError = result.error;
+      } else {
+        state.accounts = (result && result.accounts) || [];
+        state.accountsError = null;
+      }
+    } catch (error) {
+      state.accountsError = { message: error?.message || String(error), at: "", dir: "" };
+    } finally {
+      state.accountsLoading = false;
+      renderAccounts();
+      // 勾选数量可能变化（新增账号不会影响，删除账号会剔除勾选），同步主按钮文案
+      renderCompose();
+    }
+  }
+
   function renderAccounts() {
     const host = $("workbenchAccountPicks");
     const note = $("workbenchAccountNote");
+    const refreshButton = $("workbenchAccountsRefresh");
     if (!host) return;
     const accounts = state.accounts || [];
     host.innerHTML = "";
 
+    if (refreshButton) {
+      refreshButton.disabled = state.accountsLoading;
+      refreshButton.textContent = state.accountsLoading ? "读取中…" : "刷新账号";
+    }
+
+    // 读取中：列表区给明确提示（首次加载时 accounts 可能为空，不能误显示空态）
+    if (state.accountsLoading && !accounts.length) {
+      host.appendChild(emptyDiv("账号读取中…"));
+      if (note) note.textContent = "正在从应用数据目录读取账号列表。";
+      return;
+    }
+
+    // 读取失败：错误条显示具体原因与「重试」；已有旧列表时旧列表仍可见
+    if (state.accountsError) {
+      const banner = document.createElement("div");
+      banner.className = "workbench-account-error";
+      const msg = document.createElement("span");
+      msg.textContent = `账号读取失败：${state.accountsError.message}`;
+      banner.appendChild(msg);
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "text-button";
+      retry.dataset.act = "accounts-retry";
+      retry.textContent = "重试";
+      banner.appendChild(retry);
+      host.appendChild(banner);
+    }
+
     if (!accounts.length) {
-      host.appendChild(emptyDiv("（没有可执行账号）"));
-      if (note) note.textContent = "未读到任何账号。账号来自本机既有账号列表，工作台不会新建或修改账号。";
+      // 只有非加载、非错误、且确实为 0 个时才显示空态
+      if (!state.accountsError) {
+        host.appendChild(emptyDiv("（没有可执行账号）"));
+        if (note) note.textContent = "未读到任何账号。账号来自本机既有账号列表，工作台不会新建或修改账号。";
+      }
       return;
     }
 
@@ -2338,7 +2403,13 @@
       renderCompose();
     });
 
+    $("workbenchAccountsRefresh")?.addEventListener("click", refreshAccounts);
+
     $("workbenchAccountPicks")?.addEventListener("click", async (event) => {
+      if (event.target.closest('[data-act="accounts-retry"]')) {
+        await refreshAccounts();
+        return;
+      }
       const clear = event.target.closest('[data-act="clear-block"]');
       if (!clear) return;
       try {

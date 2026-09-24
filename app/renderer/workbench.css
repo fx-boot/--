@@ -151,6 +151,10 @@
 .workbench-task-controls .workbench-field { justify-content: space-between; }
 .workbench-task-controls select { flex: 1; min-width: 0; }
 .workbench-account-field { align-items: flex-start; flex-direction: column; }
+.workbench-account-head { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.workbench-account-error { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; border: 1px solid rgba(248,81,73,.55); border-radius: 7px; background: rgba(248,81,73,.12); color: #ffb4ae; font-size: 10px; line-height: 1.5; }
+.workbench-account-error span { min-width: 0; word-break: break-all; }
+.workbench-account-error .text-button { flex: 0 0 auto; color: #ffb4ae; }
 .workbench-account-picks { width: 100%; max-height: 132px; overflow: auto; display: grid; gap: 3px; align-content: start; }
 .workbench-account-pick { display: flex; align-items: center; gap: 7px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 7px; background: #121a26; cursor: pointer; font-size: 10px; }
 .workbench-account-pick:hover { border-color: rgba(255,106,61,.4); }

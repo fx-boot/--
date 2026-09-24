@@ -32,6 +32,11 @@ const { describeCapabilities, ratioOptionsFor } = require("./workbench-platform"
 
 const CHANGED = "workbench:changed";
 const PROJECT_DIR_NAME = "workbench";
+// 核心启动后使用的数据目录名（<appData>/DoubaoAccountManager）。
+// 根因：本服务在 main.js 中先于核心字节码 install，ready 回调也注册得更早，
+// 首次取 app.getPath("userData") 时核心还没改路径，拿到的是 Electron 默认的
+// %APPDATA%\doubao-account-manager；store/任务服务把该路径缓存后，账号就读空了。
+const CORE_DIR_NAME = "DoubaoAccountManager";
 const managerUrl = pathToFileURL(path.join(__dirname, "../renderer/index.html")).href;
 
 const state = {
@@ -40,36 +45,72 @@ const state = {
   store: null,
   assets: null,
   tasks: null,
+  // tasks 服务创建时绑定的 store，store 因路径修正被重建时需要同步重建 tasks
+  tasksStore: null,
   projectId: "",
   notifyTimer: null,
   lastError: "",
 };
 
+/**
+ * 解析「应用真实数据目录」（accounts.json 所在目录）。
+ * 不静态缓存：核心 setPath 可能发生在本服务首次读取之后，每次调用都重新取。
+ */
+function realUserDataDir() {
+  if (process.env.DBM_DATA_DIR) return path.resolve(process.env.DBM_DATA_DIR);
+  const current = app.getPath("userData");
+  // 核心规则：<appData>/DoubaoAccountManager。
+  // 隔离环境下 supervised-entry 已把 appData 重定向到隔离根，这里算出的就是隔离目录。
+  const coreDir = path.join(app.getPath("appData"), CORE_DIR_NAME);
+  if (coreDir !== current && fs.existsSync(path.join(coreDir, "accounts.json"))) return coreDir;
+  return current;
+}
+
 function dataRoot() {
-  return path.join(app.getPath("userData"), PROJECT_DIR_NAME);
+  return path.join(realUserDataDir(), PROJECT_DIR_NAME);
 }
 
 function store() {
-  return (state.store ||= createStore(dataRoot()));
+  // 路径在核心 setPath 前后可能变化：root 变了就重建，避免一直用早期缓存的默认目录
+  const root = dataRoot();
+  if (!state.store || state.store.rootDir !== root) state.store = createStore(root);
+  return state.store;
 }
 
 function assets() {
-  return (state.assets ||= createAssets(store()));
+  const svcStore = store();
+  if (!state.assets || state.assetsStore !== svcStore) {
+    state.assets = createAssets(svcStore);
+    state.assetsStore = svcStore;
+  }
+  return state.assets;
 }
 
 /** 任务服务懒加载：涉及 session/分区，等 app ready 后再建更稳妥 */
 function tasks() {
-  return (state.tasks ||= createTaskService({
-    store: store(),
-    assets: assets(),
-    userDataDir: app.getPath("userData"),
-    log: (kind, payload) => {
-      if (process.env.DBM_WORKBENCH_DEBUG === "1") {
-        process.stderr.write(`[workbench] ${kind} ${JSON.stringify(payload || {})}\n`);
-      }
-    },
-    onChanged: notify,
-  }));
+  const svcStore = store();
+  if (state.tasks && state.tasksStore !== svcStore) {
+    try {
+      state.tasks.dispose();
+    } catch {}
+    state.tasks = null;
+  }
+  if (!state.tasks) {
+    state.tasksStore = svcStore;
+    state.tasks = createTaskService({
+      store: svcStore,
+      assets: assets(),
+      // 传解析函数而非固定值：核心改路径后无需重建也能读到正确目录
+      resolveUserDataDir: realUserDataDir,
+      log: (kind, payload) => {
+        if (process.env.DBM_WORKBENCH_DEBUG === "1") {
+          process.stderr.write(`[workbench] ${kind} ${JSON.stringify(payload || {})}\n`);
+        }
+      },
+      onChanged: notify,
+    });
+  }
+  return state.tasks;
 }
 
 function storageStatus() {
@@ -170,7 +211,7 @@ async function snapshot() {
   }
   const assetList = project ? await assets().list(project.id) : [];
   const taskList = project ? await tasks().tasksFor(project.id) : [];
-  const accountList = await tasks().accountView();
+  const accountData = await tasks().accountStatus();
   return {
     storage: storageStatus(),
     index,
@@ -182,7 +223,8 @@ async function snapshot() {
     // 比例候选：来自实测的 platform.ratios，不再是「常见值」
     ratioOptions: ratioOptionsFor(VIDEO_CAPABILITIES, "dola"),
     limits: { maxAssetBytes: MAX_BYTES },
-    accounts: accountList,
+    accounts: accountData.accounts,
+    accountsError: accountData.error,
     tasks: taskList,
     queue: tasks().status(),
     // 状态文案由主进程单一来源提供，避免前后端各写一份
