@@ -42,7 +42,9 @@ const patchExe = has("--patch-exe");
 // 构建渠道：dev（隔离开发版，默认）/ release（正式发布版）；仅写入包内副本，不污染源码
 const buildChannel = argValue("--channel", "dev");
 
-const EXE_NAME = "豆包管理器.exe";
+// 可执行文件名随软件全称变更（旧包名「豆包管理器.exe」仍被启动脚本兼容识别）
+const EXE_NAME = "澜川Dola管理器.exe";
+const EXE_NAME_LEGACY = "豆包管理器.exe";
 const INTEGRITY_MARKER = '[{"file":"resources\\\\app.asar","alg":"SHA256","value":"';
 
 const ALIGN = 4;
@@ -267,8 +269,10 @@ function main() {
   };
 
   if (patchExe) {
-    const exePath = path.join(targetDir, EXE_NAME);
-    if (!fs.existsSync(exePath)) throw new Error(`未找到 exe：${exePath}`);
+    const exePath = [path.join(targetDir, EXE_NAME), path.join(targetDir, EXE_NAME_LEGACY)].find((p) =>
+      fs.existsSync(p)
+    );
+    if (!exePath) throw new Error(`未找到 exe：${path.join(targetDir, EXE_NAME)}`);
     const buf = fs.readFileSync(exePath);
     const marker = Buffer.from(INTEGRITY_MARKER);
     const at = buf.indexOf(marker);

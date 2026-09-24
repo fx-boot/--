@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self';">
-  <title>豆包管理器</title>
+  <title>澜川Dola管理器</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="hd-original.css">
   <link rel="stylesheet" href="video-log.css">
@@ -13,9 +13,9 @@
 <body>
   <header class="titlebar">
     <div class="brand">
-      <div class="brand-mark">豆</div>
+      <div class="brand-mark">澜</div>
       <div>
-        <strong>豆包管理器</strong>
+        <strong>澜川Dola管理器</strong>
         <span>多账号工作台</span>
       </div>
     </div>
@@ -82,6 +82,13 @@
           <button class="text-button" id="exportAccounts" title="导出包含登录状态的完整账号备份">完整备份</button>
         </div>
       </div>
+      <!-- 左下角固定展示：软件全称 + 当前语义化版本号（点击查看更新日志） -->
+      <div class="app-version">
+        <button type="button" class="app-version-badge" id="appVersionBadge" title="当前版本（点击查看更新日志）">
+          <span class="app-version-name">澜川Dola管理器</span>
+          <span class="app-version-num" id="appVersionNum">v—</span>
+        </button>
+      </div>
     </aside>
 
     <main class="workspace">
@@ -96,7 +103,7 @@
       </div>
       <section class="browser-stack" id="browserStack">
         <div class="welcome" id="welcome">
-          <div class="welcome-orbit"><span>豆</span></div>
+          <div class="welcome-orbit"><span>澜</span></div>
           <span class="eyebrow">ONE DESK · MANY ACCOUNTS</span>
           <h1>把每个创作账号<br>放在同一个工作台</h1>
           <p>不同账号的 Cookie 与登录状态相互隔离。选择已有账号，或添加你的第一个账号。</p>
@@ -414,11 +421,15 @@
     </section>
   </div>
 
-  <!-- 版本更新日志（简易记录：当前版本更新摘要 + 构建信息） -->
+  <!-- 关于本软件 / 版本更新日志（简易记录：当前版本更新摘要 + 构建信息） -->
   <div class="overlay hidden" id="workbenchChangelogModal">
     <section class="modal workbench-changelog-modal">
       <div class="modal-title">
-        <h2>版本更新日志</h2>
+        <div>
+          <span class="eyebrow">ABOUT &amp; CHANGELOG</span>
+          <h2>关于 <span class="workbench-about-name">澜川Dola管理器</span></h2>
+          <p>当前版本与本次迭代改动摘要</p>
+        </div>
         <button type="button" class="modal-close" data-close="workbenchChangelogModal">×</button>
       </div>
       <div class="workbench-changelog-body" id="workbenchChangelogBody">读取中…</div>

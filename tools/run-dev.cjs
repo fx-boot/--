@@ -29,7 +29,7 @@ const has = (flag) => args.includes(flag);
 
 const ROOT = path.resolve(__dirname, "..");
 const runtimeDir = path.resolve(argValue("--runtime", path.join(ROOT, "runtime", "dev")));
-const exePath = path.join(runtimeDir, "豆包管理器.exe");
+const exePath = require("./exe-name").resolveExe(runtimeDir);
 const dataDir = path.resolve(
   argValue("--data", path.join(ROOT, "runtime", "dev-data", `boot-${Date.now()}`))
 );

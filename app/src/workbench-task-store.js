@@ -262,6 +262,10 @@ function createAttempt(input = {}) {
 function applyStatus(record, status, note = "") {
   const from = record.status;
   if (!Object.values(STATUS).includes(status)) throw new Error(`未知状态：${status}`);
+  // 幂等：重复写入同一状态直接跳过。
+  // 旧实现会抛「不允许的状态迁移」，轮询在「账号已被判为需人工处理」后再次收到
+  // 平台拒绝时，整个 patch 回滚，poll 计数与错误信息都写不进去。
+  if (from === status) return record;
   if (!canTransition(from, status)) {
     throw new Error(`不允许的状态迁移：${STATUS_LABEL[from] || from} → ${STATUS_LABEL[status] || status}`);
   }
@@ -362,11 +366,27 @@ function createTaskStore(dirFor) {
   const fileFor = (projectId) => path.join(dirFor(projectId), "tasks.json");
 
   function read(projectId) {
+    const file = fileFor(projectId);
+    let raw;
     try {
-      const value = JSON.parse(fs.readFileSync(fileFor(projectId), "utf8"));
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      // 文件不存在：正常情况（首次使用）
+      return { schemaVersion: SCHEMA_VERSION, tasks: [] };
+    }
+    try {
+      const value = JSON.parse(raw);
       const tasks = Array.isArray(value?.tasks) ? value.tasks : [];
       return { schemaVersion: SCHEMA_VERSION, tasks: tasks.map(normalizeAttempt) };
     } catch {
+      // 解析失败：先把损坏文件备份出来再返回空。
+      // 旧实现直接返回空数组，随后任何一次 append 都会用空历史覆盖原文件，
+      // 等于一次损坏就静默清空全部任务记录，且无从恢复。
+      try {
+        const backup = `${file}.corrupt-${Date.now()}.json`;
+        fs.copyFileSync(file, backup);
+        console.error(`[task-store] tasks.json 解析失败，已备份到 ${backup}`);
+      } catch {}
       return { schemaVersion: SCHEMA_VERSION, tasks: [] };
     }
   }

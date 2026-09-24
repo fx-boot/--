@@ -228,7 +228,8 @@ function createDownloader({
     const headers = { Referer: "https://www.dola.com/", Accept: "video/*,application/octet-stream;q=0.9,*/*;q=0.8" };
 
     /** 单来源下载（解析同源地址 → 传输 → 校验 → 落盘） */
-    const runSource = async (source) => {
+    const runSource = async (source, options = {}) => {
+      const useResume = options.resume !== undefined ? options.resume : resume;
       let url = source.url;
       if (source.requiresResolve) {
         report({ phase: "resolve", force: true, message: "正在解析澜川同源原片地址…" });
@@ -243,7 +244,7 @@ function createDownloader({
         url,
         headers,
         partPath,
-        resume,
+        resume: useResume,
         signal: controller.signal,
         onProgress: (p) => report({ phase: "download", received: p.received, total: p.total, resumed: p.resumed }),
       });
@@ -258,9 +259,15 @@ function createDownloader({
     try {
       let outcome = null;
       let lastError = null;
+      // 换来源必须从头下：澜川同源与平台播放版的字节并不一致，
+      // 沿用上一来源留下的分片做断点续传会拼出损坏文件（旧实现所有来源共用同一 partPath 与 resume）。
+      let freshStart = false;
       for (const candidate of [current, ...(allowFallback ? resolved.sources.filter((s) => s.id !== current.id && s.available) : [])]) {
         try {
-          outcome = await runSource(candidate);
+          if (freshStart) {
+            await fsp.rm(partPath, { force: true }).catch(() => {});
+          }
+          outcome = await runSource(candidate, freshStart ? { resume: false } : {});
           current = candidate;
           break;
         } catch (error) {
@@ -277,6 +284,7 @@ function createDownloader({
             return r;
           });
           if (!canFallback) throw error;
+          freshStart = true;
         }
       }
       if (!outcome) throw lastError || new Error("下载失败");

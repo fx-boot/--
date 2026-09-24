@@ -306,6 +306,8 @@ function unbindAsset(project, storyboardId, assetId) {
 function baseHandlers() {
   return {
     "workbench:snapshot": () => snapshot(),
+    // 轻量版本通道：主窗口左下角固定展示版本号用，避免为此拉取整份 snapshot
+    "workbench:version-info": () => appVersion(),
 
     // ── 项目 ───────────────────────────────────────────────
     "workbench:project-create": async (_e, name) => {

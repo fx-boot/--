@@ -719,9 +719,12 @@ const STEP_CHOOSE_PICK = `
   const deadline = Date.now() + __MENU_TIMEOUT__;
   let root = null;
   let flashed = false; // 等待窗口内是否曾出现过菜单（哪怕后来被页面自动关掉）
+  let menuPresent = false; // 菜单节点在、但还没解析出可点选项（radix 渲染中）
   while (Date.now() < deadline) {
-    const found = dropdownRoots().find(el => optionEls(el).length >= 1) || null;
+    const roots = dropdownRoots();
+    const found = roots.find(el => optionEls(el).length >= 1) || null;
     if (found) { root = found; break; }
+    if (roots.length) menuPresent = true;
     if (menuRoots().length) flashed = true;
     await new Promise(r => setTimeout(r, 80));
   }
@@ -729,7 +732,12 @@ const STEP_CHOOSE_PICK = `
     return {
       ok: false,
       flashed,
-      reason: flashed ? '菜单打开后又被页面自动关闭（疑似平台自动聚焦输入框）' : '点击控件后没有出现菜单',
+      menuPresent,
+      reason: menuPresent
+        ? '菜单已出现但没有可识别的选项（radix 仍在渲染）'
+        : flashed
+          ? '菜单打开后又被页面自动关闭（疑似平台自动聚焦输入框）'
+          : '点击控件后没有出现菜单',
       openedMenuTexts: menuRoots().map(r => textOf(r).slice(0, 80)).slice(0, 3),
       ...pageInfo(),
     };
@@ -1366,7 +1374,13 @@ function createDolaDriver(options = {}) {
             // 实测（2026-09-24 提交前校验）：非当前账号的页面 document.hidden=true，
             // 15 秒无响应的「写入提示词」正是这种隐藏页被 Chromium 冻结/降级的症状。
             // 借调试通道把页面生命周期拉回 active，并模拟焦点，避免驱动隐藏页时被卡住。
-            const activation = await ensurePageActive(candidate);
+            // 必须加超时：隐藏页被冻结时 debugger.sendCommand 可能长时间不返回，
+            // 旧实现这里没有超时，会让 pageFor/submit 永不返回，提交槽位与账号锁永久泄漏。
+            const activation = await withTimeout(ensurePageActive(candidate), 15000, {
+              lifecycle: "",
+              focusEmulated: false,
+              errors: ["激活超过 15 秒未完成（继续后续步骤）"],
+            });
             state.activation.set(accountId, activation);
             log("dola-webview-resolved", {
               accountId,
@@ -1478,8 +1492,8 @@ function createDolaDriver(options = {}) {
               ).catch((e) => ({ diagnosticError: String(e?.message || e) }))
             : undefined;
         lastFailure = { ok: false, reason: picked.reason, attempt, diagnostic, flashed: picked.flashed };
-        // 仅「菜单没出现 / 闪现后被页面自动关闭」才重开；“没有匹配项”重开也无益
-        if (!/没有出现菜单|自动关闭/.test(picked.reason || "")) return lastFailure;
+        // 仅「菜单没出现 / 闪现后被自动关闭 / 菜单在但选项还没渲染好」才重开；“没有匹配项”重开也无益
+        if (!/没有出现菜单|自动关闭|没有可识别的选项/.test(picked.reason || "")) return lastFailure;
         await sleep(500);
         continue;
       }

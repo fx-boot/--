@@ -48,6 +48,8 @@
     // 下载实时进度（attemptId → {received,total,speed,remaining,phase}）与来源解析缓存
     downloadProgress: new Map(),
     sourceCache: new Map(),
+    // 版本信息：主窗口左下角徽标与「关于/更新日志」共用（启动时单独拉取一次）
+    appVersion: null,
   };
 
   // ── 小工具 ───────────────────────────────────────────────
@@ -1744,6 +1746,10 @@
 
   // ── 三栏布局：拖拽分隔条 + 折叠状态本地保存 ────────────────
   const LAYOUT_KEY = "dbm.workbench.layout.v1";
+  // 默认三栏比例：把更多宽度让给中间主编辑区（素材 264 / 任务 348），
+  // 与 workbench.css 各断点的兜底值保持一致；拖拽后的宽度会覆盖它并本地记忆。
+  const ASSETS_DEFAULT = 264;
+  const TASKS_DEFAULT = 348;
   const readLayout = () => {
     try {
       return JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}") || {};
@@ -1759,7 +1765,7 @@
     return next;
   };
 
-  /** 应用（并记住）栏宽与折叠状态；默认 280 / 372（可拖拽、双击复位） */
+  /** 应用（并记住）栏宽与折叠状态；默认 264 / 348（可拖拽、双击复位） */
   function applyLayout(patch = {}) {
     const body = document.querySelector(".workbench-body");
     if (!body) return;
@@ -1802,7 +1808,9 @@
         const computed = getComputedStyle(body).gridTemplateColumns.split(" ").map((v) => parseFloat(v) || 0);
         // 以实际渲染宽度落盘（第 1 列=素材，第 5 列=任务）
         applyLayout(
-          side === "left" ? { assetsWidth: Math.round(computed[0] || 280) } : { tasksWidth: Math.round(computed[4] || 372) }
+          side === "left"
+            ? { assetsWidth: Math.round(computed[0] || ASSETS_DEFAULT) }
+            : { tasksWidth: Math.round(computed[4] || TASKS_DEFAULT) }
         );
       };
       bar.addEventListener("pointerdown", (event) => {
@@ -1814,12 +1822,14 @@
       bar.addEventListener("pointermove", move);
       bar.addEventListener("pointerup", up);
       bar.addEventListener("pointercancel", up);
-      bar.addEventListener("dblclick", () => applyLayout(side === "left" ? { assetsWidth: 280 } : { tasksWidth: 372 }));
+      bar.addEventListener("dblclick", () =>
+        applyLayout(side === "left" ? { assetsWidth: ASSETS_DEFAULT } : { tasksWidth: TASKS_DEFAULT })
+      );
       bar.addEventListener("keydown", (event) => {
         // 键盘可达性：左右方向键微调 16px
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
         const layout = readLayout();
-        const current = Number(side === "left" ? layout.assetsWidth : layout.tasksWidth) || (side === "left" ? 280 : 372);
+        const current = Number(side === "left" ? layout.assetsWidth : layout.tasksWidth) || (side === "left" ? ASSETS_DEFAULT : TASKS_DEFAULT);
         const delta = (event.key === "ArrowRight" ? 16 : -16) * (side === "left" ? 1 : -1);
         event.preventDefault();
         applyLayout(side === "left" ? { assetsWidth: Math.max(min, Math.min(max, current + delta)) } : { tasksWidth: Math.max(min, Math.min(max, current + delta)) });
@@ -2772,9 +2782,48 @@
     if (host) host.replaceWith(downloadBlock(record));
   });
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bindEvents);
-  } else {
+  /**
+   * 主窗口左下角：固定展示软件全称 + 当前语义化版本号。
+   * 与工作台弹窗解耦——不打开工作台也能看到版本，点击直接看「关于/更新日志」。
+   */
+  async function bootstrapVersionBadge() {
+    const badge = $("appVersionBadge");
+    const num = $("appVersionNum");
+    if (badge && badge.dataset.bound !== "1") {
+      badge.dataset.bound = "1";
+      badge.addEventListener("click", () => {
+        renderChangelog();
+        $("workbenchChangelogModal")?.classList.remove("hidden");
+      });
+    }
+    try {
+      const info = await api.versionInfo();
+      if (info) state.appVersion = info;
+    } catch {}
+    const info = state.appVersion;
+    if (num) num.textContent = info?.display || "v—";
+    if (badge) {
+      const facts = [];
+      if (info?.channel) facts.push(`渠道：${info.channel}`);
+      if (info?.releasedAt) facts.push(`发布：${info.releasedAt}`);
+      if (info?.gitCommit) facts.push(`Git 提交：${info.gitCommit}`);
+      if (info?.buildAt) facts.push(`构建时间：${info.buildAt}`);
+      badge.title = info
+        ? `澜川Dola管理器 ${info.display}（点击查看更新日志）${facts.length ? `\n${facts.join("\n")}` : ""}`
+        : "当前版本（语义化版本）";
+    }
+    applyVersion();
+  }
+
+  function bootstrap() {
     bindEvents();
+    // 版本徽标单独引导：失败不影响工作台本身
+    bootstrapVersionBadge().catch(() => {});
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootstrap);
+  } else {
+    bootstrap();
   }
 })();

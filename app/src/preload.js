@@ -111,6 +111,7 @@ contextBridge.exposeInMainWorld("managerProxyPoolAPI", {
 
 contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
   snapshot: () => ipcRenderer.invoke("workbench:snapshot"),
+  versionInfo: () => ipcRenderer.invoke("workbench:version-info"),
   project: {
     create: (name) => ipcRenderer.invoke("workbench:project-create", name),
     open: (projectId) => ipcRenderer.invoke("workbench:project-open", projectId),

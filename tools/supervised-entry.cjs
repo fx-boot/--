@@ -54,6 +54,22 @@ function writeRecord() {
   } catch {}
 }
 
+// 软件全称统一为「澜川Dola管理器」。
+// 核心主进程逻辑被编译进 main.jsc（字节码，且带 SHA-256 完整性校验，不能改），
+// 它内部创建的窗口标题无法直接在源码里改；这里在窗口创建后统一覆盖标题，
+// 并拦截 page-title-updated，避免页面 <title> 又把它改回去。
+const APP_TITLE = "澜川Dola管理器";
+app.on("browser-window-created", (_event, win) => {
+  try {
+    win.setTitle(APP_TITLE);
+    win.on("page-title-updated", (event) => {
+      event.preventDefault();
+      win.setTitle(APP_TITLE);
+    });
+    record.titleOverridden = (record.titleOverridden || 0) + 1;
+  } catch {}
+});
+
 try {
   require("./src/main");
   record.mainLoaded = true;

@@ -21,6 +21,7 @@ const { createRunner, classifyBlock, summarizeDriver } = require(path.join(SRC, 
 const download = require(path.join(SRC, "workbench-download.js"));
 const { createAssets } = require(path.join(SRC, "workbench-assets.js"));
 const { VIDEO_CAPABILITIES } = require(path.join(SRC, "video-capabilities.js"));
+const store = require(path.join(SRC, "workbench-store.js"));
 
 let passed = 0;
 const failures = [];
@@ -154,6 +155,25 @@ async function main() {
   eq("登录失效被识别为账号阻塞", classifyBlock("登录状态已失效，请重新登录")?.code, "AUTH");
   eq("验证码被识别", classifyBlock("请完成验证码")?.code, "CAPTCHA");
   eq("限额被识别", classifyBlock("今日额度已用完")?.code, "QUOTA");
+
+  // ══ 1b. 本轮修复回归（离线、不接触平台） ══
+  console.log("── 本轮修复回归 ──");
+  // AUTH 误判：网络摘要里的裸 401/403 数字不能被当成登录失效，否则账号会被误封
+  eq(
+    "网络摘要里的 403 不再误判为登录失效",
+    classifyBlock("观察到的请求：RESP /list→403 | POST /chat/completion→200"),
+    null
+  );
+  eq("明确的 HTTP 403 仍判为登录失效", classifyBlock("HTTP 403 Forbidden")?.code, "AUTH");
+  // 状态幂等：重复写入同一状态不再抛错（否则轮询的计数与错误信息会整段回滚）
+  const idem = task.createAttempt({ projectId, storyboardId: "sb_idem", accountId: "acc_1" });
+  task.applyStatus(idem, task.STATUS.MANUAL);
+  task.applyStatus(idem, task.STATUS.MANUAL, "再次确认");
+  eq("重复写入同一状态不抛错且状态不变", idem.status, "manual");
+  // 项目级 settings 必须被归一化保留：任务服务靠它保存「生成成功后自动下载」
+  const preserved = store.normalizeProject({ id: "prj_x", settings: { autoDownload: true } }, "prj_x");
+  eq("项目级 settings.autoDownload 被保留", preserved.settings.autoDownload, true);
+  eq("未提供 settings 时补空对象", store.normalizeProject({ id: "prj_y" }, "prj_y").settings, {});
 
   // ══ 2. 快照不可变 ══
   console.log("── 快照不可变 ──");

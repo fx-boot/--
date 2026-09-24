@@ -25,7 +25,14 @@ const {
 const { buildPlan, validateParams } = require("./workbench-platform");
 
 const ACCOUNT_BLOCK_PATTERNS = [
-  { code: "AUTH", re: /登录|未登录|登录失效|重新登录|unauthor|401|403/i, label: "登录状态失效" },
+  // AUTH 必须由「登录/鉴权」语义或明确的 HTTP 401/403 语义触发。
+  // 旧实现含裸 `401|403`，会把任意含这两个数字的文本（例如网络请求摘要里的
+  // 「RESP /list→403」）误判成「登录状态失效」，进而把账号封停、后续任务全部转人工。
+  {
+    code: "AUTH",
+    re: /登录|未登录|登录失效|重新登录|unauthoriz|未授权|鉴权|认证失败|HTTP\s*40[13]|40[13]\s*(?:Unauthorized|Forbidden)/i,
+    label: "登录状态失效",
+  },
   { code: "CAPTCHA", re: /验证码|人机|captcha|challenge/i, label: "出现验证码/人机校验" },
   { code: "QUOTA", re: /额度|限额|配额|次数不足|quota|limit exceeded/i, label: "额度或限额受限" },
 ];
@@ -577,7 +584,19 @@ function createRunner(options = {}) {
     // 但驱动没在超时窗口内抓到任务 ID，旧逻辑在此直接 return，
     // 于是工作台永远停在「待确认」、也永远不会转入下载。改为：无 ID 时仍轮询，
     // 由驱动按「页面上出现本次提示词对应的视频」判定结果（不依赖平台 ID）。
-    const monitorable = Boolean(record.platformTaskId) || record.status === STATUS.UNCONFIRMED;
+    // 可监控判定：有平台任务 ID 就按 ID 核实；没有 ID 但已经进入平台侧流转的状态
+    // （待确认 / 排队 / 生成中）同样必须继续轮询——平台可能已受理并生成完成，
+    // 只是提交时没抓到任务 ID。旧实现只认 platformTaskId 与 unconfirmed，
+    // 于是 execute() 的「平台已受理但无 ID」QUEUED 排了一次 poll 后立即在这里 return，
+    // 且不再重排，任务永远卡在排队、发现不了成功或失败。
+    // submitting 仅在「本进程当前没有在跑这条提交」时才监控（重启后遗留的提交只能靠轮询收尾），
+    // 避免与正在进行的提交争抢同一个 webview。
+    const monitorable =
+      Boolean(record.platformTaskId) ||
+      record.status === STATUS.UNCONFIRMED ||
+      record.status === STATUS.QUEUED ||
+      record.status === STATUS.GENERATING ||
+      (record.status === STATUS.SUBMITTING && !state.running.has(attemptId));
     if (!monitorable) return;
 
     const startedAt = Date.parse(record.submittedAt || record.createdAt) || Date.now();

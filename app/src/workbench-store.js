@@ -88,6 +88,9 @@ function normalizeProject(input = {}, id) {
     defaults: normalizeDefaults(input.defaults),
     storyboards: storyboards.map((sb, i) => normalizeStoryboard(sb, i)),
     ui: input.ui && typeof input.ui === "object" ? input.ui : {},
+    // 项目级设置必须保留：任务服务通过 saveProject 写入 settings.autoDownload，
+    // 旧实现归一化时把 settings 丢掉，导致「生成成功后自动下载」开关永远读不到、永久失效。
+    settings: input.settings && typeof input.settings === "object" ? input.settings : {},
     generation: Number.isInteger(input.generation) ? input.generation : 1,
   };
 }
@@ -165,11 +168,34 @@ function createStore(rootDir) {
     fs.mkdirSync(projectsDir, { recursive: true });
   }
 
-  async function writeAtomic(file, value) {
+  // 同一文件的写入串行化 + 唯一临时名。
+  // 旧实现临时名固定为 `${file}.tmp` 且不串行化：两个 debounce（提示词自动保存、
+  // 分镜参数保存）同时到期时会互相覆盖临时文件，或后写覆盖前写，导致分镜/引用丢失。
+  const writeQueues = new Map();
+  async function writeFileAtomic(file, value) {
     await fsp.mkdir(path.dirname(file), { recursive: true });
-    const tmp = `${file}.tmp`;
+    const tmp = `${file}.${process.pid}.${Date.now().toString(36)}.${Math.random()
+      .toString(36)
+      .slice(2, 8)}.tmp`;
     await fsp.writeFile(tmp, dump(value), "utf8");
-    await fsp.rename(tmp, file);
+    try {
+      await fsp.rename(tmp, file);
+    } catch (error) {
+      try {
+        await fsp.rm(tmp, { force: true });
+      } catch {}
+      throw error;
+    }
+  }
+
+  function writeAtomic(file, value) {
+    const prev = writeQueues.get(file) || Promise.resolve();
+    const next = prev.then(
+      () => writeFileAtomic(file, value),
+      () => writeFileAtomic(file, value)
+    );
+    writeQueues.set(file, next.catch(() => {}));
+    return next;
   }
 
   async function readJson(file, fallback) {

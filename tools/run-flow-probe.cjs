@@ -25,7 +25,7 @@ const waitSeconds = Number(argValue("--seconds", "180"));
 
 const ROOT = path.resolve(__dirname, "..");
 const runtimeDir = path.join(ROOT, "runtime", "dev");
-const exePath = path.join(runtimeDir, "豆包管理器.exe");
+const exePath = require("./exe-name").resolveExe(runtimeDir);
 const reportPath = path.join(runtimeDir, "flow-probe-report.json");
 const isolatedRoot = path.join(ROOT, "runtime", "isolation", `flow-${Date.now()}`);
 const chromiumDir = path.join(isolatedRoot, "chromium");

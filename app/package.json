@@ -1,7 +1,8 @@
 {
   "name": "doubao-account-manager",
+  "productName": "澜川Dola管理器",
   "version": "2.0.0",
-  "description": "豆包多账号管理器 V2.0 - 独立会话、资源管理与离线授权",
+  "description": "澜川Dola管理器 - 多账号独立会话、Dola 视频分镜批量生成、澜川同源下载与离线授权",
   "main": "src/main.js",
   "author": "",
   "license": "UNLICENSED",

@@ -32,7 +32,7 @@ const supervised = args.includes("--supervised");
 
 const ROOT = path.resolve(__dirname, "..");
 const runtimeDir = path.join(ROOT, "runtime", "dev");
-const exePath = path.join(runtimeDir, "豆包管理器.exe");
+const exePath = require("./exe-name").resolveExe(runtimeDir);
 const reportPath = path.join(runtimeDir, "boot-probe-report.json");
 const isolatedRoot = path.join(ROOT, "runtime", "isolation", supervised ? "stable" : `run-${Date.now()}`);
 /** 受控入口模式读 launch-record.json；探针模式读 boot-probe-report.json */
