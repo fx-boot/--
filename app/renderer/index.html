@@ -3,17 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; media-src 'self' https: http: file: blob:;">
   <title>澜川Dola管理器</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="hd-original.css">
   <link rel="stylesheet" href="video-log.css">
   <link rel="stylesheet" href="workbench.css">
+  <link rel="stylesheet" href="studio-theme.css">
+  <link rel="stylesheet" href="workbench-library.css">
 </head>
 <body>
   <header class="titlebar">
     <div class="brand">
-      <div class="brand-mark">澜</div>
+      <img class="brand-mark" src="../assets/lanchuan-icon.svg" alt="澜川">
       <div>
         <strong>澜川Dola管理器</strong>
         <span>多账号工作台</span>
@@ -41,14 +43,14 @@
       <button class="toolbar-btn" id="toggleResourcesPanel" title="收起或展开素材栏">
         <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM15 5v14"/></svg><span>素材栏</span>
       </button>
-      <button class="toolbar-btn toolbar-accent" id="showWorkbench" title="视频分镜批量生成工作台">
-        <svg viewBox="0 0 24 24"><path d="M3 5h18v14H3zM3 10h18M9 10v9M15 10v9"/></svg><span>分镜工作台</span>
+      <button class="toolbar-btn toolbar-accent" id="showWorkbench" title="打开视频创作工作台">
+        <svg viewBox="0 0 24 24"><path d="M3 5h18v14H3zM3 10h18M9 10v9M15 10v9"/></svg><span>视频创作</span>
       </button>
     </nav>
     <div class="license-pill" id="licensePill">
       <span class="status-dot"></span>
       <span id="licenseText">授权读取中</span>
-      <button id="renewLicense">续期</button>
+      <button id="renewLicense">授权信息</button>
     </div>
     <div class="window-controls">
       <button id="windowMin" title="最小化">—</button>
@@ -225,19 +227,22 @@
     </section>
   </div>
 
-  <!-- 视频分镜批量生成工作台（阶段1：素材 / 分镜 / @图片 / 草稿） -->
+  <!-- 视频创作工作台：一个提示词框 / 参考图片 / 参数 / 任务 -->
   <div class="overlay hidden" id="workbenchModal">
     <section class="modal workbench-modal">
       <div class="modal-title">
         <div>
-          <span class="eyebrow">STORYBOARD WORKBENCH</span>
-          <h2>视频分镜工作台 <span class="workbench-version-badge" id="workbenchVersion" title="当前版本（语义化版本）">v—</span></h2>
+          <h2>视频创作工作台 <span class="workbench-version-badge" id="workbenchVersion" title="当前版本（语义化版本）">v—</span></h2>
           <p id="workbenchStorage">数据目录读取中…</p>
         </div>
         <div class="workbench-title-actions">
-          <select id="workbenchProjectSelect" aria-label="选择项目"></select>
+          <select id="workbenchProjectSelect" aria-label="选择大项目"></select>
+          <select id="workbenchEpisodeSelect" aria-label="选择分集或公共素材"></select>
+          <button type="button" class="secondary-action compact" id="workbenchEpisodeNew">新建分集</button>
           <button type="button" class="secondary-action compact" id="workbenchProjectNew">新建项目</button>
           <button type="button" class="secondary-action compact" id="workbenchProjectRename">重命名</button>
+          <button type="button" class="secondary-action compact workbench-danger-btn" id="workbenchEpisodeDelete" title="删除当前分集（含其素材与任务记录）">删除分集</button>
+          <button type="button" class="secondary-action compact workbench-danger-btn" id="workbenchProjectDelete" title="删除当前大项目（有分集时会询问是否一并删除）">删除项目</button>
           <button type="button" class="text-button workbench-changelog-btn" id="workbenchVersionLog">更新日志</button>
           <button type="button" class="modal-close" data-close="workbenchModal">×</button>
         </div>
@@ -249,6 +254,7 @@
             <span class="count-badge" id="workbenchAssetCount">0</span>
           </div>
           <div class="workbench-asset-inner" id="workbenchAssetInner">
+            <div class="workbench-asset-location"><span id="workbenchAssetLocation"></span><button type="button" class="text-button" id="workbenchAssetReuse">从本项目复用素材</button></div>
             <div class="workbench-asset-tools">
               <label class="search-box">
                 <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
@@ -269,12 +275,13 @@
           <!-- 单条创作主区：一个编辑框 + 上方参数 + 下方主操作栏 -->
           <div class="workbench-create" id="workbenchCreate">
             <div class="workbench-params-row" id="workbenchParamsRow"></div>
-            <label class="workbench-prompt-label" for="workbenchMainPrompt">
+            <div class="workbench-prompt-label">
               <span>提示词</span>
-              <em>输入 @ 可插入参考图片</em>
-            </label>
-            <textarea id="workbenchMainPrompt" class="workbench-main-prompt" spellcheck="false"
-              placeholder="描述这个分镜的画面与动作；在需要的位置输入 @ 插入参考图片"></textarea>
+              <em>输入 @ 插入参考图片 · Ctrl+Enter 生成 · Ctrl+S 立即保存 · Ctrl+V 粘贴图片</em>
+              <div class="library-entry"><button type="button" id="workbenchTemplates">模板</button><button type="button" id="workbenchHistory">历史</button><button type="button" id="workbenchWorks">作品</button></div>
+            </div>
+            <textarea id="workbenchMainPrompt" aria-label="提示词" class="workbench-main-prompt" spellcheck="false"
+              placeholder="描述你想生成的画面、人物与动作；输入 @ 插入参考图片"></textarea>
             <div class="workbench-refs-row" id="workbenchRefsRow"></div>
             <div class="workbench-main-actionbar">
               <div class="workbench-run-summary" id="workbenchRunSummary"></div>
@@ -289,19 +296,23 @@
             <div class="workbench-main-status" id="workbenchMainStatus"></div>
           </div>
 
-          <!-- 分镜列表 / 批量模式（保留既有能力，默认收进次级入口，避免和主编辑框抢输入） -->
-          <details class="workbench-storyboards-wrap" id="workbenchStoryboardsWrap">
+          <!-- 分集列表 / 批量：默认收起；展开后承载排序、批量复制与删除 -->
+          <details class="workbench-storyboards-wrap" id="workbenchEpisodeWrap">
             <summary>
-              <strong>分镜列表 / 批量</strong>
-              <span class="workbench-hint">收起的：历史分镜与批量提交都在这里，不会影响上面的编辑框</span>
+              <span id="workbenchEpisodeSummary">分集列表 / 批量</span>
+              <span class="workbench-hint" id="workbenchEpisodeHint">展开可排序、批量复制与删除</span>
             </summary>
-            <div class="workbench-storyboards-actions">
-              <button type="button" class="secondary-action compact" id="workbenchStoryboardAdd">新增分镜</button>
-              <button type="button" class="secondary-action compact" id="workbenchRunBatch">生成整批（分配执行）</button>
-              <button type="button" class="secondary-action compact" id="workbenchPasteOpen">批量粘贴提示词</button>
+            <div class="workbench-storyboards-actions workbench-episode-actions" id="workbenchEpisodeActions">
+              <label class="workbench-episode-check"><input type="checkbox" id="workbenchEpisodeAll"> 全选</label>
+              <button type="button" class="text-button" id="workbenchEpisodeUp" title="把选中的一条分集上移一位">上移</button>
+              <button type="button" class="text-button" id="workbenchEpisodeDown" title="把选中的一条分集下移一位">下移</button>
+              <button type="button" class="text-button" id="workbenchEpisodeCopy" title="复制选中分集（含提示词、参数与素材）">批量复制</button>
+              <button type="button" class="text-button" id="workbenchEpisodeRemove" title="删除选中分集（含素材与任务记录）">批量删除</button>
+              <span class="workbench-hint" id="workbenchEpisodeSelection">未选择分集</span>
             </div>
-            <div class="workbench-storyboards" id="workbenchStoryboardList"></div>
+            <div class="workbench-storyboards" id="workbenchEpisodeList"></div>
           </details>
+
           <span class="workbench-hint" id="workbenchHint"></span>
         </div>
 
@@ -330,36 +341,26 @@
             </div>
           </div>
           <div class="workbench-account-note" id="workbenchAccountNote">账号状态与额度本工作台无法核实，显示为未知。</div>
-          <div class="workbench-task-list" id="workbenchTaskList"></div>
-        </aside>
-      </div>
-    </section>
-  </div>
-
-  <!-- 批量粘贴提示词：导入前预览拆分结果 -->
-  <div class="overlay hidden" id="workbenchPasteModal">
-    <section class="modal workbench-paste-modal">
-      <div class="modal-title">
-        <div><span class="eyebrow">BULK IMPORT</span><h2>批量粘贴提示词</h2><p>先预览拆分结果，确认后再导入为分镜</p></div>
-        <button type="button" class="modal-close" data-close="workbenchPasteModal">×</button>
-      </div>
-      <div class="workbench-paste-body">
-        <div class="workbench-paste-input">
-          <div class="workbench-paste-modes" id="workbenchPasteModes">
-            <label><input type="radio" name="workbenchPasteMode" value="blank" checked> 空行分隔</label>
-            <label><input type="radio" name="workbenchPasteMode" value="line"> 每行一条</label>
-            <label><input type="radio" name="workbenchPasteMode" value="marker"> 按标题/分镜标记</label>
+          <div class="workbench-task-overview" id="workbenchTaskOverview">
+            <div class="workbench-task-summary" id="workbenchTaskSummary" role="status" aria-live="polite">还没有生成任务</div>
+            <div class="workbench-task-filters" id="workbenchTaskFilters" role="group" aria-label="筛选生成任务">
+              <button type="button" data-filter="all" aria-pressed="true">全部</button>
+              <button type="button" data-filter="active" aria-pressed="false">进行中</button>
+              <button type="button" data-filter="attention" aria-pressed="false">需处理</button>
+              <button type="button" data-filter="succeeded" aria-pressed="false">已生成</button>
+            </div>
+            <input id="workbenchTaskSearch" class="workbench-task-search" type="search" aria-label="搜索任务或账号" placeholder="搜索任务或账号">
+            <div class="workbench-task-tools">
+              <button type="button" class="text-button" id="workbenchTaskClear"
+                title="只清理「生成成功且下载未在进行」的记录；失败、需人工处理与未完成任务一律保留">清理已完成任务</button>
+            </div>
           </div>
-          <textarea id="workbenchPasteText" placeholder="把提示词粘贴到这里，多个分镜之间用空行分隔"></textarea>
-        </div>
-        <div class="workbench-paste-preview">
-          <div class="workbench-section-head"><strong>拆分预览</strong><span id="workbenchPasteCount">0 条</span></div>
-          <div class="workbench-paste-list" id="workbenchPasteList"></div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <button type="button" class="secondary-action" data-close="workbenchPasteModal">取消</button>
-        <button type="button" class="primary-action" id="workbenchPasteImport" disabled>导入为分镜</button>
+          <div class="workbench-task-list" id="workbenchTaskList"></div>
+          <div class="workbench-task-pagination" id="workbenchTaskPagination">
+            <span id="workbenchTaskRange"></span>
+            <button type="button" class="text-button" id="workbenchTaskMore" hidden>显示更多</button>
+          </div>
+        </aside>
       </div>
     </section>
   </div>
@@ -392,31 +393,31 @@
     </section>
   </div>
 
-  <!-- 提交前确认：先展示校验结果与平台限制 -->
-  <div class="overlay hidden" id="workbenchRunModal">
-    <section class="modal confirm-modal workbench-run-modal">
-      <div class="modal-title">
-        <div><span class="eyebrow">SUBMIT ONE STORYBOARD</span><h2>确认提交这一条分镜</h2><p>默认只提交一条，用于验证闭环；不会批量消耗账号额度</p></div>
-        <button type="button" class="modal-close" data-close="workbenchRunModal">×</button>
-      </div>
-      <div class="workbench-run-body" id="workbenchRunPreview"></div>
-      <div class="modal-actions">
-        <button type="button" class="secondary-action" data-close="workbenchRunModal">取消</button>
-        <button type="button" class="primary-action" id="workbenchRunConfirm">确认提交</button>
-      </div>
-    </section>
-  </div>
-
   <!-- 删除素材：影响范围确认 -->
   <div class="overlay hidden" id="workbenchImpactModal">
     <section class="modal confirm-modal workbench-impact-modal">
       <div class="danger-icon">!</div>
-      <h2>这些素材仍被分镜引用</h2>
+      <h2>这些素材仍被提示词引用</h2>
       <p id="workbenchImpactSummary">删除会同时解除引用，并移除提示词中对应的 @图片 标记。</p>
       <div class="workbench-impact-list" id="workbenchImpactList"></div>
       <div class="modal-actions">
         <button type="button" class="secondary-action" data-close="workbenchImpactModal">取消</button>
         <button type="button" class="danger-action" id="workbenchImpactConfirm">解除引用并删除</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- 工作台通用确认弹窗：删除分集/项目、批量生成、未保存改动、批量清理任务共用 -->
+  <div class="overlay hidden" id="workbenchConfirmModal">
+    <section class="modal confirm-modal workbench-confirm-modal">
+      <div class="danger-icon" id="workbenchConfirmIcon">!</div>
+      <h2 id="workbenchConfirmTitle">确认操作</h2>
+      <p id="workbenchConfirmMessage"></p>
+      <div class="workbench-confirm-extra" id="workbenchConfirmExtra"></div>
+      <div class="modal-actions">
+        <button type="button" class="secondary-action" data-close="workbenchConfirmModal">取消</button>
+        <button type="button" class="secondary-action" id="workbenchConfirmAlt" hidden>丢弃改动</button>
+        <button type="button" class="danger-action" id="workbenchConfirmOk">确认</button>
       </div>
     </section>
   </div>
@@ -444,6 +445,8 @@
   <script src="hd-original.js"></script>
   <script src="video-log-shared.js"></script>
   <script src="video-log.js"></script>
+  <script src="workbench-library.js"></script>
+  <script src="workbench-project-assets.js"></script>
   <script src="workbench.js"></script>
 </body>
 </html>

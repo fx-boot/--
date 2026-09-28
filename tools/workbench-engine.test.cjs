@@ -1334,11 +1334,13 @@ const refWarn = platform.validateParams({
   eq("对比模式下单分镜多账号成倍", platform.assignStoryboards({ storyboardIds: ["sb_1"], accountIds: accounts, mode: "compare" }).length, 2);
   eq("空输入返回空计划", platform.assignStoryboards({ storyboardIds: [], accountIds: accounts }).length, 0);
 
-  check("渲染层默认模式是分配执行", /run: \{ mode: "distribute"/.test(rendererSrc), "state.run 初始化");
-  check("打开确认框的默认模式是分配执行", /async function openRunModal\(storyboardIds, mode = "distribute"\)/.test(rendererSrc));
-  check("确认框提供模式选择", /workbenchRunMode/.test(rendererSrc));
-  check("分镜卡片按钮走分配模式", /openRunModal\(\[storyboardId\], "distribute"\)/.test(rendererSrc));
-  check("工具栏有「生成整批（分配执行）」入口", /id="workbenchRunBatch"/.test(indexSrc) && /workbenchRunBatch/.test(rendererSrc));
+  // v0.5.0 起创作界面换成「单一提示词框」，旧的 run 弹窗 / workbenchRunMode / 生成整批入口
+  // 已按需求移除并沉淀到批量分集列表；这里改成校验当前界面契约（同样可离线静态判定）。
+  check("渲染层主按钮为单提示词生成入口", /id="workbenchGenerate"/.test(indexSrc) && /async function generateCurrent/.test(rendererSrc));
+  check("多账号生成前有二次确认", /确认多账号生成/.test(rendererSrc) && /workbenchConfirmModal/.test(indexSrc));
+  check("确认文案明确任务数与额度消耗", /账号各生成一次，共创建/.test(rendererSrc) && /分别消耗对应账号额度/.test(rendererSrc));
+  check("分集列表提供批量复制与批量删除", /workbenchEpisodeCopy/.test(indexSrc) && /workbenchEpisodeRemove/.test(indexSrc) && /duplicateEpisodes/.test(rendererSrc));
+  check("工具栏保留新建分集 / 删除分集 / 删除项目入口", ["workbenchEpisodeNew", "workbenchEpisodeDelete", "workbenchProjectDelete"].every((id) => indexSrc.includes(`id="${id}"`) && rendererSrc.includes(`"${id}"`)));
 
   check("界面不再写「每个账号各生成一条」当作默认", !/每个账号各生成一条/.test(rendererSrc));
 

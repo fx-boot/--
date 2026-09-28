@@ -1,5 +1,5 @@
 /**
- * 视频分镜批量生成工作台 · 渲染层
+ * 视频创作工作台 · 单提示词编辑器
  *
  * 阶段 1 范围：素材库、分镜编辑、@图片绑定、草稿自动保存与重启恢复。
  * 平台能力（模型/时长）一律取自主进程返回的 capabilities（即应用自身的能力表），
@@ -27,10 +27,12 @@
     accountsLoading: false,
     accountsError: null,
     tasks: [],
+    taskFilter: "all",
+    taskSearch: "",
+    taskVisibleLimit: 40,
     queue: null,
     // 执行账号可多选：一次为每个勾选账号各建一条尝试
     selectedAccountIds: [],
-    run: { mode: "distribute", storyboardIds: [], accountIds: [], assignments: [], currentAttemptId: "" },
     // 单条创作区：当前分镜、繁忙状态与状态文案
     compose: { storyboardId: "", draft: "", busy: "", status: "", statusKind: "" },
     assetsCollapsed: false,
@@ -41,7 +43,12 @@
     // 正在编辑但尚未落盘的值：重渲染时优先使用，避免自动保存期间的输入被覆盖
     pendingValues: new Map(),
     lastSaved: "",
-    focusedStoryboardId: "",
+    // 草稿三态：saved（已保存）/ saving（保存中）/ dirty（存在未保存改动）
+    draftState: "saved",
+    // 分集列表的批量选中集合（不落盘，仅本次会话）
+    episodeSelection: new Set(),
+    // 账号勾选持久化的归属项目：切换项目时从该项目自己的 ui 重新载入
+    accountsOwner: "",
     mention: { storyboardId: "", prompt: "", caret: 0, search: "" },
     impact: { assetIds: [] },
     thumbCache: new Map(),
@@ -65,6 +72,51 @@
 
   const openModal = (id) => $(id)?.classList.remove("hidden");
   const closeModal = (id) => $(id)?.classList.add("hidden");
+
+  /**
+   * 通用确认弹窗（Electron 渲染层没有可用的原生 confirm）。
+   * 返回 "ok" | "alt" | "cancel"：三按钮版本用于「保存并切换 / 丢弃改动 / 取消」。
+   * options.extra 可放一段自定义说明节点（例如将被一并删除的分集清单）。
+   */
+  function confirmAction(options = {}) {
+    const modal = $("workbenchConfirmModal");
+    if (!modal) return Promise.resolve("ok");
+    const icon = $("workbenchConfirmIcon");
+    $("workbenchConfirmTitle").textContent = options.title || "确认操作";
+    $("workbenchConfirmMessage").textContent = options.message || "";
+    if (icon) icon.textContent = options.danger === false ? "i" : "!";
+    const extra = $("workbenchConfirmExtra");
+    if (extra) {
+      extra.replaceChildren();
+      if (options.extra) extra.appendChild(options.extra);
+      extra.hidden = !options.extra;
+    }
+    const ok = $("workbenchConfirmOk");
+    ok.textContent = options.okLabel || "确认";
+    ok.className = options.danger === false ? "primary-action" : "danger-action";
+    const alt = $("workbenchConfirmAlt");
+    alt.hidden = !options.altLabel;
+    alt.textContent = options.altLabel || "";
+    return new Promise((resolve) => {
+      const finish = (value) => {
+        ok.removeEventListener("click", onOk);
+        alt.removeEventListener("click", onAlt);
+        modal.removeEventListener("click", onClose, true);
+        closeModal("workbenchConfirmModal");
+        resolve(value);
+      };
+      const onOk = () => finish("ok");
+      const onAlt = () => finish("alt");
+      const onClose = (event) => {
+        if (event.target === modal || event.target.closest("[data-close]")) finish("cancel");
+      };
+      ok.addEventListener("click", onOk);
+      alt.addEventListener("click", onAlt);
+      modal.addEventListener("click", onClose, true);
+      openModal("workbenchConfirmModal");
+      ok.focus();
+    });
+  }
 
   function formatBytes(bytes) {
     const n = Number(bytes) || 0;
@@ -105,10 +157,20 @@
   }
 
   // ── 数据 ─────────────────────────────────────────────────
+  let creationLibrary;
+  let refreshVersion = 0;
+  let editorFingerprint = "";
   async function refresh(options = {}) {
+    const version = ++refreshVersion;
+    let tasksOnly = false;
     if (!options.silent) {
       try {
         const snapshot = await api.snapshot();
+        if (version !== refreshVersion) return;
+        const fingerprint = JSON.stringify([snapshot.storage, snapshot.index, snapshot.project, snapshot.assets,
+          snapshot.capabilities, snapshot.capabilityView, snapshot.ratioOptions, snapshot.limits, snapshot.appVersion]);
+        tasksOnly = options.tasksOnly === true && fingerprint === editorFingerprint;
+        editorFingerprint = fingerprint;
         Object.assign(state, {
           storage: snapshot.storage,
           index: snapshot.index,
@@ -121,6 +183,8 @@
           accounts: snapshot.accounts || [],
           accountsError: snapshot.accountsError || null,
           tasks: snapshot.tasks || [],
+          statusLabels: snapshot.statusLabels || {},
+          downloadLabels: snapshot.downloadLabels || {},
           queue: snapshot.queue || null,
           appVersion: snapshot.appVersion || null,
         });
@@ -130,7 +194,17 @@
         return;
       }
     }
-    render();
+    if (tasksOnly) {
+      const focus = captureFocus();
+      renderAccounts();
+      renderTasks();
+      renderHint();
+      restoreFocus(focus);
+    } else {
+      render();
+    }
+    creationLibrary?.render();
+    return true;
   }
 
   function captureFocus() {
@@ -159,6 +233,7 @@
     const focus = captureFocus();
     renderStorage();
     renderProjects();
+    renderEpisodes();
     renderAssets();
     // 先把栏宽/折叠状态应用回来，再渲染内容（避免首帧按默认宽度闪一下）
     applyLayout();
@@ -166,39 +241,24 @@
     renderAccounts();
     renderParams();
     renderCompose();
-    renderStoryboards();
     renderTasks();
-    renderRunProgress();
     renderHint();
+    restoreDraftBackup();
     restoreFocus(focus);
   }
 
-  /** 提交确认框里的实时进度：执行期间每一步都会刷新，避免看起来「点了没反应」 */
-  function renderRunProgress() {
-    const modal = $("workbenchRunModal");
-    const status = $("workbenchRunStatus");
-    if (!modal || !status || modal.classList.contains("hidden")) return;
-    const attemptId = state.run.currentAttemptId;
-    if (!attemptId) return;
-    const record = (state.tasks || []).find((t) => t.id === attemptId);
-    if (!record) return;
-    const steps = record.driver?.steps || [];
-    const last = steps[steps.length - 1];
-    if (record.driver?.outcome === "running") {
-      status.textContent = `第 ${steps.length} 步：${
-        last ? STEP_LABEL[last.step] || last.step : "正在打开账号页面"
-      }…（真实提交，请勿关闭窗口）`;
-      return;
-    }
-    if (last) {
-      status.textContent = `最近一步：${STEP_LABEL[last.step] || last.step}${last.detail ? ` · ${last.detail}` : ""}`;
-    }
+  /** 草稿状态文案：保存中 / 存在未保存改动 / 已自动保存 */
+  function draftText() {
+    if (state.draftState === "saving") return "草稿保存中…";
+    if (state.draftState === "dirty") return "存在未保存改动（松开输入 0.6 秒自动保存，Ctrl+S 立即保存）";
+    return state.lastSaved ? `草稿已保存 ${state.lastSaved}` : "编辑内容会自动保存";
   }
 
   function renderHint() {
     const hint = $("workbenchHint");
     if (!hint) return;
-    hint.textContent = state.lastSaved ? `已自动保存 ${state.lastSaved}` : "编辑内容会自动保存";
+    hint.textContent = draftText();
+    hint.classList.toggle("is-dirty", state.draftState !== "saved");
   }
 
   function renderStorage() {
@@ -217,21 +277,273 @@
 
   function renderProjects() {
     const select = $("workbenchProjectSelect");
+    const episodes = $("workbenchEpisodeSelect");
     if (!select) return;
-    select.innerHTML = "";
-    if (!state.index.projects.length) {
-      const option = document.createElement("option");
-      option.value = "";
-      option.textContent = "（暂无项目，请先新建）";
-      select.appendChild(option);
+    const projects = state.index.projects || [];
+    const current = state.project;
+    const rootId = current?.parentId || current?.id || "";
+    const root = projects.find(p => p.id === rootId);
+    select.replaceChildren();
+    const roots = projects.filter(p => !p.parentId || !projects.some(parent => parent.id === p.parentId));
+    for (const project of roots) select.add(new Option(project.name, project.id));
+    if (!roots.length) select.add(new Option("（暂无项目，请先新建）", ""));
+    select.value = rootId;
+    if (episodes) {
+      episodes.replaceChildren();
+      episodes.add(new Option("公共素材 / 项目工作区", rootId));
+      // 下拉顺序与「分集列表」保持一致（列表里上移下移后，这里同步变化）
+      for (const child of episodesOf(rootId)) episodes.add(new Option(child.name, child.id));
+      episodes.value = current?.id || rootId;
+      episodes.disabled = !current || Boolean(state.compose.busy);
     }
-    for (const project of state.index.projects) {
-      const option = document.createElement("option");
-      option.value = project.id;
-      option.textContent = `${project.name}（${project.storyboardCount} 个分镜）`;
-      select.appendChild(option);
+    const label = $("workbenchAssetLocation");
+    if (label) label.textContent = current ? (root?.name || current.name) + " / " + (current.parentId ? current.name : "公共素材") : "请先创建项目";
+  }
+
+  // ── 分集列表 / 批量（编辑框仍只编辑当前分集；顺序本地记忆） ──
+  const EPISODE_ORDER_KEY = "dbm.workbench.episodeOrder.v1";
+
+  function readEpisodeOrder(rootId) {
+    try {
+      const map = JSON.parse(localStorage.getItem(EPISODE_ORDER_KEY) || "{}") || {};
+      return Array.isArray(map[rootId]) ? map[rootId] : [];
+    } catch {
+      return [];
     }
-    select.value = state.index.currentProjectId || "";
+  }
+
+  function writeEpisodeOrder(rootId, ids) {
+    try {
+      const map = JSON.parse(localStorage.getItem(EPISODE_ORDER_KEY) || "{}") || {};
+      map[rootId] = ids;
+      localStorage.setItem(EPISODE_ORDER_KEY, JSON.stringify(map));
+    } catch {}
+  }
+
+  /** 分集顺序：本地记忆优先，其余按名称数字序，保证新建分集出现在末尾 */
+  function episodesOf(rootId) {
+    if (!rootId) return [];
+    const children = (state.index.projects || []).filter((item) => item.parentId === rootId);
+    const rank = new Map(readEpisodeOrder(rootId).map((id, index) => [id, index]));
+    const tail = Number.MAX_SAFE_INTEGER;
+    return children.sort((a, b) => {
+      const ra = rank.has(a.id) ? rank.get(a.id) : tail;
+      const rb = rank.has(b.id) ? rank.get(b.id) : tail;
+      if (ra !== rb) return ra - rb;
+      return String(a.name).localeCompare(String(b.name), "zh-CN", { numeric: true });
+    });
+  }
+
+  const currentRootId = () => state.project?.parentId || state.project?.id || "";
+
+  function renderEpisodes() {
+    const host = $("workbenchEpisodeList");
+    if (!host) return;
+    const current = state.project;
+    const rootId = currentRootId();
+    const episodes = rootId ? episodesOf(rootId) : [];
+    if ($("workbenchEpisodeSummary")) $("workbenchEpisodeSummary").textContent = `分集列表 / 批量（${episodes.length}）`;
+    // 选中集合按现存分集收敛，避免删除后残留脏选中
+    const alive = new Set(episodes.map((item) => item.id));
+    state.episodeSelection = new Set([...state.episodeSelection].filter((id) => alive.has(id)));
+    const picked = state.episodeSelection;
+    host.replaceChildren();
+    if (!episodes.length) host.appendChild(emptyDiv("当前大项目下还没有分集，点上方「新建分集」开始。"));
+    episodes.forEach((episode, index) => {
+      const row = document.createElement("div");
+      row.className = `workbench-episode${episode.id === current?.id ? " is-current" : ""}`;
+      row.dataset.projectId = episode.id;
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = picked.has(episode.id);
+      box.dataset.act = "episode-select";
+      box.title = "选中后可批量复制/删除";
+      row.appendChild(box);
+
+      const seq = document.createElement("span");
+      seq.className = "workbench-episode-index";
+      seq.textContent = String(index + 1);
+      row.appendChild(seq);
+
+      const main = document.createElement("div");
+      main.className = "workbench-episode-main";
+      const title = document.createElement("strong");
+      title.textContent = episode.name || "未命名分集";
+      main.appendChild(title);
+      const preview = document.createElement("span");
+      preview.className = "workbench-episode-preview";
+      preview.textContent = episode.promptPreview || "（暂无提示词）";
+      preview.title = episode.promptPreview || "";
+      main.appendChild(preview);
+      const meta = document.createElement("em");
+      meta.textContent = `素材 ${episode.refCount || 0} 张 · 更新 ${formatTime(episode.updatedAt) || "—"}`;
+      main.appendChild(meta);
+      row.appendChild(main);
+
+      const actions = document.createElement("div");
+      actions.className = "workbench-episode-actions-btns";
+      for (const [act, label, hint] of [
+        ["open", "编辑", "载入这条分集到上方编辑框"],
+        ["up", "↑", "上移一位"],
+        ["down", "↓", "下移一位"],
+        ["copy", "复制", "复制这条分集（含提示词、参数与素材）"],
+        ["remove", "删除", "删除这条分集（含素材与任务记录）"],
+      ]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "text-button";
+        button.dataset.act = act;
+        button.textContent = label;
+        button.title = hint;
+        button.disabled = Boolean(state.compose.busy);
+        actions.appendChild(button);
+      }
+      row.appendChild(actions);
+      host.appendChild(row);
+    });
+
+    const all = $("workbenchEpisodeAll");
+    if (all) {
+      all.checked = episodes.length > 0 && picked.size === episodes.length;
+      all.disabled = Boolean(state.compose.busy) || !episodes.length;
+    }
+    if ($("workbenchEpisodeSelection")) {
+      $("workbenchEpisodeSelection").textContent = picked.size ? `已选 ${picked.size} 条` : "未选择分集";
+    }
+    const single = picked.size === 1;
+    if ($("workbenchEpisodeUp")) $("workbenchEpisodeUp").disabled = Boolean(state.compose.busy) || !single;
+    if ($("workbenchEpisodeDown")) $("workbenchEpisodeDown").disabled = Boolean(state.compose.busy) || !single;
+    if ($("workbenchEpisodeCopy")) {
+      $("workbenchEpisodeCopy").disabled = Boolean(state.compose.busy) || !picked.size;
+      $("workbenchEpisodeCopy").textContent = picked.size > 1 ? `批量复制（${picked.size}）` : "批量复制";
+    }
+    if ($("workbenchEpisodeRemove")) {
+      $("workbenchEpisodeRemove").disabled = Boolean(state.compose.busy) || !picked.size;
+      $("workbenchEpisodeRemove").textContent = picked.size > 1 ? `批量删除（${picked.size}）` : "批量删除";
+    }
+  }
+
+  /** 上移/下移：把选中的这一条在列表里移动一位，并本地记忆顺序 */
+  function moveEpisode(id, delta) {
+    const rootId = currentRootId();
+    const ids = episodesOf(rootId).map((item) => item.id);
+    const from = ids.indexOf(id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= ids.length) {
+      toast(delta < 0 ? "已经在最前面了" : "已经在最后面了");
+      return;
+    }
+    ids.splice(to, 0, ids.splice(from, 1)[0]);
+    writeEpisodeOrder(rootId, ids);
+    renderEpisodes();
+    renderProjects();
+    toast("已调整分集顺序（重启后保持）");
+  }
+
+  async function removeEpisodes(ids) {
+    const wanted = new Set(ids);
+    const episodes = (state.index.projects || []).filter((item) => wanted.has(item.id));
+    if (!episodes.length) return;
+    const extra = document.createElement("div");
+    extra.className = "workbench-confirm-list";
+    for (const episode of episodes) {
+      const line = document.createElement("span");
+      line.textContent = `${episode.name}（素材 ${episode.refCount || 0} 张）`;
+      extra.appendChild(line);
+    }
+    const choice = await confirmAction({
+      title: `删除 ${episodes.length} 条分集？`,
+      message: "删除会一并移除这些分集的素材、任务记录与已下载文件，无法恢复。其中若有未结束的任务或未完成的下载，会拒绝删除并提示先处理。",
+      okLabel: `确认删除（${episodes.length}）`,
+      extra,
+    });
+    if (choice !== "ok") return;
+    const failed = [];
+    for (const episode of episodes) {
+      try {
+        const result = await api.project.remove(episode.id);
+        if (result?.cleanupFailed?.length) failed.push(`${episode.name}：目录未能删净（文件被占用）`);
+      } catch (error) {
+        failed.push(`${episode.name}：${error.message}`);
+      }
+    }
+    const done = episodes.length - failed.length;
+    if (done) toast(`已删除 ${done} 条分集`, "ok");
+    for (const line of failed) toast(`未删除 ${line}`, "error");
+    state.episodeSelection = new Set();
+    state.thumbCache.clear();
+    await refresh();
+  }
+
+  async function duplicateEpisodes(ids) {
+    const list = ids.slice();
+    if (!list.length) return;
+    const stayId = projectId();
+    state.compose.busy = "duplicate";
+    renderCompose();
+    const created = [];
+    try {
+      for (const id of list) {
+        const episode = (state.index.projects || []).find((item) => item.id === id);
+        try {
+          created.push(await api.project.duplicate(id));
+        } catch (error) {
+          toast(`复制「${episode?.name || id}」失败：${error.message}`, "error");
+        }
+      }
+      if (created.length) {
+        toast(`已复制 ${created.length} 条分集（含提示词、参数与素材）`, "ok");
+        for (const item of created) {
+          if (item.droppedRefs?.length) {
+            toast(`${item.name}：${item.droppedRefs.join("、")} 素材复制失败，已同步移除该引用`, "error");
+          }
+        }
+      }
+      state.episodeSelection = new Set();
+      state.thumbCache.clear();
+      // 复制会把「当前项目」切到副本上，这里拉回用户原本所在的分集，不打断编辑
+      if (stayId && (state.index.projects || []).some((item) => item.id === stayId)) await api.project.open(stayId);
+      await refresh();
+    } finally {
+      state.compose.busy = "";
+      renderCompose();
+    }
+  }
+
+  async function removeCurrentProject() {
+    const current = state.project;
+    if (!current) return;
+    if (current.parentId) return removeEpisodes([current.id]);
+    const children = (state.index.projects || []).filter((item) => item.parentId === current.id);
+    const extra = document.createElement("div");
+    extra.className = "workbench-confirm-list";
+    for (const child of children) {
+      const line = document.createElement("span");
+      line.textContent = `${child.name}（素材 ${child.refCount || 0} 张）`;
+      extra.appendChild(line);
+    }
+    const choice = await confirmAction({
+      title: `删除大项目「${current.name}」？`,
+      message: children.length
+        ? `该项目下还有 ${children.length} 条分集，点确认后会连同分集、素材、任务记录与已下载文件一起删除，无法恢复。有未结束任务或未完成下载时会拒绝删除。`
+        : "删除会一并移除该项目的素材、任务记录与已下载文件，无法恢复。",
+      okLabel: children.length ? `连同 ${children.length} 条分集一起删除` : "确认删除",
+      extra: children.length ? extra : null,
+    });
+    if (choice !== "ok") return;
+    try {
+      const result = await api.project.remove(current.id, { cascade: children.length > 0 });
+      toast(`已删除项目${result?.removed?.length > 1 ? `及其 ${result.removed.length - 1} 条分集` : ""}`, "ok");
+      if (result?.cleanupFailed?.length) {
+        toast(`${result.cleanupFailed.length} 个目录未能删净（文件被占用），可在数据目录手工清理`, "error");
+      }
+      state.episodeSelection = new Set();
+      state.thumbCache.clear();
+      await refresh();
+    } catch (error) {
+      toast(`删除项目失败：${error.message}`, "error");
+    }
   }
 
   async function thumbFor(assetId) {
@@ -459,7 +771,7 @@
       row.appendChild(name);
       const detail = document.createElement("span");
       detail.textContent = items
-        .map((u) => `${u.name || "未命名分镜"} 里的 ${u.token}`)
+        .map((u) => `${u.name || "历史草稿"} 里的 ${u.token}`)
         .join("、");
       row.appendChild(detail);
       list.appendChild(row);
@@ -492,34 +804,6 @@
       duration: overrides.duration || defaults.duration,
       ratio: overrides.ratio || defaults.ratio,
     };
-  }
-
-  /**
-   * 把某条历史分镜载入上面的编辑框。
-   * 切换前先把当前未落盘的输入保存掉，避免「切过去再切回来内容没了」。
-   */
-  async function loadStoryboardIntoCompose(storyboardId) {
-    const current = currentStoryboard();
-    if (current && current.id !== storyboardId) {
-      const pendingKey = `sb-prompt:${current.id}`;
-      const pending = state.pendingValues.get(pendingKey);
-      if (pending !== undefined && pending !== current.prompt) {
-        try {
-          await api.storyboard.update(projectId(), current.id, { prompt: pending });
-          state.pendingValues.delete(pendingKey);
-        } catch (error) {
-          toast(`切换前保存失败：${error.message}`, "error");
-          return;
-        }
-      }
-    }
-    state.compose.storyboardId = "";
-    state.compose.status = "";
-    setMainStatus("");
-    try {
-      await api.ui.set(projectId(), { selectedStoryboardId: storyboardId });
-    } catch {}
-    await refresh();
   }
 
   /**
@@ -603,10 +887,7 @@
     // 生效来源标注：消除「全局改了但单条覆盖还在生效」的歧义
     const source = document.createElement("span");
     source.className = "workbench-param-source";
-    const overridden = ["model", "duration", "ratio"].filter((key) => overrides[key]);
-    source.textContent = overridden.length
-      ? `当前生效值来自本条分镜的单条设置（${overridden.length} 项）；改这里的值会直接写入本条分镜`
-      : "当前生效值继承自全局默认；改这里的值会写入本条分镜，不再影响全局";
+    source.textContent = "参数与提示词自动保存，重新打开可继续创作";
     host.appendChild(source);
 
     // 增强时长的可用性说明（不静默降级）
@@ -615,22 +896,22 @@
     if (enhanced) {
       const usable = effective.model === enhanced.requiresModel;
       enhancedNote.textContent = usable
-        ? `${enhanced.from}—${enhanced.to} 秒由应用自带增强器改写请求体，实际时长以请求体回读为准；结果视频长度平台不保证`
+        ? `${enhanced.from}—${enhanced.to} 秒为增强时长，实际成片时长以平台结果为准`
         : `${enhanced.from}—${enhanced.to} 秒增强仅 ${labelOfModel.get(enhanced.requiresModel) || enhanced.requiresModel} 可用，当前模型不支持（不会自动降级）`;
     } else {
       enhancedNote.textContent = "时长增强能力未在能力表中声明，只显示已核实档位";
     }
-    host.appendChild(enhancedNote);
+    if (enhanced && Number(effective.duration) >= enhanced.from) host.appendChild(enhancedNote);
 
     const onChange = async () => {
       if (!storyboard) return;
       try {
-        await api.storyboard.update(projectId(), storyboard.id, {
-          overrides: { model: model.value, duration: duration.value, ratio: ratio.value },
-        });
+        const ownerId = projectId();
+        const patch = { overrides: { model: model.value, duration: duration.value, ratio: ratio.value } };
+        await writeDraft(ownerId, () => api.storyboard.update(ownerId, storyboard.id, patch));
         state.lastSaved = formatTime(new Date());
         await refresh();
-        setMainStatus("参数已保存到本条分镜", "ok");
+        setMainStatus("参数已保存", "ok");
       } catch (error) {
         toast(`保存参数失败：${error.message}`, "error");
       }
@@ -683,6 +964,19 @@
     const value = pending === undefined ? String(storyboard?.prompt || "") : pending;
     if (document.activeElement !== prompt && prompt.value !== value) prompt.value = value;
     prompt.dataset.sbId = storyboard?.id || "";
+    prompt.dataset.focusKey = storyboard ? `sb-prompt:${storyboard.id}` : "";
+    prompt.readOnly = Boolean(state.compose.busy);
+    for (const id of [
+      "workbenchProjectSelect",
+      "workbenchEpisodeSelect",
+      "workbenchEpisodeNew",
+      "workbenchProjectNew",
+      "workbenchProjectRename",
+      "workbenchEpisodeDelete",
+      "workbenchProjectDelete",
+    ]) {
+      if ($(id)) $(id).disabled = Boolean(state.compose.busy);
+    }
 
     if (refsHost) {
       refsHost.innerHTML = "";
@@ -727,12 +1021,13 @@
       // 已绑定数量与草稿保存状态：放在引用行末尾，不另占空间
       const meta = document.createElement("span");
       meta.className = "workbench-refs-meta";
-      meta.textContent = `已绑定 ${refs.length} 张${state.lastSaved ? ` · 草稿已保存 ${state.lastSaved}` : " · 草稿自动保存已开启"}`;
+      meta.textContent = `已绑定 ${refs.length} 张 · ${draftText()}`;
+      meta.classList.toggle("is-dirty", state.draftState !== "saved");
       refsHost.appendChild(meta);
     if (refs.length) {
         const hint = document.createElement("span");
         hint.className = "workbench-refs-hint";
-        hint.textContent = "平台不支持内联图片节点：编辑器里的 @图N 提交时会写成「参考图N」，并按同一编号顺序作为参考图上传";
+        hint.textContent = "引用图片按编号发送，请保持提示词中的 @图N 与参考图对应。";
         refsHost.appendChild(hint);
       }
     }
@@ -741,7 +1036,7 @@
     const accountCount = (state.selectedAccountIds || []).length;
     const busy = state.compose.busy;
     const reasons = [];
-    if (!storyboard) reasons.push("还没有分镜");
+    if (!storyboard) reasons.push("请先新建项目");
     if (!String(prompt.value || "").trim()) reasons.push("提示词为空");
     if (!accountCount) reasons.push("未选择执行账号");
     if (!effective.model || !effective.duration || !effective.ratio) reasons.push("参数未就绪");
@@ -768,7 +1063,7 @@
     }
     const auto = $("workbenchAutoDownload");
     if (auto) {
-      const on = state.project?.settings?.autoDownload === true;
+      const on = state.project?.settings?.autoDownload !== false;
       if (auto.checked !== on && document.activeElement !== auto) auto.checked = on;
     }
     if (reasons.length && !busy) {
@@ -853,6 +1148,15 @@
     const refreshButton = $("workbenchAccountsRefresh");
     if (!host) return;
     const accounts = state.accounts || [];
+    // 勾选配置随项目保存（project.ui.selectedAccountIds）：切换项目/重启后恢复用户自己的勾选。
+    // 旧实现只存在渲染进程内存里，重启后回到「默认勾选第一个」，用户「清空」的意图也不被记住。
+    const owner = projectId();
+    if (state.accountsOwner !== owner) {
+      state.accountsOwner = owner;
+      const saved = state.project?.ui?.selectedAccountIds;
+      state.selectedAccountIds = Array.isArray(saved) ? saved.filter((id) => typeof id === "string") : [];
+      state.accountsTouched = Array.isArray(saved);
+    }
     host.innerHTML = "";
 
     if (refreshButton) {
@@ -944,7 +1248,8 @@
           .map((a) => `${a.name}（${a.blocked.label}）`)
           .join("、")}`
       // 平台额度与登录状态本工作台无法核实，按需求显示「未知」
-      : `已选 ${picked.size} 个账号 · 登录状态：未知 · 额度：未知 · 当前创作区＝「多账号同稿生成」：同一份内容在每个所选账号各生成一次（共 ${picked.size} 条任务，分别消耗对应账号额度）；「分镜列表 / 批量」里是「多分镜分配执行」：不同分镜分配给账号，每条分镜只执行一次`;
+      : `已选 ${picked.size} 个账号 · 登录与额度未知。单条创作将生成 ${picked.size} 份，分别消耗账号额度。`;
+    line.title = "当前提示词将在每个所选账号各生成一次，分别消耗对应账号额度。";
     note.appendChild(line);
     for (const [act, label] of [
       ["accounts-all", "全选"],
@@ -959,18 +1264,73 @@
     }
   }
 
+  /** 把账号勾选写回项目 ui（失败不阻塞交互，只提示一次） */
+  function persistAccountSelection() {
+    const ownerId = projectId();
+    if (!ownerId) return;
+    api.ui
+      .set(ownerId, { selectedAccountIds: state.selectedAccountIds.slice() })
+      .catch((error) => toast(`账号勾选未能保存（重启后会恢复默认）：${error.message}`, "error"));
+  }
+
+  const taskCardFingerprints = new WeakMap();
+  let renderedTaskProject = "";
+  function needsAttention(record) {
+    return ["failed", "manual", "unconfirmed"].includes(record.status) || record.download?.status === "failed";
+  }
+
   function renderTasks() {
     const host = $("workbenchTaskList");
-    const count = $("workbenchTaskCount");
     if (!host) return;
-    const tasks = state.tasks || [];
-    if (count) count.textContent = String(tasks.filter((t) => isActiveStatus(t.status)).length);
-    host.innerHTML = "";
-    if (!tasks.length) {
-      host.appendChild(emptyDiv("还没有生成任务。在分镜卡片上点「生成这一条」开始。"));
-      return;
+    if (renderedTaskProject !== projectId()) {
+      renderedTaskProject = projectId();
+      state.taskVisibleLimit = 40;
+      host.replaceChildren();
     }
-    for (const record of tasks) host.appendChild(taskCard(record));
+    const tasks = state.tasks || [];
+    const active = tasks.filter((task) => isActiveStatus(task.status)).length;
+    const attention = tasks.filter(needsAttention).length;
+    const succeeded = tasks.filter((task) => task.status === "succeeded").length;
+    if ($("workbenchTaskCount")) $("workbenchTaskCount").textContent = String(active);
+    if ($("workbenchTaskSummary")) $("workbenchTaskSummary").textContent =
+      `${state.queue?.paused ? "队列已暂停 · " : ""}${active} 进行中 · ${attention} 需处理 · ${succeeded} 已生成`;
+    const names = new Map((state.accounts || []).map((account) => [account.id, account.name]));
+    const query = state.taskSearch.trim().toLocaleLowerCase();
+    const filtered = tasks.filter((record) => {
+      if (state.taskFilter === "active" && !isActiveStatus(record.status)) return false;
+      if (state.taskFilter === "attention" && !needsAttention(record)) return false;
+      if (state.taskFilter === "succeeded" && record.status !== "succeeded") return false;
+      return !query || `${record.storyboardName || ""} ${names.get(record.accountId) || record.accountId}`.toLocaleLowerCase().includes(query);
+    });
+    const visible = filtered.slice(0, state.taskVisibleLimit);
+    const ids = new Set(visible.map((record) => record.id));
+    for (const child of [...host.children]) {
+      if (!ids.has(child.dataset.attemptId)) child.remove();
+    }
+    const existing = new Map([...host.children].map((node) => [node.dataset.attemptId, node]));
+    for (const [index, record] of visible.entries()) {
+      let card = existing.get(record.id);
+      const fingerprint = JSON.stringify([record, names.get(record.accountId), state.sourceCache.get(record.id), state.statusLabels, state.downloadLabels]);
+      if (!card || taskCardFingerprints.get(card) !== fingerprint) {
+        const old = card;
+        const openDetails = new Set(old ? [...old.querySelectorAll("details[open]")].map((node) => node.className) : []);
+        const focusedAction = old?.contains(document.activeElement) ? document.activeElement.dataset.act : "";
+        card = taskCard(record);
+        for (const detail of card.querySelectorAll("details")) detail.open = openDetails.has(detail.className);
+        taskCardFingerprints.set(card, fingerprint);
+        if (old) old.replaceWith(card);
+        if (focusedAction) [...card.querySelectorAll("button[data-act]")].find((node) => node.dataset.act === focusedAction)?.focus({ preventScroll: true });
+      }
+      if (host.children[index] !== card) host.insertBefore(card, host.children[index] || null);
+    }
+    if (!visible.length) host.appendChild(emptyDiv(tasks.length ? "没有匹配的任务，试试其他筛选条件。" : "还没有生成任务。填写提示词并选择账号后即可开始。"));
+    for (const button of $("workbenchTaskFilters")?.querySelectorAll("button[data-filter]") || []) {
+      button.setAttribute("aria-pressed", String(button.dataset.filter === state.taskFilter));
+    }
+    if ($("workbenchTaskRange")) $("workbenchTaskRange").textContent = `显示 ${visible.length} / ${filtered.length} 条`;
+    if ($("workbenchTaskMore")) $("workbenchTaskMore").hidden = visible.length >= filtered.length;
+    if ($("workbenchQueuePause")) $("workbenchQueuePause").disabled = state.queue?.paused === true;
+    if ($("workbenchQueueResume")) $("workbenchQueueResume").disabled = state.queue?.paused !== true;
   }
 
   function taskCard(record) {
@@ -982,13 +1342,54 @@
     const head = document.createElement("div");
     head.className = "workbench-task-head";
     const title = document.createElement("strong");
-    title.textContent = `${record.storyboardName || "未命名分镜"} · 尝试 ${record.attempt}`;
+    title.textContent = `${record.storyboardName || "视频创作"} · 尝试 ${record.attempt}`;
     head.appendChild(title);
     const chip = document.createElement("span");
     chip.className = `workbench-status workbench-status-${record.status}`;
-    chip.textContent = statusLabel(record.status);
+    chip.textContent = record.interruption?.stopped ? (record.interruption.platformMayContinue ? "本地跟踪已停止" : "已中断提交") : statusLabel(record.status);
     head.appendChild(chip);
     card.appendChild(head);
+
+    if (!record.interruption?.stopped && ["pending", "submitting", "queued", "generating", "unconfirmed"].includes(record.status)) {
+      const control = document.createElement("div");
+      control.className = "workbench-stop-control";
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "workbench-stop-button";
+      stop.dataset.act = "interrupt";
+      stop.textContent = ["pending", "submitting"].includes(record.status) ? "■ 中断当前提交" : "■ 停止跟踪并释放账号";
+      const hint = document.createElement("small");
+      hint.textContent = "停止后可用该账号提交新任务。已发送到豆包的任务可能仍在生成。";
+      control.append(stop, hint);
+      card.appendChild(control);
+    }
+
+    const feedback = document.createElement("section");
+    feedback.className = "workbench-platform-feedback";
+    const guidance = document.createElement("strong");
+    guidance.textContent = ({
+      pending: "已加入队列，尚未发送；无需再次点击生成。",
+      submitting: "正在提交，尚未确认豆包是否受理；请勿重复提交。",
+      queued: "豆包已受理，正在等待结果；不代表已生成成功，请勿重复提交。",
+      generating: "豆包正在生成，请等待结果，无需再次点击。",
+      succeeded: "已检测到生成的视频，生成成功；下载失败也无需重新生成。",
+      failed: "本次任务失败，请查看原因，处理后可使用「重试」。",
+      unconfirmed: "暂未确认结果，不代表失败；请先核实豆包页面，避免重复扣费。",
+      manual: "需要人工核实或处理；请先查看豆包回复，不要盲目重复提交。",
+      canceled: "本次任务已取消。",
+    })[record.status] || "正在等待任务状态。";
+    if (record.interruption?.stopped) guidance.textContent = record.interruption.platformMayContinue ? "已停止本地跟踪，可用该账号提交新任务。豆包可能仍在生成或扣费，也可恢复查询原任务。" : "已中断提交，没有向豆包发送本次请求。";
+    if (record.autoRetry?.nextAt && !record.autoRetry.stopped) guidance.textContent = `豆包未受理，已安排自动重提（${record.autoRetry.count}/${record.autoRetry.max}）。可点击停止重试。`;
+    feedback.appendChild(guidance);
+    const replyTitle = document.createElement("div");
+    replyTitle.className = "workbench-reply-title";
+    replyTitle.textContent = `豆包回复${record.platformReply?.at ? ` · ${formatTime(record.platformReply.at)}` : ""}`;
+    feedback.appendChild(replyTitle);
+    const reply = document.createElement("div");
+    reply.className = "workbench-reply-text";
+    reply.textContent = record.platformReply?.text || record.driver?.acceptanceEvidence?.excerpt || record.driver?.evidence?.excerpt || "暂未读取到本次请求的豆包回复，请以任务状态为准。";
+    feedback.appendChild(reply);
+    card.appendChild(feedback);
 
     const meta = document.createElement("div");
     meta.className = "workbench-task-meta";
@@ -996,7 +1397,6 @@
       `账号 ${accountName(record.accountId)}`,
       record.submittedAt ? `提交 ${formatTime(record.submittedAt)}` : "尚未提交",
       `最近更新 ${formatTime(record.updatedAt)}`,
-      record.platformTaskId ? `平台任务 ${record.platformTaskId}` : "平台任务 ID：无",
     ];
     if (record.params?.duration) {
       const evidence = record.driver?.durationEvidence;
@@ -1019,9 +1419,15 @@
     // UUID / 内部标识默认折叠（调试信息统一收纳，主视图只留业务信息）
     const detailBits = document.createElement("details");
     detailBits.className = "workbench-task-ids workbench-debug";
-    detailBits.innerHTML = `<summary>调试信息 · 内部标识</summary><div>账号 ${record.accountId}</div><div>尝试 ${record.id}${
-      record.params?.model ? ` · 模型标识 ${record.params.model}` : ""
-    }</div>`;
+    const idsSummary = document.createElement("summary");
+    idsSummary.textContent = "任务标识与模型";
+    detailBits.appendChild(idsSummary);
+    for (const line of [`账号 ${record.accountId}`, `尝试 ${record.id}`,
+      `平台任务 ${record.platformTaskId || "等待平台返回"}`, `模型 ${record.params?.model || "未指定"}`]) {
+      const row = document.createElement("div");
+      row.textContent = line;
+      detailBits.appendChild(row);
+    }
     meta.appendChild(detailBits);
     card.appendChild(meta);
 
@@ -1047,7 +1453,7 @@
     }
 
     // 平台明确拒绝（人脸未认证、内容规则等）：显示原因并要求人工处理，不自动换素材/换模型
-    if (record.driver?.needsUser || record.autoRetry?.stopped) {
+    if ((record.driver?.needsUser && !record.autoRetry?.nextAt) || record.autoRetry?.stopped) {
       const note = document.createElement("div");
       note.className = "workbench-task-reject";
       note.textContent = `平台未受理，需你处理：${
@@ -1088,8 +1494,10 @@
     if (driver && (steps.length || driver.outcome === "running")) {
       const box = document.createElement("details");
       box.className = "workbench-task-steps workbench-debug";
-      // 进行中默认展开，用户能实时看到走到哪一步
-      if (driver.outcome === "running") box.open = true;
+      // 进行中与失败默认展开：失败卡片直接呈现「卡在第几步、哪一步没成功」的完整报错
+      if (driver.outcome === "running" || driver.outcome === "failed" || steps.some((step) => step.ok === false)) {
+        box.open = true;
+      }
       const summary = document.createElement("summary");
       const badCount = steps.filter((s) => s.ok === false).length;
       summary.textContent =
@@ -1132,7 +1540,8 @@
     foot.appendChild(downloadBlock(record));
 
     const buttons = [];
-    if (isActiveStatus(record.status)) buttons.push(["cancel", "取消"]);
+    if (record.interruption?.stopped && record.interruption.platformMayContinue) buttons.push(["resume-monitoring", "恢复查询"]);
+    else if (record.submittedAt && ["manual", "unconfirmed"].includes(record.status)) buttons.push(["resume-monitoring", "重新查询豆包"]);
     if (["failed", "manual", "unconfirmed"].includes(record.status)) buttons.push(["retry", "重新生成"]);
     if (record.status === "succeeded") {
       const dlStatus = record.download?.status || "idle";
@@ -1202,7 +1611,7 @@
     head.className = "workbench-download-head";
     const chip = document.createElement("span");
     chip.className = `workbench-download-chip workbench-download-chip-${dl.status}`;
-    chip.textContent = `下载：${downloadLabel(dl.status)}`;
+    chip.textContent = dl.errorCode === "QUALITY_SIZE_LOW" || dl.errorCode === "QUALITY_PROBE_FAILED" ? "下载：画质待核验" : `下载：${downloadLabel(dl.status)}`;
     head.appendChild(chip);
     if (dl.sourceLabel || dl.source) {
       const source = document.createElement("span");
@@ -1297,147 +1706,6 @@
     return state.accounts.find((a) => a.id === accountId)?.name || accountId;
   }
 
-  /**
- * 提交确认框
- * 默认模式是「分配执行」：多条分镜分配给多个所选账号，每条分镜只执行一次。
- * 「对比模式」是独立选项，必须用户显式选择 —— 同一分镜才会在每个账号各生成一次。
- */
-  function runPreview(host, previews, context = {}) {
-    host.innerHTML = "";
-    const list = Array.isArray(previews) ? previews : [previews];
-    const first = list[0] || { params: {}, uploads: [], errors: [], limitations: [], promptPreview: "" };
-    const mode = context.mode || "distribute";
-
-    const modes = document.createElement("div");
-    modes.className = "workbench-run-modes";
-    modes.id = "workbenchRunModes";
-    for (const [value, label, hint] of [
-      ["distribute", "分配执行（默认）", "多条分镜按顺序分配给所选账号，每条分镜只执行一次"],
-      ["compare", "对比模式", "同一条分镜在每个所选账号各生成一次（会按账号数成倍消耗额度）"],
-    ]) {
-      const wrap = document.createElement("label");
-      wrap.className = "workbench-run-mode";
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = "workbenchRunMode";
-      radio.value = value;
-      radio.checked = mode === value;
-      radio.dataset.act = "run-mode";
-      wrap.appendChild(radio);
-      const text = document.createElement("span");
-      text.textContent = `${label} · ${hint}`;
-      wrap.appendChild(text);
-      modes.appendChild(wrap);
-    }
-    host.appendChild(modes);
-
-    const rows = [
-      ["模型", first.params.model || "(未设置)"],
-      ["时长", first.params.duration ? `${first.params.duration} 秒` : "(未设置)"],
-      ["比例", first.params.ratio || "(未设置，用平台默认)"],
-      ["参考图片", first.uploads.length ? `${first.uploads.length} 张` : "无"],
-    ];
-    for (const [name, value] of rows) {
-      const row = document.createElement("div");
-      row.className = "workbench-run-row";
-      const label = document.createElement("span");
-      label.textContent = name;
-      row.appendChild(label);
-      const text = document.createElement("strong");
-      text.textContent = value;
-      row.appendChild(text);
-      host.appendChild(row);
-    }
-
-    const assignments = context.assignments || [];
-    const plan = document.createElement("div");
-    plan.className = "workbench-run-plan";
-    const head = document.createElement("div");
-    head.className = "workbench-run-row";
-    const headLabel = document.createElement("span");
-    headLabel.textContent = "本次提交";
-    head.appendChild(headLabel);
-    const headValue = document.createElement("strong");
-    headValue.textContent = `共 ${assignments.length} 条尝试（${assignments.filter((a) => a.valid).length} 条可提交）`;
-    head.appendChild(headValue);
-    plan.appendChild(head);
-    for (const item of assignments) {
-      const row = document.createElement("div");
-      row.className = `workbench-run-row${item.valid ? "" : " workbench-run-row-bad"}`;
-      const label = document.createElement("span");
-      label.textContent = item.storyboardName || item.storyboardId;
-      row.appendChild(label);
-      const text = document.createElement("strong");
-      text.textContent = item.valid
-        ? `→ ${accountName(item.accountId)}`
-        : `✕ 不可提交：${(item.errors || []).join("；") || "参数未通过校验"}`;
-      row.appendChild(text);
-      plan.appendChild(row);
-    }
-    host.appendChild(plan);
-
-    const prompt = document.createElement("div");
-    prompt.className = "workbench-run-prompt";
-    prompt.textContent = first.promptPreview || "(空提示词)";
-    host.appendChild(prompt);
-
-    if (first.limitations.length) {
-      const box = document.createElement("div");
-      box.className = "workbench-run-notes";
-      box.textContent = `平台限制说明：${first.limitations.join("；")}`;
-      host.appendChild(box);
-    }
-    const status = document.createElement("div");
-    status.className = "workbench-run-status";
-    status.id = "workbenchRunStatus";
-    host.appendChild(status);
-  }
-
-  /**
-   * 打开提交确认框：先按模式算出「分镜 → 账号」的分配，再逐条做提交前预览。
-   * 分配结果同时留在 state.run.assignments，确认时只提交校验通过的条目。
-   */
-  async function openRunModal(storyboardIds, mode = "distribute") {
-    const accountIds = state.selectedAccountIds.slice();
-    if (!accountIds.length) {
-      toast("请先勾选执行账号（可多选）", "error");
-      return;
-    }
-    const boards = (storyboardIds || []).filter(Boolean);
-    if (!boards.length) {
-      toast("当前没有可提交的分镜", "error");
-      return;
-    }
-    const assignments = await api.task.assignments(boards, accountIds, mode);
-    const names = new Map((state.project?.storyboards || []).map((s) => [s.id, s.name || s.id]));
-    const cache = new Map();
-    const rows = [];
-    for (const item of assignments) {
-      const key = `${item.storyboardId}|${item.accountId}`;
-      let preview = cache.get(key);
-      if (!preview) {
-        try {
-          preview = await api.task.preview(projectId(), item.storyboardId, item.accountId);
-        } catch (error) {
-          preview = { valid: false, errors: [error.message], warnings: [], limitations: [], uploads: [], params: {}, promptPreview: "" };
-        }
-        cache.set(key, preview);
-      }
-      rows.push({
-        ...item,
-        storyboardName: names.get(item.storyboardId) || item.storyboardId,
-        valid: Boolean(preview.valid),
-        errors: preview.errors || [],
-        preview,
-      });
-    }
-    state.run = { mode, storyboardIds: boards, accountIds, assignments: rows, currentAttemptId: "" };
-    runPreview($("workbenchRunPreview"), rows.map((row) => row.preview), { mode, assignments: rows });
-    const confirm = $("workbenchRunConfirm");
-    if (confirm) confirm.disabled = !rows.some((row) => row.valid);
-    openModal("workbenchRunModal");
-  }
-
   // ── 单条创作区交互 ───────────────────────────────────────
   /** 某个账号的页面是否已打开且落在 dola 上 */
   function accountPageState(accountId) {
@@ -1489,12 +1757,27 @@
   async function generateCurrent() {
     if (state.compose.busy) return; // 提交期间防重复点击
     const storyboard = currentStoryboard();
-    if (!storyboard) return setMainStatus("还没有分镜，先新增一条", "warn");
+    if (!storyboard) return setMainStatus("请先新建或选择项目", "warn");
     const accountIds = [...new Set((state.selectedAccountIds || []).slice())];
     if (!accountIds.length) return setMainStatus("请先在右侧勾选执行账号", "warn");
 
+    // 批量生成必须二次确认：任务数 = 账号数，每个账号各消耗一次额度，提交后无法撤回
+    if (accountIds.length > 1) {
+      const choice = await confirmAction({
+        title: `确认多账号生成（${accountIds.length} 条任务）？`,
+        message: `将在 ${accountIds.length} 个账号各生成一次，共创建 ${accountIds.length} 条任务，分别消耗对应账号额度。提交后平台侧可能已计费，不能撤回。`,
+        okLabel: `确认生成（${accountIds.length} 条）`,
+      });
+      if (choice !== "ok") return setMainStatus("已取消本次批量生成", "warn");
+    }
+
     state.compose.busy = "checking";
     renderCompose();
+    try { await flushComposeDraft(); } catch (error) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`保存提示词失败，未提交：${error.message}`, "error");
+    }
     setMainStatus(`正在检查 ${accountIds.length} 个账号的提交条件…`);
     const previews = await Promise.all(
       accountIds.map((accountId) =>
@@ -1543,6 +1826,11 @@
     // 交给队列按并发上限调度：不是逐个 await，而是同时跑（上限内）
     await api.queue.run();
     await refresh();
+    if (state.queue?.paused) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`已加入队列 ${created.length} 条任务。队列已暂停，点击「恢复队列」后开始。`);
+    }
     setMainStatus(
       `已创建 ${created.length} 条任务，正在并发执行（上限 ${state.queue?.limits?.globalConcurrency ?? 3} 个账号，其余排队）…`
     );
@@ -1572,7 +1860,7 @@
       .filter((record) => record && !["queued", "generating", "succeeded"].includes(record.status));
     if (failures.length) {
       setMainStatus(
-        `${lastLine}；${failures.length} 条未成功：${failures
+        `${lastLine}；${failures.length} 条需核实或处理（不代表生成失败）：${failures
           .map((r) => `${accountName(r.accountId)}（${r.error?.message || r.driver?.message || statusLabel(r.status)}）`)
           .join("；")}`,
         "error"
@@ -1589,12 +1877,17 @@
   async function precheckCurrent() {
     if (state.compose.busy) return;
     const storyboard = currentStoryboard();
-    if (!storyboard) return setMainStatus("还没有分镜，先新增一条", "warn");
+    if (!storyboard) return setMainStatus("请先新建或选择项目", "warn");
     const accountIds = [...new Set((state.selectedAccountIds || []).slice())];
     if (!accountIds.length) return setMainStatus("请先在右侧勾选执行账号", "warn");
 
     state.compose.busy = "prechecking";
     renderCompose();
+    try { await flushComposeDraft(); } catch (error) {
+      state.compose.busy = "";
+      renderCompose();
+      return setMainStatus(`保存提示词失败，未校验：${error.message}`, "error");
+    }
     setMainStatus(`正在校验 ${accountIds.length} 个账号：走到发送前停下，不消耗生成额度…`);
     const notReady = await ensureAccountPages(accountIds);
     const usable = accountIds.filter((id) => !notReady.some((item) => item.accountId === id));
@@ -1660,6 +1953,10 @@
       if (!storyboard) return;
       const node = event.target;
       state.pendingValues.set(`sb-prompt:${storyboard.id}`, node.value);
+      // 兜底草稿随输入落 localStorage：即使 600ms 内关闭窗口/异常退出也能恢复
+      backupDraft(storyboard.id, node.value);
+      state.draftState = "dirty";
+      renderHint();
       setMainStatus("");
       const caret = node.selectionStart;
       if (caret > 0 && node.value[caret - 1] === "@") {
@@ -1670,6 +1967,29 @@
       scheduleUpdate(storyboard.id, { prompt: node.value });
       const summary = $("workbenchRunSummary");
       if (summary) summary.dataset.dirty = "1";
+    });
+
+    // 快捷键：Ctrl+Enter 生成、Ctrl+S 立即保存（保存失败会明确提示，不静默）
+    prompt?.addEventListener("keydown", (event) => {
+      const ctrl = event.ctrlKey || event.metaKey;
+      if (!ctrl) return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        $("workbenchGenerate")?.click();
+        return;
+      }
+      if (event.key === "s" || event.key === "S") {
+        event.preventDefault();
+        void (async () => {
+          try {
+            await flushComposeDraft();
+            toast("提示词已保存", "ok");
+            await refresh();
+          } catch (error) {
+            toast(`保存失败：${error.message}`, "error");
+          }
+        })();
+      }
     });
 
     prompt?.addEventListener("blur", () => {
@@ -1701,8 +2021,13 @@
       await importClipboardImages(files);
     });
 
-    $("workbenchGenerate")?.addEventListener("click", generateCurrent);
-    $("workbenchPrecheck")?.addEventListener("click", precheckCurrent);
+    const runComposeAction = (action) => action().catch((error) => {
+      state.compose.busy = "";
+      renderCompose();
+      setMainStatus(`操作中断：${error.message}，请查看任务状态后再继续。`, "error");
+    });
+    $("workbenchGenerate")?.addEventListener("click", () => runComposeAction(generateCurrent));
+    $("workbenchPrecheck")?.addEventListener("click", () => runComposeAction(precheckCurrent));
     $("workbenchAutoDownload")?.addEventListener("change", async (event) => {
       const enabled = event.target.checked === true;
       try {
@@ -1779,6 +2104,12 @@
     if (assetsToggle) assetsToggle.textContent = state.assetsCollapsed ? "▶ 素材库" : "◀ 素材库";
     const tasksToggle = $("workbenchTasksToggle");
     if (tasksToggle) tasksToggle.textContent = layout.tasksCollapsed === true ? "◀ 账号与任务" : "收起 ▶";
+    // 分集列表的展开状态与栏宽共用同一份本地记录，重启后保持一致
+    const episodeWrap = $("workbenchEpisodeWrap");
+    if (episodeWrap) {
+      const open = layout.episodesOpen === true;
+      if (episodeWrap.open !== open) episodeWrap.open = open;
+    }
   }
 
   function bindSplitters() {
@@ -1852,6 +2183,9 @@
 
   /** 标题处版本徽标：固定展示 v主.次.补丁，悬停查看渠道/发布/Git/构建信息 */
   function applyVersion() {
+    const brand = document.querySelector(".brand strong");
+    if (brand && state.appVersion?.version) brand.textContent = `澜川Dola管理器 · v${state.appVersion.version}`;
+
     const info = state.appVersion;
     const badge = $("workbenchVersion");
     if (!badge) return;
@@ -1901,244 +2235,173 @@
        </section>` + history;
   }
 
-  // ── 分镜 ─────────────────────────────────────────────────
-  function renderStoryboards() {
-    const host = $("workbenchStoryboardList");
-    if (!host) return;
-    host.innerHTML = "";
-    if (!state.project) return;
-    const storyboards = state.project.storyboards || [];
-    if (!storyboards.length) {
-      host.appendChild(
-        Object.assign(document.createElement("div"), {
-          className: "workbench-empty",
-          textContent: "还没有分镜。可以「新增分镜」或「批量粘贴提示词」。",
-        })
+  // ── 草稿自动保存 ─────────────────────────────────────────
+  // 兜底草稿：600ms 防抖窗口内关闭窗口/异常退出时，最后一次输入不会随进程消失。
+  // 正常保存成功后会清掉；重启打开工作台时若发现比已保存内容新，会恢复并提示。
+  const DRAFT_BACKUP_KEY = "dbm.workbench.draft.v1";
+  let draftRestoreChecked = false;
+
+  function backupDraft(storyboardId, value) {
+    try {
+      localStorage.setItem(
+        DRAFT_BACKUP_KEY,
+        JSON.stringify({ projectId: projectId(), storyboardId, value: String(value ?? ""), at: Date.now() })
       );
+    } catch {}
+  }
+
+  function clearDraftBackup() {
+    try {
+      localStorage.removeItem(DRAFT_BACKUP_KEY);
+    } catch {}
+  }
+
+  /** 启动/刷新时检查兜底草稿：只处理与当前项目、当前分集匹配且比已保存内容新的一份 */
+  function restoreDraftBackup() {
+    if (draftRestoreChecked) return;
+    if (!state.project) return;
+    draftRestoreChecked = true;
+    let saved = null;
+    try {
+      saved = JSON.parse(localStorage.getItem(DRAFT_BACKUP_KEY) || "null");
+    } catch {
+      saved = null;
+    }
+    if (!saved || !saved.storyboardId || saved.projectId !== projectId()) return;
+    const storyboard = (state.project.storyboards || []).find((item) => item.id === saved.storyboardId);
+    if (!storyboard || String(storyboard.prompt || "") === String(saved.value || "")) {
+      clearDraftBackup();
       return;
     }
-    storyboards.forEach((storyboard, index) => host.appendChild(storyboardCard(storyboard, index, storyboards)));
+    state.pendingValues.set(`sb-prompt:${saved.storyboardId}`, String(saved.value || ""));
+    state.draftState = "dirty";
+    const node = $("workbenchMainPrompt");
+    if (node && currentStoryboard()?.id === saved.storyboardId) node.value = String(saved.value || "");
+    toast("已恢复上次未保存的提示词，正在自动保存…");
+    scheduleUpdate(saved.storyboardId, { prompt: String(saved.value || "") }, { delay: 300 });
   }
 
-  function storyboardCard(storyboard, index, all) {
-    const card = document.createElement("div");
-    card.className = "workbench-sb";
-    card.dataset.sbId = storyboard.id;
-    if (state.project.ui?.selectedStoryboardId === storyboard.id) {
-      card.classList.add("workbench-sb-selected");
+  const draftWrites = new Map();
+  function writeDraft(ownerId, operation) {
+    const previous = draftWrites.get(ownerId) || Promise.resolve();
+    const next = previous.then(operation, operation);
+    draftWrites.set(ownerId, next);
+    const cleanup = () => { if (draftWrites.get(ownerId) === next) draftWrites.delete(ownerId); };
+    next.then(cleanup, cleanup);
+    return next;
+  }
+
+  function cancelDraftTimer(storyboardId) {
+    const key = `${storyboardId}:prompt`;
+    const timer = state.saveTimers.get(key);
+    if (timer !== undefined) clearTimeout(timer);
+    state.saveTimers.delete(key);
+  }
+
+  async function persistPrompt(ownerId, storyboardId, prompt) {
+    const result = await writeDraft(ownerId, () => api.storyboard.update(ownerId, storyboardId, { prompt }));
+    if (projectId() === ownerId && result.storyboard) {
+      state.project = { ...state.project, storyboards: state.project.storyboards.map((draft) =>
+        draft.id === storyboardId ? result.storyboard : draft) };
     }
+    const key = `sb-prompt:${storyboardId}`;
+    if (state.pendingValues.get(key) === prompt) state.pendingValues.delete(key);
+    state.lastSaved = formatTime(new Date());
+    state.draftState = "saved";
+    renderHint();
+    // 保存成功即撤销兜底草稿（只清属于本次保存的那一份）
+    try {
+      const backup = JSON.parse(localStorage.getItem(DRAFT_BACKUP_KEY) || "null");
+      if (backup?.storyboardId === storyboardId && backup?.projectId === ownerId) clearDraftBackup();
+    } catch {}
+    if (result.droppedTokens?.length) toast(`提示词里已找不到 ${result.droppedTokens.join("、")}，对应引用已解除`, "error");
+    return result;
+  }
 
-    const header = document.createElement("div");
-    header.className = "workbench-sb-head";
-    const badge = document.createElement("span");
-    badge.className = "workbench-sb-index";
-    badge.textContent = `#${index + 1}`;
-    header.appendChild(badge);
+  async function flushComposeDraft() {
+    const storyboard = currentStoryboard();
+    if (!storyboard) return;
+    const ownerId = projectId();
+    cancelDraftTimer(storyboard.id);
+    const value = $("workbenchMainPrompt")?.value ?? storyboard.prompt;
+    state.draftState = "saving";
+    renderHint();
+    await persistPrompt(ownerId, storyboard.id, value);
+  }
 
-    const nameInput = document.createElement("input");
-    nameInput.className = "workbench-sb-name";
-    const pendingName = state.pendingValues.get(`sb-name:${storyboard.id}`);
-    nameInput.value = pendingName === undefined ? storyboard.name : pendingName;
-    nameInput.maxLength = 120;
-    nameInput.dataset.focusKey = `sb-name:${storyboard.id}`;
-    header.appendChild(nameInput);
+  /** 编辑框里是否存在尚未落盘的改动（含未到期的防抖定时器） */
+  function composeDirty() {
+    const storyboard = currentStoryboard();
+    if (!storyboard) return false;
+    if (state.saveTimers.has(`${storyboard.id}:prompt`)) return true;
+    const node = $("workbenchMainPrompt");
+    const pending = state.pendingValues.get(`sb-prompt:${storyboard.id}`);
+    const live = node && node.dataset.sbId === storyboard.id ? String(node.value || "") : pending;
+    const value = live === undefined ? String(storyboard.prompt || "") : live;
+    return value !== String(storyboard.prompt || "");
+  }
 
-    const actions = document.createElement("div");
-    actions.className = "workbench-sb-actions";
-    const buttons = [
-      ["up", "上移", index === 0],
-      ["down", "下移", index === all.length - 1],
-      ["duplicate", "复制", false],
-      ["delete", "删除", false],
-    ];
-    for (const [act, label, disabled] of buttons) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "text-button";
-      button.dataset.act = act;
-      button.textContent = label;
-      button.disabled = disabled;
-      actions.appendChild(button);
+  /**
+   * 切换项目/分集前的兜底：有未保存改动时先确认（保存并切换 / 丢弃改动 / 取消）。
+   * 返回 true 表示可以继续切换。
+   */
+  async function confirmLeaveDraft() {
+    if (!composeDirty()) {
+      try {
+        await flushComposeDraft();
+      } catch {}
+      return true;
     }
-    header.appendChild(actions);
-    card.appendChild(header);
-
-    // 图片引用标签：显示缩略图 + token + 可删除
-    const refs = document.createElement("div");
-    refs.className = "workbench-sb-refs";
-    if (!storyboard.refs.length) {
-      const empty = document.createElement("span");
-      empty.className = "workbench-refs-empty";
-      empty.textContent = "在提示词里输入 @ 即可插入参考图片";
-      refs.appendChild(empty);
-    }
-    for (const ref of storyboard.refs) {
-      const asset = assetById(ref.assetId);
-      const chip = document.createElement("span");
-      chip.className = "workbench-ref-chip";
-      if (asset) {
-        const img = document.createElement("img");
-        img.alt = asset.name;
-        paintThumb(img, asset.id);
-        chip.appendChild(img);
-      }
-      const text = document.createElement("b");
-      text.textContent = `${ref.token} ${asset ? asset.name : "（素材已删除）"}`;
-      chip.appendChild(text);
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.dataset.act = "unbind";
-      remove.dataset.assetId = ref.assetId;
-      remove.title = "解除引用";
-      remove.textContent = "×";
-      chip.appendChild(remove);
-      refs.appendChild(chip);
-    }
-    card.appendChild(refs);
-
-    const prompt = document.createElement("textarea");
-    prompt.className = "workbench-sb-prompt";
-    const pendingPrompt = state.pendingValues.get(`sb-prompt:${storyboard.id}`);
-    prompt.value = pendingPrompt === undefined ? storyboard.prompt : pendingPrompt;
-    prompt.placeholder = "描述这个分镜的画面与动作；输入 @ 插入参考图片。";
-    prompt.dataset.focusKey = `sb-prompt:${storyboard.id}`;
-    card.appendChild(prompt);
-
-    const foot = document.createElement("div");
-    foot.className = "workbench-sb-foot";
-    const params = document.createElement("span");
-    const effective = effectiveParams(storyboard);
-    const overridden = Object.entries(storyboard.overrides || {}).filter(([, v]) => v);
-    params.textContent = `模型 ${effective.model} · 时长 ${effective.duration}${
-      overridden.length ? `（含 ${overridden.length} 项单条覆盖）` : "（继承全局）"
-    }`;
-    foot.appendChild(params);
-
-    const loadButton = document.createElement("button");
-    loadButton.type = "button";
-    loadButton.className = "text-button";
-    loadButton.dataset.act = "load";
-    loadButton.textContent = "载入编辑区";
-    loadButton.title = "把这条分镜载入上方的提示词编辑框";
-    foot.appendChild(loadButton);
-
-    const runButton = document.createElement("button");
-    runButton.type = "button";
-    runButton.className = "text-button workbench-run-button";
-    runButton.dataset.act = "run";
-    runButton.textContent = "生成这一条";
-    foot.appendChild(runButton);
-
-    const overrideToggle = document.createElement("button");
-    overrideToggle.type = "button";
-    overrideToggle.className = "text-button";
-    overrideToggle.dataset.act = "override";
-    overrideToggle.textContent = "单条覆盖";
-    foot.appendChild(overrideToggle);
-    card.appendChild(foot);
-
-    const overrideBox = document.createElement("div");
-    overrideBox.className = "workbench-sb-overrides hidden";
-    const target = capabilityTarget();
-    const modelSelect = document.createElement("select");
-    modelSelect.dataset.act = "override-model";
-    const inheritModel = document.createElement("option");
-    inheritModel.value = "";
-    inheritModel.textContent = "继承全局";
-    modelSelect.appendChild(inheritModel);
-    for (const value of target?.models || []) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = value;
-      modelSelect.appendChild(option);
-    }
-    modelSelect.value = storyboard.overrides?.model || "";
-    overrideBox.appendChild(field("模型", modelSelect));
-
-    const durationSelect = document.createElement("select");
-    durationSelect.dataset.act = "override-duration";
-    const inheritDuration = document.createElement("option");
-    inheritDuration.value = "";
-    inheritDuration.textContent = "继承全局";
-    durationSelect.appendChild(inheritDuration);
-    for (const value of target?.durations || []) {
-      const option = document.createElement("option");
-      option.value = String(value);
-      option.textContent = value === "auto" ? "自动" : `${value} 秒`;
-      durationSelect.appendChild(option);
-    }
-    durationSelect.value = storyboard.overrides?.duration || "";
-    overrideBox.appendChild(field("时长", durationSelect));
-
-    const ratioSelect = document.createElement("select");
-    ratioSelect.dataset.act = "override-ratio";
-    const inheritRatio = document.createElement("option");
-    inheritRatio.value = "";
-    inheritRatio.textContent = "继承全局";
-    ratioSelect.appendChild(inheritRatio);
-    ratioOptions(storyboard.overrides?.ratio).forEach((value) => {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = value;
-      ratioSelect.appendChild(option);
+    const choice = await confirmAction({
+      title: "当前分集有未保存的改动",
+      message: "这条提示词还没写回草稿。直接切换会丢失刚输入的内容。",
+      okLabel: "保存并切换",
+      altLabel: "丢弃改动",
+      danger: false,
     });
-    ratioSelect.value = storyboard.overrides?.ratio || "";
-    overrideBox.appendChild(field("比例", ratioSelect));
-
-    const ratioNote = document.createElement("span");
-    ratioNote.className = "workbench-unknown";
-    ratioNote.textContent = "比例能力未核实";
-    overrideBox.appendChild(ratioNote);
-
-    card.appendChild(overrideBox);
-
-    return card;
-  }
-
-  function effectiveParams(storyboard) {
-    const defaults = state.project.defaults || {};
-    return {
-      model: storyboard.overrides?.model || defaults.model,
-      duration: storyboard.overrides?.duration || defaults.duration,
-      ratio: storyboard.overrides?.ratio || defaults.ratio,
-    };
+    if (choice === "cancel") return false;
+    if (choice === "ok") {
+      try {
+        await flushComposeDraft();
+      } catch (error) {
+        toast(`保存失败，未切换：${error.message}`, "error");
+        return false;
+      }
+      return true;
+    }
+    // 丢弃：只清掉还没落盘的本地值，服务端草稿保持上一次保存的内容
+    const storyboard = currentStoryboard();
+    if (storyboard) {
+      cancelDraftTimer(storyboard.id);
+      state.pendingValues.delete(`sb-prompt:${storyboard.id}`);
+      const node = $("workbenchMainPrompt");
+      if (node) node.value = String(storyboard.prompt || "");
+    }
+    clearDraftBackup();
+    state.draftState = "saved";
+    renderHint();
+    renderCompose();
+    return true;
   }
 
   function scheduleUpdate(storyboardId, patch, options = {}) {
-    const key = `${storyboardId}:${options.key || "prompt"}`;
-    const timer = state.saveTimers.get(key);
-    if (timer) clearTimeout(timer);
-    state.saveTimers.set(
-      key,
-      setTimeout(async () => {
-        state.saveTimers.delete(key);
-        state.pendingValues.delete(`sb-${options.key || "prompt"}:${storyboardId}`);
-        try {
-          const result = await api.storyboard.update(projectId(), storyboardId, patch);
-          state.lastSaved = formatTime(new Date());
-          if (result.droppedTokens?.length) {
-            toast(`提示词里已找不到 ${result.droppedTokens.join("、")}，对应引用已解除`, "error");
-          }
-          await refresh();
-        } catch (error) {
-          toast(`保存失败：${error.message}`, "error");
-        }
-      }, options.delay ?? 600)
-    );
-  }
-
-  async function selectStoryboard(storyboardId) {
-    if (!state.project) return;
-    // 已在选中态就直接返回，避免 focusin → 保存 → 广播 → 重渲染 的回环
-    if (state.project.ui?.selectedStoryboardId === storyboardId) {
-      state.focusedStoryboardId = storyboardId;
-      return;
-    }
-    state.focusedStoryboardId = storyboardId;
-    try {
-      await api.ui.set(projectId(), { selectedStoryboardId: storyboardId });
-      state.project.ui = { ...(state.project.ui || {}), selectedStoryboardId: storyboardId };
-    } catch {}
+    const ownerId = projectId();
+    cancelDraftTimer(storyboardId);
+    state.draftState = "dirty";
+    renderHint();
+    state.saveTimers.set(`${storyboardId}:prompt`, setTimeout(async () => {
+      state.saveTimers.delete(`${storyboardId}:prompt`);
+      try {
+        state.draftState = "saving";
+        renderHint();
+        await persistPrompt(ownerId, storyboardId, patch.prompt);
+        if (projectId() === ownerId) await refresh();
+      } catch (error) {
+        state.draftState = "dirty";
+        renderHint();
+        toast(`保存失败，输入仍保留在编辑区：${error.message}`, "error");
+      }
+    }, options.delay ?? 600));
   }
 
   // ── @图片选择器 ───────────────────────────────────────────
@@ -2196,7 +2459,9 @@
     const { storyboardId, prompt, caret } = state.mention;
     closeModal("workbenchMentionModal");
     try {
-      const result = await api.storyboard.bind(projectId(), storyboardId, assetId, { prompt, caret });
+      const ownerId = projectId();
+      cancelDraftTimer(storyboardId);
+      const result = await writeDraft(ownerId, () => api.storyboard.bind(ownerId, storyboardId, assetId, { prompt, caret }));
       state.lastSaved = formatTime(new Date());
       // 绑定后服务端会重写提示词（把 @图N 插到光标处）：
       // 必须先丢掉本地未落盘的旧值与待保存定时器，否则重渲染会用旧文本覆盖，视觉上就像「没关联」
@@ -2220,62 +2485,48 @@
     }
   }
 
-  // ── 批量粘贴 ─────────────────────────────────────────────
-  let pasteItems = [];
-
-  function pasteMode() {
-    const checked = document.querySelector('input[name="workbenchPasteMode"]:checked');
-    return checked?.value || "blank";
-  }
-
-  async function previewPaste() {
-    const text = $("workbenchPasteText")?.value || "";
-    const list = $("workbenchPasteList");
-    const count = $("workbenchPasteCount");
-    const button = $("workbenchPasteImport");
-    try {
-      const result = await api.prompt.split(text, pasteMode());
-      pasteItems = result.items;
-      if (count) count.textContent = `${result.count} 条`;
-      if (button) button.disabled = result.count === 0;
-      if (!list) return;
-      list.innerHTML = "";
-      for (const item of result.items) {
-        const row = document.createElement("div");
-        row.className = "workbench-paste-item";
-        const head = document.createElement("div");
-        const index = document.createElement("span");
-        index.className = "workbench-paste-index";
-        index.textContent = `#${item.index}`;
-        head.appendChild(index);
-        const name = document.createElement("strong");
-        name.textContent = item.name;
-        head.appendChild(name);
-        const meta = document.createElement("em");
-        meta.textContent = `${item.chars} 字 / ${item.lines} 行`;
-        head.appendChild(meta);
-        row.appendChild(head);
-        const body = document.createElement("p");
-        body.textContent = item.prompt.length > 160 ? `${item.prompt.slice(0, 160)}…` : item.prompt;
-        row.appendChild(body);
-        list.appendChild(row);
-      }
-    } catch (error) {
-      toast(`拆分失败：${error.message}`, "error");
-    }
-  }
-
   // ── 事件绑定 ─────────────────────────────────────────────
   function bindEvents() {
-    $("showWorkbench")?.addEventListener("click", () => {
+    $("workbenchTaskFilters")?.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-filter]");
+      if (!button) return;
+      state.taskFilter = button.dataset.filter;
+      state.taskVisibleLimit = 40;
+      renderTasks();
+      $("workbenchTaskList").scrollTop = 0;
+    });
+    $("workbenchTaskSearch")?.addEventListener("input", (event) => {
+      state.taskSearch = event.target.value;
+      state.taskVisibleLimit = 40;
+      renderTasks();
+      $("workbenchTaskList").scrollTop = 0;
+    });
+    $("workbenchTaskMore")?.addEventListener("click", () => {
+      state.taskVisibleLimit += 40;
+      renderTasks();
+    });
+    let openingWorkbench = false;
+    $("showWorkbench")?.addEventListener("click", async () => {
       openModal("workbenchModal");
-      refresh();
+      if (openingWorkbench) return;
+      openingWorkbench = true;
+      try {
+        const loaded = await refresh();
+        if (loaded && !state.project) {
+          await api.project.create("视频创作");
+          await refresh();
+        }
+      } catch (error) {
+        toast(`打开创作区失败：${error.message}`, "error");
+      } finally {
+        openingWorkbench = false;
+      }
     });
 
     bindComposeEvents();
     renderAssetsCollapse();
 
-    for (const node of document.querySelectorAll("#workbenchModal [data-close], #workbenchPasteModal [data-close], #workbenchMentionModal [data-close], #workbenchPreviewModal [data-close], #workbenchImpactModal [data-close]")) {
+    for (const node of document.querySelectorAll("#workbenchModal [data-close], #workbenchMentionModal [data-close], #workbenchPreviewModal [data-close], #workbenchImpactModal [data-close]")) {
       node.addEventListener(
         "click",
         (event) => {
@@ -2287,21 +2538,152 @@
     }
 
     $("workbenchProjectSelect")?.addEventListener("change", async (event) => {
+      const targetProjectId = event.target.value;
       try {
-        await api.project.open(event.target.value);
+        // 有未保存改动时先确认（保存并切换 / 丢弃 / 取消），取消则把下拉选回原值
+        if (!(await confirmLeaveDraft())) {
+          await refresh();
+          return;
+        }
+        await api.project.open(targetProjectId);
         state.thumbCache.clear();
         await refresh();
+        toast(`已切换项目：${state.project?.name || ""}`);
       } catch (error) {
         toast(`切换项目失败：${error.message}`, "error");
+        await refresh();
       }
+    });
+
+    $("workbenchEpisodeSelect")?.addEventListener("change", async (event) => {
+      const targetId = event.target.value;
+      try {
+        if (!(await confirmLeaveDraft())) {
+          await refresh();
+          return;
+        }
+        await api.project.open(targetId);
+        state.thumbCache.clear();
+        await refresh();
+        toast(`已切换分集：${state.project?.name || ""}`);
+      } catch (error) {
+        toast(error.message, "error");
+        await refresh();
+      }
+    });
+    $("workbenchEpisodeNew")?.addEventListener("click", async () => {
+      if (!state.project) return toast("请先新建大项目", "error");
+      try {
+        if (!(await confirmLeaveDraft())) return;
+        const parentId = state.project.parentId || state.project.id;
+        // 编号由主进程串行分配：快速连点也不会出现两个「第 1 集」
+        await api.project.create("", { parentId });
+        state.thumbCache.clear();
+        await refresh();
+        toast(`已新建分集：${state.project?.name || ""}`, "ok");
+      } catch (error) { toast("新建分集失败：" + error.message, "error"); }
+    });
+
+    // ── 删除分集 / 删除项目（标题栏入口，高危操作一律二次确认） ──
+    $("workbenchEpisodeDelete")?.addEventListener("click", async () => {
+      const current = state.project;
+      if (!current?.parentId) return toast("当前是「公共素材 / 项目工作区」，请先选中要删除的分集", "error");
+      await removeEpisodes([current.id]);
+    });
+    $("workbenchProjectDelete")?.addEventListener("click", () => void removeCurrentProject());
+
+    // ── 分集列表 / 批量 ──
+    $("workbenchEpisodeWrap")?.addEventListener("toggle", () => {
+      writeLayout({ episodesOpen: $("workbenchEpisodeWrap")?.open === true });
+    });
+    $("workbenchEpisodeList")?.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-act]");
+      if (!button) return;
+      const projectIdOfRow = button.closest(".workbench-episode")?.dataset.projectId;
+      if (!projectIdOfRow) return;
+      const act = button.dataset.act;
+      if (act === "up" || act === "down") return moveEpisode(projectIdOfRow, act === "up" ? -1 : 1);
+      if (act === "copy") return void duplicateEpisodes([projectIdOfRow]);
+      if (act === "remove") return void removeEpisodes([projectIdOfRow]);
+      if (act === "open") {
+        try {
+          if (!(await confirmLeaveDraft())) return;
+          await api.project.open(projectIdOfRow);
+          state.thumbCache.clear();
+          await refresh();
+        } catch (error) {
+          toast(`载入分集失败：${error.message}`, "error");
+        }
+      }
+    });
+    $("workbenchEpisodeList")?.addEventListener("change", (event) => {
+      const box = event.target.closest('input[data-act="episode-select"]');
+      if (!box) return;
+      const id = box.closest(".workbench-episode")?.dataset.projectId;
+      if (!id) return;
+      const next = new Set(state.episodeSelection);
+      if (box.checked) next.add(id);
+      else next.delete(id);
+      state.episodeSelection = next;
+      renderEpisodes();
+    });
+    $("workbenchEpisodeAll")?.addEventListener("change", (event) => {
+      const episodes = episodesOf(currentRootId());
+      state.episodeSelection = event.target.checked ? new Set(episodes.map((item) => item.id)) : new Set();
+      renderEpisodes();
+    });
+    $("workbenchEpisodeUp")?.addEventListener("click", () => {
+      const [id] = [...state.episodeSelection];
+      if (id) moveEpisode(id, -1);
+    });
+    $("workbenchEpisodeDown")?.addEventListener("click", () => {
+      const [id] = [...state.episodeSelection];
+      if (id) moveEpisode(id, 1);
+    });
+    $("workbenchEpisodeCopy")?.addEventListener("click", () => void duplicateEpisodes([...state.episodeSelection]));
+    $("workbenchEpisodeRemove")?.addEventListener("click", () => void removeEpisodes([...state.episodeSelection]));
+
+    // ── 任务批量清理（只清「生成成功且下载未在进行」的记录） ──
+    $("workbenchTaskClear")?.addEventListener("click", async () => {
+      const succeeded = (state.tasks || []).filter((task) => task.status === "succeeded").length;
+      if (!succeeded) return toast("当前没有可清理的已完成任务（失败与未完成任务都会保留）");
+      const choice = await confirmAction({
+        title: `清理 ${succeeded} 条已完成任务记录？`,
+        message:
+          "只删除「生成成功且下载未在进行」的任务记录；失败、需人工处理、未完成，以及下载中/已暂停的记录都会保留。已下载到本地的视频文件不会被删除。",
+        okLabel: `确认清理（${succeeded}）`,
+      });
+      if (choice !== "ok") return;
+      try {
+        const result = await api.task.clear(projectId(), { statuses: ["succeeded"] });
+        toast(
+          `已清理 ${result.removed} 条记录${
+            result.skipped?.length ? `；${result.skipped.length} 条因下载未完成被保留` : ""
+          }`,
+          "ok"
+        );
+        await refresh();
+      } catch (error) {
+        toast(`清理失败：${error.message}`, "error");
+      }
+    });
+
+    $("workbenchAssetReuse")?.addEventListener("click", async () => {
+      if (!state.project) return;
+      try {
+        await flushComposeDraft();
+        window.openProjectAssetReuse({ api, target: {id: state.project.id, name: state.project.parentId ? state.project.name : state.project.name + " / 公共素材"}, onImported: async () => { state.thumbCache.clear(); await refresh(); } });
+      } catch (error) { toast(error.message, "error"); }
     });
 
     $("workbenchProjectNew")?.addEventListener("click", async () => {
       try {
-        // Electron 不支持 window.prompt，改为创建后就地改名
+        // 先保存当前编辑内容，再切换到新项目。
+        if (!(await confirmLeaveDraft())) return;
         await api.project.create(`项目 ${new Date().toLocaleDateString("zh-CN")}`);
         state.thumbCache.clear();
         await refresh();
+        toast(`已新建项目：${state.project?.name || ""}`, "ok");
         promptInline($("workbenchProjectSelect")?.parentElement, state.project?.name || "", async (name) => {
           if (!name) return;
           await api.project.rename(projectId(), name);
@@ -2385,20 +2767,62 @@
         return openModal("workbenchPreviewModal");
       }
       if (act === "insert") {
-        const target = state.focusedStoryboardId || state.project?.storyboards?.[0]?.id;
-        if (!target) return toast("请先新增一个分镜", "error");
+        const target = currentStoryboard()?.id;
+        if (!target) return toast("请先新建或选择项目", "error");
         // 用输入框里的实时文本与光标，而不是等防抖落盘的旧值，否则刚打的字会被丢掉
         const node = document.querySelector(`[data-focus-key="sb-prompt:${target}"]`);
-        state.mention = {
-          storyboardId: target,
-          prompt: node ? node.value : null,
-          caret: node ? node.selectionStart : null,
-          search: "",
-        };
+        let base = node ? node.value : null;
+        let caret = node ? node.selectionStart : null;
+        // 选中了一段文字再点「插入」：用这条 @图N 替换选中的那段，而不是插在选区后面
+        if (node && Number.isInteger(node.selectionStart) && node.selectionEnd > node.selectionStart) {
+          base = node.value.slice(0, node.selectionStart) + node.value.slice(node.selectionEnd);
+          caret = node.selectionStart;
+        }
+        state.mention = { storyboardId: target, prompt: base, caret, search: "" };
         await bindFromMention(assetId);
         return;
       }
     });
+
+    // 素材悬停放大预览：延迟 320ms 出现，移开立即隐藏（不占用卡位、不阻塞点击）
+    let hoverTimer = null;
+    const hoverNode = () => {
+      let node = $("workbenchAssetHover");
+      if (!node) {
+        node = document.createElement("div");
+        node.id = "workbenchAssetHover";
+        node.className = "workbench-hover-preview";
+        document.body.appendChild(node);
+      }
+      return node;
+    };
+    const hideHover = () => {
+      clearTimeout(hoverTimer);
+      $("workbenchAssetHover")?.classList.remove("is-visible");
+    };
+    $("workbenchAssetList")?.addEventListener("mouseover", (event) => {
+      const thumb = event.target.closest(".workbench-asset-thumb");
+      if (!thumb) return;
+      const assetId = thumb.closest(".workbench-asset")?.dataset.assetId;
+      if (!assetId) return;
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(async () => {
+        const url = await thumbFor(assetId);
+        if (!url) return;
+        const node = hoverNode();
+        const rect = thumb.getBoundingClientRect();
+        node.replaceChildren(Object.assign(document.createElement("img"), { src: url, alt: "素材预览" }));
+        const width = 240;
+        node.style.left = `${Math.max(8, Math.min(window.innerWidth - width - 16, rect.right + 12))}px`;
+        node.style.top = `${Math.max(8, rect.top - 24)}px`;
+        node.style.width = `${width}px`;
+        node.classList.add("is-visible");
+      }, 320);
+    });
+    $("workbenchAssetList")?.addEventListener("mouseout", (event) => {
+      if (event.target.closest(".workbench-asset-thumb")) hideHover();
+    });
+    $("workbenchAssetList")?.addEventListener("scroll", hideHover);
 
     $("workbenchAssetList")?.addEventListener(
       "change",
@@ -2411,7 +2835,7 @@
           await api.asset.rename(projectId(), assetId, input.value);
           // 改名只影响展示名，分镜里的引用按 assetId 保持不变
           await refresh();
-          toast("已改名（分镜引用不受影响）");
+          toast("已改名（图片引用不受影响）");
         } catch (error) {
           toast(`改名失败：${error.message}`, "error");
         }
@@ -2423,47 +2847,6 @@
       const ids = state.impact.assetIds.slice();
       closeModal("workbenchImpactModal");
       for (const id of ids) await deleteAsset(id, "unbind");
-    });
-
-    $("workbenchStoryboardAdd")?.addEventListener("click", async () => {
-      if (!state.project) return toast("请先新建或选择项目", "error");
-      try {
-        const result = await api.storyboard.add(projectId(), {});
-        await refresh();
-        state.focusedStoryboardId = result.storyboard.id;
-        document.querySelector(`[data-focus-key="sb-prompt:${result.storyboard.id}"]`)?.focus();
-      } catch (error) {
-        toast(`新增分镜失败：${error.message}`, "error");
-      }
-    });
-
-    $("workbenchPasteOpen")?.addEventListener("click", () => {
-      if (!state.project) return toast("请先新建或选择项目", "error");
-      pasteItems = [];
-      const text = $("workbenchPasteText");
-      if (text) text.value = "";
-      openModal("workbenchPasteModal");
-      previewPaste();
-    });
-
-    let pasteTimer = 0;
-    $("workbenchPasteText")?.addEventListener("input", () => {
-      clearTimeout(pasteTimer);
-      pasteTimer = setTimeout(previewPaste, 300);
-    });
-
-    $("workbenchPasteModes")?.addEventListener("change", previewPaste);
-
-    $("workbenchPasteImport")?.addEventListener("click", async () => {
-      if (!pasteItems.length) return;
-      try {
-        const result = await api.prompt.import(projectId(), pasteItems, pasteMode());
-        closeModal("workbenchPasteModal");
-        await refresh();
-        toast(`已导入 ${result.created} 个分镜`);
-      } catch (error) {
-        toast(`导入失败：${error.message}`, "error");
-      }
     });
 
     $("workbenchMentionSearch")?.addEventListener("input", (event) => {
@@ -2480,6 +2863,7 @@
       else set.delete(id);
       state.selectedAccountIds = [...set];
       state.accountsTouched = true;
+      persistAccountSelection();
       renderAccounts();
       // 账号选择直接影响主按钮的可用性，这里必须同步刷新
       renderCompose();
@@ -2523,73 +2907,11 @@
       }
     });
 
-    $("workbenchRunConfirm")?.addEventListener("click", async () => {
-      const confirm = $("workbenchRunConfirm");
-      const assignments = (state.run.assignments || []).filter((item) => item.valid);
-      if (!assignments.length) return toast("没有校验通过的尝试可提交", "error");
-      const original = confirm.textContent;
-      confirm.disabled = true;
-      confirm.textContent = "提交中…";
-      const failed = [];
-      let done = 0;
-      try {
-        for (const [index, item] of assignments.entries()) {
-          const status = $("workbenchRunStatus");
-          if (status) {
-            status.textContent = `正在提交第 ${index + 1}/${assignments.length} 条：${item.storyboardName} → ${accountName(
-              item.accountId
-            )}（真实提交，请勿关闭窗口）…`;
-          }
-          try {
-            const created = await api.task.enqueue(projectId(), item.storyboardId, item.accountId);
-            state.run.currentAttemptId = created.attempt.id;
-            await refresh();
-            await api.task.execute(projectId(), created.attempt.id);
-            done++;
-          } catch (error) {
-            failed.push(`${item.storyboardName} → ${accountName(item.accountId)}：${error.message}`);
-          }
-        }
-        state.run.currentAttemptId = "";
-        await refresh();
-        closeModal("workbenchRunModal");
-        if (failed.length) {
-          toast(`已提交 ${done} 条，${failed.length} 条失败`, "error");
-          for (const text of failed) toast(text, "error");
-        } else {
-          toast(`已提交 ${done} 条尝试，任务卡片里有逐步结果`, "ok");
-        }
-      } catch (error) {
-        toast(`提交失败：${error.message}`, "error");
-      } finally {
-        confirm.disabled = false;
-        confirm.textContent = original;
-      }
-    });
-
-    // 模式切换：切换后重新算分配（默认分配执行，对比模式必须显式选择）
-    $("workbenchRunPreview")?.addEventListener("change", async (event) => {
-      const radio = event.target.closest('input[name="workbenchRunMode"]');
-      if (!radio) return;
-      try {
-        await openRunModal(state.run.storyboardIds, radio.value);
-      } catch (error) {
-        toast(`重新计算分配失败：${error.message}`, "error");
-      }
-    });
-
-    $("workbenchRunBatch")?.addEventListener("click", async () => {
-      try {
-        await openRunModal((state.project?.storyboards || []).map((s) => s.id), "distribute");
-      } catch (error) {
-        toast(`无法准备批量提交：${error.message}`, "error");
-      }
-    });
-
     $("workbenchAccountNote")?.addEventListener("click", (event) => {
       if (event.target.closest('[data-act="accounts-all"]')) {
         state.accountsTouched = true;
         state.selectedAccountIds = (state.accounts || []).map((a) => a.id);
+        persistAccountSelection();
         renderAccounts();
         renderCompose();
         return;
@@ -2597,6 +2919,7 @@
       if (event.target.closest('[data-act="accounts-none"]')) {
         state.accountsTouched = true;
         state.selectedAccountIds = [];
+        persistAccountSelection();
         renderAccounts();
         renderCompose();
       }
@@ -2609,7 +2932,13 @@
       if (!attemptId) return;
       button.disabled = true;
       try {
-        if (button.dataset.act === "cancel") {
+        if (button.dataset.act === "interrupt") {
+          const record = await api.task.interrupt(projectId(), attemptId);
+          toast(record.interruption?.stopped ? (record.interruption.platformMayContinue ? "已停止跟踪，可用该账号创建新任务；豆包可能仍在生成" : "已中断，未发送到豆包") : "任务已结束，无需中断");
+        } else if (button.dataset.act === "resume-monitoring") {
+          await api.task.resumeMonitoring(projectId(), attemptId);
+          toast("已恢复查询，不会重新提交");
+        } else if (button.dataset.act === "cancel") {
           const record = await api.task.cancel(projectId(), attemptId);
           toast(record.status === "canceled" ? "已取消" : `未取消：${record.poll?.message || "平台不支持取消"}`);
         } else if (button.dataset.act === "stop-retry") {
@@ -2650,136 +2979,57 @@
         await refresh();
       } catch (error) {
         toast(`操作失败：${error.message}`, "error");
+      } finally {
         button.disabled = false;
       }
     });
 
-    const list = $("workbenchStoryboardList");
-    if (!list) return;
-
-    list.addEventListener("input", (event) => {
-      const card = event.target.closest(".workbench-sb");
-      if (!card) return;
-      const storyboardId = card.dataset.sbId;
-      state.focusedStoryboardId = storyboardId;
-      if (event.target.classList.contains("workbench-sb-name")) {
-        state.pendingValues.set(`sb-name:${storyboardId}`, event.target.value);
-        scheduleUpdate(storyboardId, { name: event.target.value }, { key: "name" });
-        return;
+    // 关闭窗口 / 页面隐藏前的兜底保存：
+    // 旧实现只有 600ms 防抖，编辑后立刻退出会让最后一次输入永久丢失。
+    // 这里双保险：先尽力 flush（正常路径），同时把未落盘的值写进 localStorage（异常退出也能恢复）。
+    window.addEventListener("beforeunload", () => {
+      const storyboard = currentStoryboard();
+      const node = $("workbenchMainPrompt");
+      if (storyboard && node && String(node.value || "") !== String(storyboard.prompt || "")) {
+        backupDraft(storyboard.id, node.value);
       }
-      if (event.target.classList.contains("workbench-sb-prompt")) {
-        const node = event.target;
-        state.pendingValues.set(`sb-prompt:${storyboardId}`, node.value);
-        const caret = node.selectionStart;
-        // 刚输入 @ → 弹出图片选择器；把 @ 本身排除在插入点之外
-        if (caret > 0 && node.value[caret - 1] === "@") {
-          const withoutAt = node.value.slice(0, caret - 1) + node.value.slice(caret);
-          openMention(storyboardId, withoutAt, caret - 1);
-          return;
-        }
-        scheduleUpdate(storyboardId, { prompt: node.value });
-      }
-    });
-
-    list.addEventListener("focusin", (event) => {
-      const card = event.target.closest(".workbench-sb");
-      if (card) selectStoryboard(card.dataset.sbId);
-    });
-
-    list.addEventListener("change", async (event) => {
-      const card = event.target.closest(".workbench-sb");
-      if (!card) return;
-      const storyboardId = card.dataset.sbId;
-      const act = event.target.dataset.act;
-      if (act !== "override-model" && act !== "override-duration" && act !== "override-ratio") return;
-      const patch = act === "override-model"
-        ? { model: event.target.value }
-        : act === "override-duration"
-          ? { duration: event.target.value }
-          : { ratio: event.target.value };
       try {
-        await api.storyboard.update(projectId(), storyboardId, { overrides: patch });
-        state.lastSaved = formatTime(new Date());
-        await refresh();
-      } catch (error) {
-        toast(`保存单条覆盖失败：${error.message}`, "error");
-      }
+        void flushComposeDraft();
+      } catch {}
     });
-
-    list.addEventListener("click", async (event) => {
-      const button = event.target.closest("[data-act]");
-      if (!button) return;
-      const card = button.closest(".workbench-sb");
-      if (!card) return;
-      const storyboardId = card.dataset.sbId;
-      const act = button.dataset.act;
-      const storyboards = state.project.storyboards || [];
-      const index = storyboards.findIndex((s) => s.id === storyboardId);
-
-      try {
-        if (act === "unbind") {
-          await api.storyboard.unbind(projectId(), storyboardId, button.dataset.assetId);
-          await refresh();
-          return;
-        }
-        if (act === "delete") {
-          await api.storyboard.remove(projectId(), storyboardId);
-          await refresh();
-          return;
-        }
-        if (act === "duplicate") {
-          await api.storyboard.duplicate(projectId(), storyboardId);
-          await refresh();
-          return;
-        }
-        if (act === "override") {
-          card.querySelector(".workbench-sb-overrides")?.classList.toggle("hidden");
-          return;
-        }
-        if (act === "load") {
-          await loadStoryboardIntoCompose(storyboardId);
-          toast("已载入编辑区");
-          return;
-        }
-        if (act === "run") {
-          await openRunModal([storyboardId], "distribute");
-          return;
-        }
-        if (act === "up" || act === "down") {
-          const target = act === "up" ? index - 1 : index + 1;
-          if (target < 0 || target >= storyboards.length) return;
-          const ids = storyboards.map((s) => s.id);
-          [ids[index], ids[target]] = [ids[target], ids[index]];
-          await api.storyboard.reorder(projectId(), ids);
-          await refresh();
-        }
-      } catch (error) {
-        toast(`操作失败：${error.message}`, "error");
-      }
+    window.addEventListener("pagehide", () => void flushComposeDraft().catch(() => {}));
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") void flushComposeDraft().catch(() => {});
     });
   }
 
   api.onChanged(() => {
     if (!$("workbenchModal") || $("workbenchModal").classList.contains("hidden")) return;
-    refresh({ silent: false });
+    refresh({ silent: false, tasksOnly: true });
   });
 
-  // 下载实时进度：只更新受影响的任务卡（节流到 ~4 次/秒），不整页刷新
-  let progressFlush = 0;
+  // 一次合并所有下载的最新进度，避免全局节流让其他账号的更新丢失。
+  let progressTimer = null;
+  const pendingProgress = new Set();
   api.onDownloadProgress((payload) => {
     if (!payload?.attemptId) return;
     const current = state.downloadProgress.get(payload.attemptId) || {};
     state.downloadProgress.set(payload.attemptId, { ...current, ...payload });
-    const now = Date.now();
-    if (now - progressFlush < 250) return;
-    progressFlush = now;
-    if ($("workbenchModal")?.classList.contains("hidden")) return;
-    const card = document.querySelector(`.workbench-task[data-attempt-id="${payload.attemptId}"]`);
-    if (!card) return;
-    const record = (state.tasks || []).find((t) => t.id === payload.attemptId);
-    if (!record) return;
-    const host = card.querySelector(".workbench-download");
-    if (host) host.replaceWith(downloadBlock(record));
+    pendingProgress.add(payload.attemptId);
+    if (progressTimer !== null) return;
+    progressTimer = setTimeout(() => {
+      progressTimer = null;
+      const ids = new Set(pendingProgress);
+      pendingProgress.clear();
+      if ($("workbenchModal")?.classList.contains("hidden")) return;
+      const records = new Map((state.tasks || []).map((record) => [record.id, record]));
+      for (const card of $("workbenchTaskList")?.children || []) {
+        const id = card.dataset.attemptId;
+        if (!ids.has(id) || !records.has(id)) continue;
+        const host = card.querySelector(".workbench-download");
+        if (host) host.replaceWith(downloadBlock(records.get(id)));
+      }
+    }, 250);
   });
 
   /**
@@ -2817,6 +3067,29 @@
 
   function bootstrap() {
     bindEvents();
+    creationLibrary = window.createWorkbenchLibrary?.({
+      api, getState: () => state, refresh, toast,
+      withDraft: async (operation, input) => {
+        if (state.compose.busy) throw new Error("请等待当前操作完成");
+        const ownerId = projectId();
+        const draft = currentStoryboard();
+        if (!draft) throw new Error("尚未准备好草稿");
+        state.compose.busy = "library";
+        renderCompose();
+        try {
+          await flushComposeDraft();
+          await writeDraft(ownerId, () => api.library(operation, ownerId, { ...input, draftId: draft.id }));
+          if (operation === "apply" || operation === "undo") {
+            state.pendingValues.delete(`sb-prompt:${draft.id}`);
+            state.compose.status = "";
+          }
+          await refresh();
+        } finally { state.compose.busy = ""; renderCompose(); }
+      },
+    });
+    for (const [id, tab] of [["workbenchTemplates", "templates"], ["workbenchHistory", "history"], ["workbenchWorks", "works"]]) {
+      $(id)?.addEventListener("click", () => creationLibrary?.open(tab));
+    }
     // 版本徽标单独引导：失败不影响工作台本身
     bootstrapVersionBadge().catch(() => {});
   }

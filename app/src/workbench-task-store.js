@@ -54,7 +54,7 @@ const TRANSITIONS = Object.freeze({
   generating: ["succeeded", "failed", "unconfirmed", "manual", "canceled"],
   succeeded: [],
   failed: ["submitting"], // 仅「重试」时先复位为 submitting，且必须是新尝试；见 retryOf
-  manual: ["canceled"],
+  manual: ["canceled", "unconfirmed"],
   // 「提交结果待确认」也必须能走到「需人工处理」：监控窗口到期时轮询就是这么收尾的
   // （workbench-runner.js pollOnce 的监控超时分支）。旧表漏了 manual，导致该分支
   // 每次都抛「不允许的状态迁移：提交结果待确认 → 需人工处理」，任务被永久卡在待确认。
@@ -131,7 +131,15 @@ function snapshotRefs(refs) {
 }
 
 function normalizeAttempt(input = {}) {
-  const status = Object.values(STATUS).includes(input.status) ? input.status : STATUS.PENDING;
+  // 未知/缺失状态**不得**默认成「待执行」。
+  // runner.tick 会把所有 pending 记录纳入准入并真正向平台提交，因此一条被损坏、
+  // 被手工编辑、或由其它版本写入的记录，一旦被强转成 pending，就会在用户下次点
+  // 「生成」时被重新提交——重复消耗额度，且用户完全无感知。
+  // 规则：已知状态原样保留；状态缺失（新建/极旧记录）按 pending；非空但无法识别
+  // 的状态一律落到「需人工处理」，并把原值记进历史，供人工核实后再决定。
+  const rawStatus = String(input.status ?? "").trim();
+  const knownStatus = Object.values(STATUS).includes(rawStatus);
+  const status = knownStatus ? rawStatus : rawStatus ? STATUS.MANUAL : STATUS.PENDING;
   const downloadStatus = Object.values(DOWNLOAD_STATUS).includes(input.download?.status)
     ? input.download.status
     : DOWNLOAD_STATUS.IDLE;
@@ -152,17 +160,25 @@ function normalizeAttempt(input = {}) {
     submittedAt: text(input.submittedAt),
     updatedAt: text(input.updatedAt) || now,
     finishedAt: text(input.finishedAt),
-    history: (Array.isArray(input.history) ? input.history : []).map((h) => ({
-      status: text(h?.status),
-      at: text(h?.at),
-      note: text(h?.note, 300),
-    })),
+    history: [
+      ...(Array.isArray(input.history) ? input.history : []).map((h) => ({
+        status: text(h?.status),
+        at: text(h?.at),
+        note: text(h?.note, 300),
+      })),
+      // 状态被识别失败时留痕：否则用户只会看到一个「需人工处理」的任务，无从判断原因
+      ...(!knownStatus && rawStatus
+        ? [{ status: STATUS.MANUAL, at: now, note: `记录里的状态「${text(rawStatus, 40)}」无法识别，已转为需人工处理，未自动执行` }]
+        : []),
+    ],
     error: input.error
       ? { code: text(input.error.code, 60), message: text(input.error.message, 500), at: text(input.error.at) }
-      : null,
+      : !knownStatus && rawStatus
+        ? { code: "UNKNOWN_STATUS", message: `记录状态无法识别（原值：${text(rawStatus, 40)}），已停止自动执行以免重复提交`, at: now }
+        : null,
     result: input.result
       ? {
-          videoUrl: text(input.result.videoUrl, 800),
+          videoUrl: text(input.result.videoUrl),
           filePath: text(input.result.filePath, 500),
           width: Number(input.result.width) || 0,
           height: Number(input.result.height) || 0,
@@ -175,7 +191,7 @@ function normalizeAttempt(input = {}) {
       // 下载来源与进度：与生成状态完全独立，「下载失败不改变生成结果」
       source: text(input.download?.source, 40),
       sourceLabel: text(input.download?.sourceLabel, 80),
-      url: text(input.download?.url, 2000),
+      url: text(input.download?.url),
       urlSafe: text(input.download?.urlSafe, 300),
       filePath: text(input.download?.filePath, 500),
       message: text(input.download?.message, 300),
@@ -195,6 +211,9 @@ function normalizeAttempt(input = {}) {
       })),
       at: text(input.download?.at),
     },
+    interruption: input.interruption ? { stopped: input.interruption.stopped === true, at: text(input.interruption.at), resumedAt: text(input.interruption.resumedAt), platformMayContinue: input.interruption.platformMayContinue === true } : null,
+    platformContext: input.platformContext ? { requestMessageId: text(input.platformContext.requestMessageId, 60), beforeCount: Math.max(0, Number(input.platformContext.beforeCount) || 0), url: text(input.platformContext.url, 4000) } : null,
+    platformReply: input.platformReply?.text ? { text: text(input.platformReply.text, 8000), at: text(input.platformReply.at) } : null,
     poll: {
       count: Number(input.poll?.count) || 0,
       lastAt: text(input.poll?.lastAt),
@@ -289,7 +308,7 @@ function setError(record, code, message) {
 function setResult(record, patch = {}) {
   const at = new Date().toISOString();
   record.result = {
-    videoUrl: text(patch.videoUrl ?? record.result?.videoUrl, 800),
+    videoUrl: text(patch.videoUrl ?? record.result?.videoUrl),
     filePath: text(patch.filePath ?? record.result?.filePath, 500),
     width: Number(patch.width ?? record.result?.width) || 0,
     height: Number(patch.height ?? record.result?.height) || 0,
@@ -313,7 +332,7 @@ function setDownload(record, status, patch = {}) {
     // 来源（澜川同源 / 平台播放版）与脱敏地址：界面据此标注，完整地址只作为请求参数保留
     source: text(patch.source ?? previous.source, 40),
     sourceLabel: text(patch.sourceLabel ?? previous.sourceLabel, 80),
-    url: text(patch.url ?? previous.url, 2000),
+    url: text(patch.url ?? previous.url),
     urlSafe: text(patch.urlSafe ?? previous.urlSafe, 300),
     filePath: text(patch.filePath ?? previous.filePath, 500),
     message: text(patch.message ?? "", 300),
@@ -394,8 +413,8 @@ function createTaskStore(dirFor) {
   async function write(projectId, doc) {
     const file = fileFor(projectId);
     await fsp.mkdir(path.dirname(file), { recursive: true });
-    // 保留最近 MAX_TASKS 条，避免无限增长；历史仍可导出
-    if (doc.tasks.length > MAX_TASKS) doc.tasks = doc.tasks.slice(-MAX_TASKS);
+    // 持久化层不裁剪记录：活动任务、下载及重试链均依赖历史 ID。
+    // 展示数量由渲染层分页控制；归档功能落地前必须保全历史。
     const tmp = `${file}.tmp`;
     await fsp.writeFile(tmp, `${JSON.stringify(doc, null, 2)}\n`, "utf8");
     await fsp.rename(tmp, file);
@@ -446,6 +465,41 @@ function createTaskStore(dirFor) {
       return serialized(projectId, () =>
         write(projectId, { schemaVersion: SCHEMA_VERSION, tasks: (tasks || []).map(normalizeAttempt) })
       );
+    },
+    /**
+     * 批量清理历史记录（目前只用于「清理已完成任务」）。
+     * 安全约束（缺一不可，否则会损坏其它链路）：
+     * - 只允许删除终态记录：活动任务（待执行/提交中/排队/生成中）永不清理，否则 runner 会「任务记录不存在」；
+     * - 默认只清「生成成功」；失败与需人工处理的记录保留，供用户排查与重试；
+     * - 下载中/已暂停的记录一律跳过：分片与断点续传状态都挂在记录上，删掉就再也续不上；
+     * - 返回 removedIds 与 skipped（原因），界面据此如实提示「清了几条、留了几条、为什么留」。
+     */
+    async clear(projectId, options = {}) {
+      const requested = Array.isArray(options.statuses) && options.statuses.length ? options.statuses : [STATUS.SUCCEEDED];
+      const allowed = new Set(requested.filter((s) => TERMINAL_STATUSES.includes(s)));
+      if (!allowed.size) throw new Error("只能清理已结束的任务（生成成功/失败/已取消）");
+      return serialized(projectId, async () => {
+        const doc = read(projectId);
+        const kept = [];
+        const removedIds = [];
+        const skipped = [];
+        for (const task of doc.tasks) {
+          if (!allowed.has(task.status)) {
+            kept.push(task);
+            continue;
+          }
+          const downloadStatus = task.download?.status;
+          if (downloadStatus === DOWNLOAD_STATUS.RUNNING || downloadStatus === DOWNLOAD_STATUS.PAUSED) {
+            kept.push(task);
+            skipped.push({ id: task.id, status: task.status, reason: "下载尚未完成（下载中或已暂停），保留记录以便继续下载" });
+            continue;
+          }
+          removedIds.push(task.id);
+        }
+        if (!removedIds.length) return { removed: 0, removedIds: [], skipped };
+        await write(projectId, { schemaVersion: SCHEMA_VERSION, tasks: kept });
+        return { removed: removedIds.length, removedIds, skipped };
+      });
     },
     nextAttemptNumber,
   };

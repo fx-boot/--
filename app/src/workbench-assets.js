@@ -281,7 +281,15 @@ function createAssets(store) {
         kept.push(asset);
         continue;
       }
-      removed.push(publicView(asset));
+      removed.push(asset);
+    }
+    if (!removed.length) return [];
+    current.assets = kept;
+    // 顺序很关键：先写目录、再删文件。
+    // 旧实现先 unlink 再写目录，一旦写目录失败就会留下「索引仍有记录、文件已删除」
+    // 的悬空项 —— 界面能列出这张素材，但预览与提交都会失败，且无从修复。
+    await writeCatalog(catalog, current);
+    for (const asset of removed) {
       for (const [dir, fileName] of [
         [assetsDir, asset.fileName],
         [thumbsDir, `${asset.id}.png`],
@@ -292,20 +300,27 @@ function createAssets(store) {
       }
       thumbCache.delete(asset.id);
     }
-    current.assets = kept;
-    await writeCatalog(catalog, current);
-    return removed;
+    return removed.map(publicView);
   }
 
+  const writes = new Map();
+  function serializedMutation(operation) {
+    return (projectId, ...args) => {
+      const previous = writes.get(projectId) || Promise.resolve();
+      const next = previous.then(() => operation(projectId, ...args), () => operation(projectId, ...args));
+      writes.set(projectId, next.catch(() => {}));
+      return next;
+    };
+  }
   return {
     IMAGE_EXT,
     findAsset,
-    importBuffers,
-    importPaths,
+    importBuffers: serializedMutation(importBuffers),
+    importPaths: serializedMutation(importPaths),
     list,
     previewDataUrl,
-    remove,
-    rename,
+    remove: serializedMutation(remove),
+    rename: serializedMutation(rename),
     thumbDataUrl,
   };
 }

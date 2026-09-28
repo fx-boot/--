@@ -100,6 +100,7 @@ function assignStoryboards({ storyboardIds = [], accountIds = [], mode = "distri
  * 这两种都说明「平台收到了请求但没有开始生成」，不能当成「提交结果待确认」。
  */
 const PLATFORM_REPLY_PATTERNS = Object.freeze([
+  { code: "MISSING_REFERENCE", re: /没有收到[^。\n]{0,40}图片资源|请先上传(?:定帧图|参考图)|缺少(?:参考图|图片资源)/i, label: "平台未开始生成：缺少参考图，请检查上传结果" },
   {
     // 实测（2026-09-24 005/008）：会话失效后页面弹出可见登录框，标题就是
     // 「登录以解锁更多功能」。此时点任何入口都不会出现控件，必须让用户重新登录，

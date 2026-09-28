@@ -160,10 +160,19 @@ function transferOnce({
           await streamDone;
           const written = received - (resumed ? resumeFrom : 0);
           if (!written) throw failure("EMPTY_VIDEO");
-          if (total && (!header("content-encoding") || header("content-encoding") === "identity") && received !== total) {
-            throw failure("INCOMPLETE_VIDEO");
-          }
-          finish(null, { received, total, resumed, restarted: truncated });
+          // 完整性：只有「声明了总长度且是明文传输」时才能用长度比对。
+          // 压缩传输（content-encoding 非 identity）下收到的是解码后的字节数，与 content-length 不同量纲；
+          // 未声明总长度时也无法比对。这两种情况旧实现直接跳过比对且不留痕，
+          // 现在改为把「未做长度校验」如实写进下载备注，不当作通过。
+          const encoded = Boolean(header("content-encoding")) && header("content-encoding") !== "identity";
+          if (total && !encoded && received !== total) throw failure("INCOMPLETE_VIDEO");
+          const lengthVerified = Boolean(total) && !encoded;
+          const lengthNote = !total
+            ? "响应未提供文件总长度，未做长度比对"
+            : encoded
+              ? "响应为压缩传输，未做长度比对"
+              : "";
+          finish(null, { received, total, resumed, restarted: truncated, lengthVerified, lengthNote });
         } catch (error) {
           finish(error);
         }

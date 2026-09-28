@@ -1135,7 +1135,7 @@ const STEP_SEND_REACTION = `
   const list = editors();
   const editor = list[0] || null;
   const text = editor ? String(editor.textContent || '') : '';
-  const messages = document.querySelectorAll('[data-message-id]').length;
+  const messages = (() => { const primary = [...document.querySelectorAll('[data-message-id]')]; if (primary.length) return primary; const candidates = [...document.querySelectorAll('[data-testid="send_message"],[data-testid="receive_message"],[data-testid="message_text"],[class*="message-item"],[class*="message-content"],[class*="message_text"],[class*="markdown"]')].filter(node => !node.closest('nav,aside,header,[contenteditable="true"]') && !node.querySelector('textarea,[contenteditable="true"]')); return candidates.filter(node => !candidates.some(parent => parent !== node && parent.contains(node))); })().length;
   const bodyText = String(document.body?.innerText || '');
   return {
     ok: true,
@@ -1155,11 +1155,16 @@ const STEP_SEND_REACTION = `
  */
 const STEP_READ_REPLIES = `
   const before = __BEFORE__;
-  const nodes = [...document.querySelectorAll('[data-message-id]')];
+  const wanted = __TEXT__;
+  const normalizeText = value => String(value || '').normalize('NFKC').replace(/参考图|@图/g, '图').replace(/[^\\p{L}\\p{N}]/gu, '');
+  const key = normalizeText(wanted).slice(0, 48);
+  const nodes = (() => { const primary = [...document.querySelectorAll('[data-message-id]')]; if (primary.length) return primary; const candidates = [...document.querySelectorAll('[data-testid="send_message"],[data-testid="receive_message"],[data-testid="message_text"],[class*="message-item"],[class*="message-content"],[class*="message_text"],[class*="markdown"]')].filter(node => !node.closest('nav,aside,header,[contenteditable="true"]') && !node.querySelector('textarea,[contenteditable="true"]')); return candidates.filter(node => !candidates.some(parent => parent !== node && parent.contains(node))); })();
   const urlChanged = String(location.href) !== String(before.url || "");
   const fresh = urlChanged ? nodes : nodes.slice(Math.max(0, Number(before.count) || 0));
-  const replies = fresh.map(n => String(n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300));
-  return { ok: true, count: nodes.length, newCount: fresh.length, urlChanged, newReplies: replies, url: location.href };
+  let userIndex = -1;
+  fresh.forEach((node, index) => { if (key && normalizeText(node.innerText || node.textContent).includes(key)) userIndex = index; });
+  const replies = userIndex >= 0 ? fresh.slice(userIndex + 1).map(node => String(node.innerText || node.textContent || '').trim().slice(0, 4000)) : [];
+  return { ok: true, count: nodes.length, newCount: fresh.length, urlChanged, newReplies: replies, requestMessageId: userIndex >= 0 ? fresh[userIndex].getAttribute("data-message-id") : "", url: location.href };
 `;
 
 /**
@@ -1174,14 +1179,15 @@ const STEP_READ_REPLIES = `
 const STEP_READ_RESULT = `
   return (() => {
     const wanted = __TEXT__;
-    const normText = (s) => String(s || '').replace(/\\s+/g, '');
+    const context = __CONTEXT__;
+    const normText = (s) => String(s || '').normalize('NFKC').replace(/参考图|@图/g, '图').replace(/[^\\p{L}\\p{N}]/gu, '');
     const key = normText(wanted).slice(0, 48);
-    const nodes = [...document.querySelectorAll('[data-message-id]')];
+    const nodes = (() => { const primary = [...document.querySelectorAll('[data-message-id]')]; if (primary.length) return primary; const candidates = [...document.querySelectorAll('[data-testid="send_message"],[data-testid="receive_message"],[data-testid="message_text"],[class*="message-item"],[class*="message-content"],[class*="message_text"],[class*="markdown"]')].filter(node => !node.closest('nav,aside,header,[contenteditable="true"]') && !node.querySelector('textarea,[contenteditable="true"]')); return candidates.filter(node => !candidates.some(parent => parent !== node && parent.contains(node))); })();
     const items = nodes.map((node) => {
       const video = node.querySelector('video');
       return {
         messageId: String(node.getAttribute('data-message-id') || '').slice(0, 60),
-        text: String(node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300),
+        text: String(node.innerText || node.textContent || '').trim().slice(0, 4000),
         hasVideo: Boolean(video),
         videoUrl: String(video ? (video.currentSrc || video.src || video.querySelector('source')?.src || '') : '').slice(0, 4000),
       };
@@ -1190,10 +1196,12 @@ const STEP_READ_RESULT = `
     // 其后的消息就是平台对本次请求的回复（视频、拒绝说明或生成中提示）。
     let userIndex = -1;
     for (let i = 0; i < items.length; i++) {
-      if (key && normText(items[i].text).includes(key)) userIndex = i;
+      if (context?.requestMessageId) {
+        if (items[i].messageId === context.requestMessageId) userIndex = i;
+      } else if ((!context || context.url !== location.href || i >= context.beforeCount) && key && normText(items[i].text).includes(key)) userIndex = i;
     }
     const replies = userIndex >= 0 ? items.slice(userIndex + 1) : [];
-    const scope = replies.length ? replies : items;
+    const scope = replies;
     const withVideo = scope.filter(it => it.hasVideo);
     const newest = withVideo.slice(-1)[0] || scope[scope.length - 1] || null;
     return {
@@ -1247,7 +1255,7 @@ const STEP_SEND = `
     editorText: (() => { const list = editorsNow; return list[0] ? String(list[0].textContent || '').slice(0, 120) : ''; })(),
     // 点击前的指纹：用于判断点击后页面到底有没有起反应
     beforeLength: (() => { const list = editorsNow; return list[0] ? String(list[0].textContent || '').length : 0; })(),
-    beforeMessages: document.querySelectorAll('[data-message-id]').length,
+    beforeMessages: (() => { const primary = [...document.querySelectorAll('[data-message-id]')]; if (primary.length) return primary; const candidates = [...document.querySelectorAll('[data-testid="send_message"],[data-testid="receive_message"],[data-testid="message_text"],[class*="message-item"],[class*="message-content"],[class*="message_text"],[class*="markdown"]')].filter(node => !node.closest('nav,aside,header,[contenteditable="true"]') && !node.querySelector('textarea,[contenteditable="true"]')); return candidates.filter(node => !candidates.some(parent => parent !== node && parent.contains(node))); })().length,
     beforeUrl: String(location.href),
   };
 `;
@@ -1806,7 +1814,7 @@ function createDolaDriver(options = {}) {
       return withAccountLock(args?.accountId, () => api._submit(args));
     },
 
-    async _submit({ accountId, plan, onStep, dryRun = false }) {
+    async _submit({ accountId, plan, onStep, dryRun = false, checkInterrupted = () => {}, onBeforeSend = () => {} }) {
       const steps = [];
       // 每完成一步就立刻回报，界面才能显示「现在走到哪一步」，而不是等 45 秒后一次性出结果。
       // panelStage 是高频进度心跳：折叠进上一条 panelStage，避免刷屏并挤占落库的 20 条步骤上限。
@@ -1867,8 +1875,8 @@ function createDolaDriver(options = {}) {
           }
         }
       }
-      const ev = (source, options) => withGoneGuard(() => evaluate(contents, source, options));
-      const evIdem = (source, options) => withGoneGuard(() => evaluateIdempotent(contents, source, options));
+      const ev = (source, options) => { checkInterrupted(); return withGoneGuard(() => { checkInterrupted(); return evaluate(contents, source, options); }); };
+      const evIdem = (source, options) => { checkInterrupted(); return withGoneGuard(() => { checkInterrupted(); return evaluateIdempotent(contents, source, options); }); };
       const choose = (...args) => withGoneGuard(() => chooseOption(contents, ...args));
 
       try {
@@ -2196,6 +2204,8 @@ function createDolaDriver(options = {}) {
       }
 
       // 发送前才挂网络监听，避免把前面的步骤耗时算进等待窗口
+      checkInterrupted();
+      onBeforeSend();
       const watcher = watchForTaskId(contents, SEND_TIMEOUT_MS);
 
       const sendStep = await ev(STEP_SEND);
@@ -2242,9 +2252,20 @@ function createDolaDriver(options = {}) {
         submitted: watched.submittedDuration || "",
         mode: plan.params?.durationMode || "native",
       };
+      const replies = await evaluate(
+        contents,
+        STEP_READ_REPLIES.replace("__BEFORE__", JSON.stringify({ count: sendStep?.beforeMessages || 0, url: sendStep?.beforeUrl || "" })).replace("__TEXT__", JSON.stringify(plan.platformText || ""))
+      ).catch(() => null);
+      const normalizeReply = value => String(value || "").replace(/\s+/g, "");
+      const sentPrompt = normalizeReply(plan.platformText || "");
+      const replyText = (replies?.newReplies || []).filter(text => normalizeReply(text) !== sentPrompt).join("\n").slice(0, 8000);
+      const platformReply = replyText ? { text: replyText, at: new Date().toISOString() } : null;
+      const platformContext = { requestMessageId: replies?.requestMessageId || "", beforeCount: sendStep?.beforeMessages || 0, url: sendStep?.beforeUrl || "" };
       if (watched.taskId) {
         return {
           outcome: "ok",
+          platformReply,
+          platformContext,
           platformTaskId: watched.taskId,
           state: "queued",
           accepted: true,
@@ -2256,11 +2277,6 @@ function createDolaDriver(options = {}) {
       }
 
       // 没有任务 ID：先看平台是不是明确说了「没有开始生成」，再看是不是已受理（费用预告/生成中）
-      const replies = await evaluate(
-        contents,
-        STEP_READ_REPLIES.replace("__BEFORE__", JSON.stringify({ count: sendStep?.beforeMessages || 0, url: sendStep?.beforeUrl || "" }))
-      ).catch(() => null);
-      const replyText = (replies?.newReplies || []).join(" \n ");
       const verdict = replies?.ok ? classifyPlatformReply(replyText) : null;
       if (verdict) {
         record("platformReply", { ok: false, reason: verdict.label, excerpt: verdict.excerpt, count: replies?.count });
@@ -2268,6 +2284,8 @@ function createDolaDriver(options = {}) {
         return {
           outcome: "failed",
           errorCode: verdict.code,
+          platformReply,
+          platformContext,
           accepted: false,
           retryable: false,
           needsUser: true,
@@ -2283,6 +2301,8 @@ function createDolaDriver(options = {}) {
         // 已受理但没拿到任务 ID：停止重复提交，转入监控（不宣告成功）
         return {
           outcome: "accepted",
+          platformReply,
+          platformContext,
           accepted: true,
           acceptanceEvidence: { kind: "platform-message", codes: acceptance.codes, strength: acceptance.strength, excerpt: acceptance.excerpt },
           durationEvidence,
@@ -2304,6 +2324,8 @@ function createDolaDriver(options = {}) {
       return {
         outcome: "unknown",
         accepted: false,
+        platformReply,
+        platformContext,
         // 明确「没有受理证据」时才允许自动重试；这里先把裁决权交给编排层（见 runner 的重试策略）
         retryable: Boolean(rateLimited),
         retryAfterMs: rateLimited?.retryAfterMs || 0,
@@ -2328,10 +2350,10 @@ function createDolaDriver(options = {}) {
       }
       const prompt = String(attempt?.params?.prompt || "").trim();
       const text = prompt ? toPlatformText(buildSegments(prompt, attempt?.refs || [], new Map())) : "";
-      const step = await evaluate(contents, STEP_READ_RESULT.replace("__TEXT__", JSON.stringify(text || ""))).catch(() => null);
+      const step = await evaluate(contents, STEP_READ_RESULT.replace("__TEXT__", JSON.stringify(text || "")).replace("__CONTEXT__", JSON.stringify(attempt?.platformContext || null))).catch(() => null);
       if (!step?.ok) return { found: false, reason: step?.reason || "页面状态不可读取" };
       return {
-        found: Boolean(step.hasVideo && step.videoUrl),
+        found: Boolean(step.matched && step.hasVideo && step.videoUrl),
         matched: step.matched,
         userIndex: step.userIndex,
         replies: step.replies || [],
@@ -2360,9 +2382,12 @@ function createDolaDriver(options = {}) {
       }
       // 先看平台是否已经把本次结果渲染出来（匹配的是本次写入平台的提示词，不会把历史视频算进来）
       const result = await api.readResult({ accountId, attempt }).catch(() => null);
+      const replyText = (result?.matched ? result.replies || [] : []).join("\n").slice(0, 8000);
+      const platformReply = replyText ? { text: replyText, at: new Date().toISOString() } : null;
       if (result?.found) {
         return {
           state: "succeeded",
+          platformReply,
           message: "平台已完成生成：页面上出现本次提示词对应的视频",
           result: { videoUrl: result.videoUrl },
           evidence: { kind: "result-visible", messageId: result.messageId, matched: result.matched },
@@ -2370,27 +2395,24 @@ function createDolaDriver(options = {}) {
       }
       // 平台对本次请求的明确回复优先于页面泛文本：拒绝类必须标失败并带原文，
       // 实测（2026-09-24）：平台回「今天的生成次数已经达到上限」，旧逻辑会一直停在「待确认」。
-      const replyText = (result?.replies || []).join("\n");
       const replyRule = replyText ? classifyPlatformReply(replyText) : null;
       if (replyRule) {
         return {
           state: "failed",
           errorCode: replyRule.code,
+          platformReply,
           message: `${replyRule.label}；平台原文：${replyRule.excerpt}`,
           evidence: { kind: "platform-reply", code: replyRule.code, excerpt: replyRule.excerpt },
         };
       }
       if (/生成中|排队|正在生成|马上就好|请稍等/.test(replyText)) {
-        return { state: "generating", message: "平台回复显示正在生成", canCancel: false };
+        return { state: "generating", platformReply, message: "平台回复显示正在生成", canCancel: false };
       }
-      const read = await evaluate(contents, STEP_READ_STATE).catch(() => null);
-      if (!read?.ok) return { state: "unknown", message: "页面状态不可读取" };
-      const pageText = String(read.text || "");
-      if (/生成失败|违规|未通过/.test(pageText) && !/生成中|排队/.test(pageText)) {
-        return { state: "failed", message: "页面显示生成失败", errorCode: "GENERATE_FAILED" };
-      }
+      const acceptance = classifyAcceptance(replyText);
+      if (acceptance) return { state: "queued", platformReply, message: acceptance.note + "；请等待结果，勿重复提交", canCancel: false };
       return {
         state: "unknown",
+        platformReply,
         message: result?.reason || "页面未给出可判定的状态标记",
       };
     },

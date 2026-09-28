@@ -15,6 +15,7 @@ const {
   STATUS,
   STATUS_LABEL,
   applyStatus,
+  canTransition,
   createAttempt,
   isActive,
   isTerminal,
@@ -30,15 +31,29 @@ const ACCOUNT_BLOCK_PATTERNS = [
   // 「RESP /list→403」）误判成「登录状态失效」，进而把账号封停、后续任务全部转人工。
   {
     code: "AUTH",
-    re: /登录|未登录|登录失效|重新登录|unauthoriz|未授权|鉴权|认证失败|HTTP\s*40[13]|40[13]\s*(?:Unauthorized|Forbidden)/i,
+    re: /未登录|(?:请(?:先)?|需要|重新)登录|登录(?:状态)?(?:已|已经)?(?:失效|过期|超时|失败)|unauthoriz|未授权|鉴权失败|认证失败|HTTP\s*40[13]|40[13]\s*(?:Unauthorized|Forbidden)/i,
     label: "登录状态失效",
   },
   { code: "CAPTCHA", re: /验证码|人机|captcha|challenge/i, label: "出现验证码/人机校验" },
   { code: "QUOTA", re: /额度|限额|配额|次数不足|quota|limit exceeded/i, label: "额度或限额受限" },
 ];
 
-function classifyBlock(message) {
-  const text = String(message || "");
+// 仅对用户指定的明确拒绝启用有限重提；不把其他平台规则拒绝当作临时错误。
+function isPortraitRetry(response) {
+  const text = String(response?.platformReply?.text || response?.message || "");
+  return response?.errorCode === "FACE_UNVERIFIED" && /未认证人脸/.test(text) && /Dreamina\s+Seedance\s+2\.5/i.test(text) && /暂不支持/.test(text);
+}
+
+function classifyBlock(message, errorCode = "") {
+  const codes = { AUTH: "AUTH", SESSION_EXPIRED: "AUTH", CAPTCHA: "CAPTCHA", QUOTA: "QUOTA", QUOTA_EXHAUSTED: "QUOTA" };
+  const code = codes[String(errorCode).toUpperCase()];
+  if (code) return ACCOUNT_BLOCK_PATTERNS.find((rule) => rule.code === code);
+  // 正常/否定证据不能把整个账号封停；仍保留同一句中其他真实故障的证据。
+  const text = String(message || "")
+    .replace(/(?:未|没有|无需|不需要)(?:出现|检测到|触发|完成|进行)?(?:验证码|人机校验)/g, "")
+    .replace(/(?:验证码|人机校验)(?:已通过|通过|正常)/g, "")
+    .replace(/(?:额度|配额|限额)(?:充足|正常|未用完|未耗尽|未达到)/g, "")
+    .replace(/\b(?:no|without)\s+(?:captcha|challenge)\b/gi, "");
   for (const rule of ACCOUNT_BLOCK_PATTERNS) if (rule.re.test(text)) return rule;
   return null;
 }
@@ -162,8 +177,15 @@ function createRunner(options = {}) {
   const globalConcurrency = options.globalConcurrency ?? 3;
   const perAccountConcurrency = options.perAccountConcurrency ?? 1;
   const pollBaseMs = options.pollBaseMs ?? 3000;
-  const pollMaxMs = options.pollMaxMs ?? 30000;
-  const pollTimeoutMs = options.pollTimeoutMs ?? 30 * 60 * 1000;
+  const pollMaxMs = options.pollMaxMs ?? 10000;
+  // 监控看门狗默认 6 小时：旧默认是 Infinity，等于把看门狗关掉——
+  // 遗留的 submitting/queued/generating 记录会永远轮询、永不收尾为「需人工处理」，
+  // 用户看到的是一条永远「生成中」的任务。给一个可被覆盖的有限默认值。
+  const pollTimeoutMs = options.pollTimeoutMs ?? 6 * 60 * 60 * 1000;
+  // 重启后判定「长时间无更新」的阈值：默认 30 分钟（旧默认 Infinity 会让该分支永不触发）
+  const staleMs = options.staleMs ?? 30 * 60 * 1000;
+  // 轮询连续失败上限：达到后停止轮询并转「需人工处理」，避免无限空转
+  const pollErrorLimit = options.pollErrorLimit ?? 5;
   // 自动重试策略：只在「明确没有受理 + 临时可恢复」时触发，默认最多 2 次（总提交 3 次）
   const maxAutoRetries = options.maxAutoRetries ?? 2;
   const autoRetryBaseMs = options.autoRetryBaseMs ?? 8000;
@@ -272,32 +294,62 @@ function createRunner(options = {}) {
     return record;
   }
 
-  // ── 单次执行 ───────────────────────────────────────────────
-  async function execute(projectId, attemptId) {
-    // 立刻占住并发槽位：tick 是按 state.running 判断上限的，
-    // 若等到函数内部若干 await 之后才登记，多账号并发时会一次性超出上限。
-    // 直接调用（不是从 tick 派发）时这里补登记；从 tick 派发时保留它已经写好的账号信息。
-    if (!state.running.has(attemptId)) {
-      state.running.set(attemptId, { projectId, accountId: "", startedAt: Date.now() });
-    }
-    notify();
-    let reserved = true;
-    const releaseSlot = () => {
-      if (reserved) {
-        reserved = false;
-        state.running.delete(attemptId);
+  // 所有入口共用准入检查。串行化的仅是读记录/占槽位，不是平台操作。
+  let admissionChain = Promise.resolve();
+  const executions = new Map();
+  const waitingProjects = new Set();
+
+  function admit(projectId, attemptId) {
+    const admission = admissionChain.then(async () => {
+      if (executions.has(attemptId)) return { started: false, completion: executions.get(attemptId) };
+      const record = await loadRecord(projectId, attemptId);
+      if (!record) throw new Error("任务不存在");
+      if (record.status !== STATUS.PENDING) return { started: false, record };
+      const held = lockOf(projectId, record.storyboardId, record.accountId);
+      if (held && held.attemptId !== attemptId) {
+        throw new Error(`这条分镜正在提交中（${held.reason}），已跳过重复提交，避免重复消耗额度`);
       }
-    };
+      if (state.paused || state.running.size >= globalConcurrency || runningCountFor(record.accountId) >= perAccountConcurrency) {
+        waitingProjects.add(projectId);
+        return { started: false, record };
+      }
+      state.running.set(attemptId, { projectId, accountId: record.accountId, startedAt: Date.now() });
+      let completed = false;
+      const completion = Promise.resolve().then(() => executeReserved(projectId, attemptId, record)).then((value) => {
+        completed = true;
+        return value;
+      }).finally(() => {
+        state.running.delete(attemptId);
+        executions.delete(attemptId);
+        notify();
+        // 补派曾因槽位不足等待的项目，避免其他项目一直得不到启动机会。
+        const projects = new Set(waitingProjects);
+        // 落库异常时不立即重派同项目，否则仍为 pending 的记录会陷入紧密重试。
+        if (completed) projects.add(projectId);
+        else projects.delete(projectId);
+        waitingProjects.clear();
+        for (const id of projects) void tick(id).catch((error) => log("queue-error", { message: error.message }));
+      });
+      executions.set(attemptId, completion);
+      // tick 不等待整个提交过程，也必须消费其异常，避免未处理的 rejection。
+      void completion.catch((error) => log("execute-error", { attemptId, message: error.message }));
+      notify();
+      return { started: true, completion };
+    });
+    admissionChain = admission.then(() => undefined, () => undefined);
+    return admission;
+  }
+
+  async function execute(projectId, attemptId) {
+    const admission = await admit(projectId, attemptId);
+    return admission.completion ? admission.completion : admission.record;
+  }
+
+  // ── 单次执行：只能在准入成功、槽位已登记后调用 ───────────
+  const submissionControls = new Map();
+
+  async function executeReserved(projectId, attemptId, record) {
     clearTimer(attemptId);
-    const record = await loadRecord(projectId, attemptId);
-    if (!record) {
-      releaseSlot();
-      throw new Error("任务不存在");
-    }
-    if (isTerminal(record.status)) {
-      releaseSlot();
-      return record;
-    }
     const blocked = state.blockedAccounts.get(record.accountId);
     if (blocked) {
       const blockedRecord = await patch(projectId, attemptId, (r) => {
@@ -305,17 +357,12 @@ function createRunner(options = {}) {
         if (r.status !== STATUS.MANUAL) applyStatus(r, STATUS.MANUAL, "账号处于暂停状态，已停止执行");
         return r;
       });
-      releaseSlot();
       return blockedRecord;
     }
-
-    state.running.set(attemptId, { projectId, accountId: record.accountId, startedAt: Date.now() });
-    notify();
 
     // 提交锁：同一条分镜在同一时刻只能有一次提交（手动点击与自动重试不能并发）
     const held = lockOf(projectId, record.storyboardId, record.accountId);
     if (held && held.attemptId !== attemptId) {
-      releaseSlot();
       notify();
       throw new Error(`这条分镜正在提交中（${held.reason}），已跳过重复提交，避免重复消耗额度`);
     }
@@ -355,41 +402,64 @@ function createRunner(options = {}) {
       }
 
       // 2) 提交
+      let claimed = false;
       await patch(projectId, attemptId, (r) => {
-        if (r.status === STATUS.PENDING) applyStatus(r, STATUS.SUBMITTING, "开始提交");
+        if (r.status !== STATUS.PENDING) return false;
+        applyStatus(r, STATUS.SUBMITTING, "开始提交");
+        claimed = true;
         return r;
       });
+      if (!claimed) return;
       // 提交期间也必须有可见反馈：先写一条「进行中」，避免界面看起来完全没反应
       await patch(projectId, attemptId, (r) => {
         r.driver = runningDriver("正在打开账号页面并逐步提交…");
         return r;
       });
 
-      const submitted = await driver.submit({ accountId: record.accountId, plan, attempt: record, onStep });
+      if ((await loadRecord(projectId, attemptId))?.interruption?.stopped) return;
+      const control = { requested: false, dispatched: false };
+      submissionControls.set(attemptId, control);
+      const checkInterrupted = () => {
+        if (control.requested && !control.dispatched) {
+          const error = new Error("已中断提交，未点击发送");
+          error.code = "LOCAL_INTERRUPTED";
+          throw error;
+        }
+      };
+      const submitted = await driver.submit({ accountId: record.accountId, plan, attempt: record, onStep,
+        checkInterrupted,
+        onBeforeSend: () => { checkInterrupted(); control.dispatched = true; },
+      });
       const outcome = String(submitted?.outcome || (submitted?.platformTaskId ? "ok" : "unknown"));
 
       // 等中途写入全部落地后，再写最终结果：界面即使失败也能看到「卡在哪一步」
       await writeChain;
       await patch(projectId, attemptId, (r) => {
         r.driver = summarizeDriver(submitted);
+        if (submitted?.platformTaskId) r.platformTaskId = submitted.platformTaskId;
+        if (submitted?.platformContext) r.platformContext = submitted.platformContext;
+        if (submitted?.platformReply?.text) r.platformReply = submitted.platformReply;
         return r;
       });
 
+      if ((await loadRecord(projectId, attemptId))?.interruption?.stopped) return;
+
       if (outcome === "failed") {
-        const rule = classifyBlock(submitted?.message);
+        const rule = classifyBlock(submitted?.message, submitted?.errorCode);
         await patch(projectId, attemptId, (r) => {
           setError(r, submitted?.errorCode || rule?.code || "SUBMIT_FAILED", submitted?.message || "提交失败");
           applyStatus(r, rule ? STATUS.MANUAL : STATUS.FAILED, rule ? rule.label : "提交失败");
           return r;
         });
         if (rule) blockAccount(record.accountId, rule, submitted?.message);
-        // 平台明确拒绝（人脸未认证/内容规则/要求确认）：不自动重试，也不换素材换模型
-        if (submitted?.needsUser || !submitted?.retryable) {
+        const portraitRetry = isPortraitRetry(submitted);
+        // 只有指定的肖像回复例外；其他需人工处理的拒绝不自动重试。
+        if (!portraitRetry && (submitted?.needsUser || !submitted?.retryable)) {
           releaseLock(projectId, record.storyboardId, record.accountId);
           return;
         }
         // 明确「没有受理 + 临时可恢复」：按上限自动重试
-        const retried = await scheduleAutoRetry(projectId, attemptId, submitted);
+        const retried = await scheduleAutoRetry(projectId, attemptId, portraitRetry ? { ...submitted, retryAfterMs: 30000 } : submitted);
         if (retried) keepLock = true;
         return;
       }
@@ -444,7 +514,8 @@ function createRunner(options = {}) {
 
       schedulePoll(projectId, attemptId, 0);
     } catch (error) {
-      const rule = classifyBlock(error?.message);
+      if ((await loadRecord(projectId, attemptId))?.interruption?.stopped) return;
+      const rule = classifyBlock(error?.message, error?.code);
       // 先让中途写入落地，再把「进行中」改成失败，避免被后到的步骤写入覆盖
       await writeChain;
       await patch(projectId, attemptId, (r) => {
@@ -461,14 +532,10 @@ function createRunner(options = {}) {
       });
       if (rule) blockAccount(record.accountId, rule, error?.message);
     } finally {
-      releaseSlot();
+      submissionControls.delete(attemptId);
       // 有自动重试在排队时保留提交锁，避免手动再点一次造成并发提交
       if (!keepLock) releaseLock(projectId, record.storyboardId, record.accountId);
       notify();
-      // 让出并发槽位后立刻补派本项目的排队任务：多账号并行时其余账号不必等下一次手动触发
-      Promise.resolve()
-        .then(() => tick(projectId))
-        .catch(() => {});
     }
   }
 
@@ -479,7 +546,7 @@ function createRunner(options = {}) {
    */
   async function scheduleAutoRetry(projectId, attemptId, submitted) {
     const record = await loadRecord(projectId, attemptId);
-    if (!record) return false;
+    if (!record || record.interruption?.stopped || record.autoRetry?.stopped || state.autoRetries.has(attemptId)) return false;
     // 复核：已经有任务 ID / 已被受理，绝不重试
     if (record.platformTaskId || record.accepted) {
       log("auto-retry-skip", { attemptId, reason: "已有受理证据" });
@@ -549,9 +616,8 @@ function createRunner(options = {}) {
   }
 
   // ── 轮询（带退避） ─────────────────────────────────────────
-  /** 连续失败计数：轮询本身出错时用它给重试设上限，避免无限重试 */
+  /** 查询暂时失败仍继续低频重试，直到结果明确或用户停止跟踪。 */
   const pollErrorStreak = new Map();
-  const POLL_ERROR_LIMIT = 5;
 
   function schedulePoll(projectId, attemptId, delayMs) {
     clearTimer(attemptId);
@@ -566,11 +632,28 @@ function createRunner(options = {}) {
           // 实测（2026-09-24，真实提交 att_d56d75641fc4）：旧实现只把异常写进日志、
           // 不再安排下一次轮询，于是任务永远停在「提交结果待确认」——之后平台即使已经
           // 给出结果（含明确拒绝）也永远不会被发现。改为：出错后仍继续轮询，
-          // 但连续失败到上限就停手，由界面上的状态提示人工核实。
+          // 查询失败不会停止跟踪；不重新提交生成请求。
           const streak = (pollErrorStreak.get(attemptId) || 0) + 1;
           pollErrorStreak.set(attemptId, streak);
           log("poll-error", { attemptId, streak, message: error?.message || String(error) });
-          if (streak < POLL_ERROR_LIMIT) schedulePoll(projectId, attemptId, pollMaxMs);
+          // 连续失败到上限就停手：旧实现无限以 pollMaxMs 重排，任务可能长期空转且
+          // 界面看不到任何进展。转「需人工处理」把决定权交回用户，不再自动纠缠。
+          if (streak >= pollErrorLimit) {
+            log("poll-give-up", { attemptId, streak, limit: pollErrorLimit });
+            void patch(projectId, attemptId, (r) => {
+              r.poll = {
+                ...r.poll,
+                message: `连续 ${streak} 次查询失败，已停止自动轮询，请人工核实平台结果`,
+                stale: true,
+              };
+              if (!isTerminal(r.status) && r.status !== STATUS.MANUAL && r.status !== STATUS.UNCONFIRMED) {
+                applyStatus(r, STATUS.MANUAL, `监控异常：连续 ${streak} 次查询失败`);
+              }
+              return r;
+            }).catch(() => {});
+            return;
+          }
+          schedulePoll(projectId, attemptId, pollMaxMs);
         });
     }, Math.max(0, delayMs));
     state.timers.set(attemptId, handle);
@@ -578,7 +661,7 @@ function createRunner(options = {}) {
 
   async function pollOnce(projectId, attemptId) {
     const record = await loadRecord(projectId, attemptId);
-    if (!record || isTerminal(record.status)) return;
+    if (!record || isTerminal(record.status) || record.interruption?.stopped) return;
     // 有平台任务 ID 时按 ID 核实；没有 ID 的「提交结果待确认」任务同样必须继续监控——
     // 实测（2026-09-24 真实提交 att_d56d75641fc4）：平台已受理并生成了视频，
     // 但驱动没在超时窗口内抓到任务 ID，旧逻辑在此直接 return，
@@ -599,7 +682,7 @@ function createRunner(options = {}) {
       (record.status === STATUS.SUBMITTING && !state.running.has(attemptId));
     if (!monitorable) return;
 
-    const startedAt = Date.parse(record.submittedAt || record.createdAt) || Date.now();
+    const startedAt = Date.parse(record.interruption?.resumedAt || record.submittedAt || record.createdAt) || Date.now();
     if (Date.now() - startedAt > pollTimeoutMs) {
       await patch(projectId, attemptId, (r) => {
         r.poll = { ...r.poll, stale: true, message: "长时间未取得新状态" };
@@ -624,9 +707,10 @@ function createRunner(options = {}) {
     const backoff = Math.min(pollMaxMs, Math.round(pollBaseMs * Math.pow(1.6, attemptCount)));
     const at = new Date().toISOString();
 
-    const rule = polled?.state === "failed" ? classifyBlock(polled?.message) : null;
+    const rule = polled?.state === "failed" ? classifyBlock(polled?.message, polled?.errorCode) : null;
 
-    await patch(projectId, attemptId, (r) => {
+    const updated = await patch(projectId, attemptId, (r) => {
+      if (r.interruption?.stopped || isTerminal(r.status)) return false;
       r.poll = {
         count: attemptCount,
         lastAt: at,
@@ -634,22 +718,42 @@ function createRunner(options = {}) {
         message: String(polled?.message || "").slice(0, 300),
         stale: false,
       };
+      if (polled?.platformReply?.text) r.platformReply = polled.platformReply;
+      // 状态落库前先判断迁移是否合法：`manual` 只允许 → canceled/unconfirmed，
+      // 若平台此刻又返回成功/失败，旧实现会直接抛「不允许的状态迁移」，
+      // 异常被调度层 catch 吞掉 —— poll 计数与平台回复都写不进去，界面毫无痕迹。
+      // 这里改为：非法迁移不改状态，但把平台结论完整写进 poll.message 供人工核实。
+      const moveTo = (target, note) => {
+        if (canTransition(r.status, target)) {
+          applyStatus(r, target, note);
+          return true;
+        }
+        r.poll = {
+          ...r.poll,
+          message: `${note}；但当前状态为「${STATUS_LABEL[r.status] || r.status}」，未自动改写，请人工核实`.slice(0, 300),
+        };
+        return false;
+      };
       if (polled?.state === "succeeded") {
         setResult(r, polled.result || {});
-        applyStatus(r, STATUS.SUCCEEDED, "平台返回生成成功");
+        moveTo(STATUS.SUCCEEDED, "平台返回生成成功");
       } else if (polled?.state === "failed") {
         setError(r, polled?.errorCode || rule?.code || "GENERATE_FAILED", polled?.message || "平台返回生成失败");
-        applyStatus(r, rule ? STATUS.MANUAL : STATUS.FAILED, rule ? rule.label : "平台返回生成失败");
+        moveTo(rule ? STATUS.MANUAL : STATUS.FAILED, rule ? rule.label : "平台返回生成失败");
       } else if (polled?.state === "generating" && r.status !== STATUS.GENERATING) {
         r.canCancel = polled.canCancel !== false;
-        applyStatus(r, STATUS.GENERATING, polled.message || "平台生成中");
+        moveTo(STATUS.GENERATING, polled.message || "平台生成中");
       } else if (polled?.state === "queued" && r.status !== STATUS.QUEUED) {
-        applyStatus(r, STATUS.QUEUED, polled.message || "平台排队中");
+        moveTo(STATUS.QUEUED, polled.message || "平台排队中");
       }
       return r;
     });
 
+    if (updated.interruption?.stopped) return;
     if (rule) blockAccount(record.accountId, rule, polled?.message);
+    if (!rule && polled?.state === "failed" && isPortraitRetry(polled)) {
+      await scheduleAutoRetry(projectId, attemptId, { ...polled, retryAfterMs: 30000 });
+    }
 
     // 生成成功后：按设置决定是否自动开始下载（下载完全独立，失败不影响生成状态）
     if (polled?.state === "succeeded" && typeof options.onResultReady === "function") {
@@ -680,12 +784,20 @@ function createRunner(options = {}) {
     for (const projectId of projects) {
       const tasks = await taskStore.list(projectId);
       for (const task of tasks.filter((t) => t.status === STATUS.PENDING)) {
-        if (state.running.size >= globalConcurrency) return { started };
-        if (runningCountFor(task.accountId) >= perAccountConcurrency) continue;
-        // 派发前就把账号信息写进运行表：否则同一账号的并发判断拿不到账号，会同时启动两条
-        state.running.set(task.id, { projectId, accountId: task.accountId, startedAt: Date.now() });
-        started.push(task.id);
-        execute(projectId, task.id).catch(() => {});
+        if (state.running.size >= globalConcurrency) {
+          for (const id of projects) waitingProjects.add(id);
+          return { started };
+        }
+        if (runningCountFor(task.accountId) >= perAccountConcurrency) {
+          waitingProjects.add(projectId);
+          continue;
+        }
+        try {
+          const admission = await admit(projectId, task.id);
+          if (admission.started) started.push(task.id);
+        } catch (error) {
+          log("queue-skip", { attemptId: task.id, message: error.message });
+        }
       }
     }
     return { started };
@@ -701,6 +813,7 @@ function createRunner(options = {}) {
   function resume() {
     state.paused = false;
     notify();
+    for (const projectId of waitingProjects) void tick(projectId).catch(() => {});
     tick().catch(() => {});
     return { paused: false };
   }
@@ -718,9 +831,21 @@ function createRunner(options = {}) {
     const record = await loadRecord(projectId, attemptId);
     if (!record) throw new Error("任务不存在");
     if (record.status === STATUS.PENDING) {
-      return patch(projectId, attemptId, (r) => applyStatus(r, STATUS.CANCELED, "尚未提交，已在本地取消"));
+      const updated = await patch(projectId, attemptId, (r) => {
+        if (r.status !== STATUS.PENDING) return false;
+        return applyStatus(r, STATUS.CANCELED, "尚未提交，已在本地取消");
+      });
+      if (updated.status === STATUS.CANCELED) return updated;
+      return cancel(projectId, attemptId);
     }
     if (isTerminal(record.status)) return record;
+    // 提交准入已完成时不能声称本地取消成功，也不能抢写 manual 干扰受理结果落库。
+    if (record.status === STATUS.SUBMITTING && state.running.has(attemptId)) {
+      return patch(projectId, attemptId, (r) => {
+        r.poll = { ...r.poll, message: "正在提交，请等待平台受理后再尝试取消" };
+        return r;
+      });
+    }
     if (!record.platformTaskId) {
       return patch(projectId, attemptId, (r) => {
         r.poll = { ...r.poll, message: "无平台任务 ID，无法确认取消结果" };
@@ -743,12 +868,61 @@ function createRunner(options = {}) {
     });
   }
 
-  /** 重试 = 新建尝试记录，历史保留 */
-  async function retry(projectId, attemptId) {
+  async function interrupt(projectId, attemptId) {
+    const record = await loadRecord(projectId, attemptId);
+    if (!record) throw new Error("任务不存在");
+    if (isTerminal(record.status) && !state.autoRetries.has(attemptId)) return record;
+    const control = submissionControls.get(attemptId);
+    if (control) control.requested = true;
+    clearTimer(attemptId);
+    const automatic = state.autoRetries.get(attemptId);
+    if (automatic) { cancelSchedule(automatic.handle); state.autoRetries.delete(attemptId); releaseLock(projectId, record.storyboardId, record.accountId); }
+    return patch(projectId, attemptId, (r) => {
+      if (isTerminal(r.status) && !automatic) return false;
+      const localOnly = r.status === STATUS.PENDING || (control && !control.dispatched) || (automatic && !r.platformTaskId && !r.driver?.accepted);
+      r.interruption = { stopped: true, at: new Date().toISOString(), platformMayContinue: !localOnly };
+      r.autoRetry = r.autoRetry ? { ...r.autoRetry, stopped: true } : null;
+      r.poll = { ...r.poll, nextAt: "", message: localOnly ? "已中断，未发送到豆包" : "已停止本地跟踪；豆包可能仍在生成，平台扣费不一定停止" };
+      if (!isTerminal(r.status)) applyStatus(r, localOnly ? STATUS.CANCELED : STATUS.MANUAL, r.poll.message);
+      return r;
+    });
+  }
+
+  async function resumeMonitoring(projectId, attemptId) {
+    if (state.running.has(attemptId)) throw new Error("提交步骤正在收尾，请稍后恢复查询");
+    const record = await patch(projectId, attemptId, r => {
+      if (isTerminal(r.status) || !(r.interruption?.stopped && r.interruption.platformMayContinue || r.submittedAt && [STATUS.MANUAL, STATUS.UNCONFIRMED].includes(r.status))) return false;
+      r.interruption = { ...r.interruption, stopped: false, resumedAt: new Date().toISOString() };
+      applyStatus(r, STATUS.UNCONFIRMED, "恢复查询，不重新提交");
+      r.poll = { ...r.poll, message: "已恢复状态查询，不会重新提交", stale: false };
+      return r;
+    });
+    if (!record.interruption?.stopped && !isTerminal(record.status)) schedulePoll(projectId, attemptId, 0);
+    return record;
+  }
+
+  const retryRequests = new Map();
+  /** 合并同一来源的重复点击；每次实际重试仍保留独立历史。 */
+  function retry(projectId, attemptId) {
+    const key = `${projectId}:${attemptId}`;
+    if (retryRequests.has(key)) return retryRequests.get(key);
+    const request = retryOnce(projectId, attemptId).finally(() => retryRequests.delete(key));
+    retryRequests.set(key, request);
+    return request;
+  }
+
+  async function retryOnce(projectId, attemptId) {
     const record = await loadRecord(projectId, attemptId);
     if (!record) throw new Error("任务不存在");
     if (isActive(record.status) && record.status !== STATUS.MANUAL && record.status !== STATUS.UNCONFIRMED) {
       throw new Error("任务仍在进行中，不能重试");
+    }
+    if (record.interruption?.platformMayContinue && !isTerminal(record.status)) throw new Error("该任务可能仍在豆包生成，请先恢复查询或核实平台结果");
+    const tasks = await taskStore.list(projectId);
+    const pendingRetry = tasks.find((task) => task.retryOf === attemptId && !isTerminal(task.status));
+    if (pendingRetry) {
+      await execute(projectId, pendingRetry.id);
+      return pendingRetry;
     }
     const next = await enqueue({
       projectId,
@@ -774,13 +948,14 @@ function createRunner(options = {}) {
       for (const task of tasks) {
         // 「提交结果待确认」也要恢复监控：它可能已被平台受理并生成完成，
         // 只是提交时没抓到平台任务 ID（见 pollOnce 的同类修复）。
+        if (task.interruption?.stopped) continue;
         if (!isActive(task.status) && task.status !== STATUS.UNCONFIRMED) continue;
         if (task.status === STATUS.PENDING) continue;
         const last = Date.parse(task.poll?.lastAt || task.updatedAt || task.createdAt) || 0;
         const isUnconfirmed = task.status === STATUS.UNCONFIRMED;
         // 待确认任务优先恢复监控：它没有任何轮询记录（lastAt 为空），
         // 若按「长时间无更新」处理就永远不会再被核实，这正是实测踩到的坑。
-        if (isUnconfirmed || Date.now() - last <= (options.staleMs ?? 5 * 60 * 1000)) {
+        if (isUnconfirmed || Date.now() - last <= staleMs) {
           resumed.push(task.id);
           schedulePoll(projectId, task.id, pollBaseMs);
           continue;
@@ -795,7 +970,17 @@ function createRunner(options = {}) {
         });
       }
     }
-    return { resumed, stale };
+    // 重启后把遗留的「待执行」任务续跑起来。
+    // 旧实现只 recover 轮询、不触发调度，于是重启前排队但未开始的任务永远不会被派发，
+    // 用户看到一条「待执行」却始终不动。
+    let started = [];
+    try {
+      const result = await tick();
+      started = result?.started || [];
+    } catch (error) {
+      log("recover-tick-failed", { message: error?.message || String(error) });
+    }
+    return { resumed, stale, started };
   }
 
   function status() {
@@ -818,6 +1003,8 @@ function createRunner(options = {}) {
 
   return {
     cancel,
+    interrupt,
+    resumeMonitoring,
     clearAccountBlock,
     enqueue,
     execute,

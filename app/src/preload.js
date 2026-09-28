@@ -110,13 +110,15 @@ contextBridge.exposeInMainWorld("managerProxyPoolAPI", {
 });
 
 contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
+  library: (operation, projectId, input) => ipcRenderer.invoke("workbench:library", operation, projectId, input),
   snapshot: () => ipcRenderer.invoke("workbench:snapshot"),
   versionInfo: () => ipcRenderer.invoke("workbench:version-info"),
   project: {
-    create: (name) => ipcRenderer.invoke("workbench:project-create", name),
+    create: (name, options) => ipcRenderer.invoke("workbench:project-create", name, options),
     open: (projectId) => ipcRenderer.invoke("workbench:project-open", projectId),
     rename: (projectId, name) => ipcRenderer.invoke("workbench:project-rename", projectId, name),
-    remove: (projectId) => ipcRenderer.invoke("workbench:project-delete", projectId),
+    remove: (projectId, options) => ipcRenderer.invoke("workbench:project-delete", projectId, options || {}),
+    duplicate: (projectId) => ipcRenderer.invoke("workbench:project-duplicate", projectId),
     defaults: (projectId, defaults) => ipcRenderer.invoke("workbench:project-defaults", projectId, defaults),
   },
   storyboard: {
@@ -134,6 +136,8 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     import: (projectId, items, mode) => ipcRenderer.invoke("workbench:prompt-import", projectId, items, mode),
   },
   asset: {
+    family: (projectId) => ipcRenderer.invoke("workbench:asset-family", projectId),
+    reuse: (targetId, sourceId, assetIds) => ipcRenderer.invoke("workbench:asset-reuse", targetId, sourceId, assetIds),
     importDialog: () => ipcRenderer.invoke("workbench:asset-import-dialog"),
     importPaths: (projectId, filePaths) => ipcRenderer.invoke("workbench:asset-import-paths", projectId, filePaths),
     importBuffers: (projectId, items) => ipcRenderer.invoke("workbench:asset-import-buffers", projectId, items),
@@ -161,9 +165,12 @@ contextBridge.exposeInMainWorld("managerWorkbenchAPI", {
     enqueue: (projectId, storyboardId, accountId) =>
       ipcRenderer.invoke("workbench:task-enqueue", projectId, storyboardId, accountId),
     list: (projectId) => ipcRenderer.invoke("workbench:tasks", projectId),
+    clear: (projectId, options) => ipcRenderer.invoke("workbench:task-clear", projectId, options || {}),
     assignments: (storyboardIds, accountIds, mode) =>
       ipcRenderer.invoke("workbench:task-assignments", storyboardIds, accountIds, mode),
     execute: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-execute", projectId, attemptId),
+    interrupt: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-interrupt", projectId, attemptId),
+    resumeMonitoring: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-resume-monitoring", projectId, attemptId),
     cancel: (projectId, attemptId) => ipcRenderer.invoke("workbench:task-cancel", projectId, attemptId),
     stopAutoRetry: (projectId, attemptId) =>
       ipcRenderer.invoke("workbench:task-auto-retry-stop", projectId, attemptId),

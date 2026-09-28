@@ -155,10 +155,14 @@ async function main() {
     const after = normalizeProject(await s2.readProject(created.id), created.id);
     eq("改名后引用不变", after.storyboards[0].refs, restored.storyboards[0].refs);
 
-    const indexAfterDelete = await s2.deleteProject(created.id);
+    // deleteProject 自 v0.6.11 起返回 { index, removed, cleanupFailed }：
+    // removed 供界面提示「连同 N 条分集一起删除」，cleanupFailed 上报目录未删净（文件被占用）。
+    const deletion = await s2.deleteProject(created.id);
     check("删除项目后目录移除", !fs.existsSync(path.join(root, "projects", created.id)));
-    eq("删除后索引清空", indexAfterDelete.projects.length, 0);
-    eq("删除后不再指向该项目", indexAfterDelete.currentProjectId, "");
+    eq("删除返回已删除的项目 id", deletion.removed, [created.id]);
+    eq("删除后索引清空", deletion.index.projects.length, 0);
+    eq("删除后不再指向该项目", deletion.index.currentProjectId, "");
+    eq("删除后目录未残留时 cleanupFailed 为空", deletion.cleanupFailed, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

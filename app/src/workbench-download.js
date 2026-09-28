@@ -99,6 +99,8 @@ function createDownloader({
   groupsForAccount = () => [],
   scanAccount = async () => ({ scanned: 0 }),
   probe = null,
+  strictOriginal = false,
+  minVideoBytes = 0,
   parser = null,
   onProgress = () => {},
   now = () => Date.now(),
@@ -128,9 +130,23 @@ function createDownloader({
         matchedBy: "none",
       };
     }
-    if (refresh) await scanAccount(record.accountId).catch(() => {});
+    // 刷新失败不能静默：旧实现直接吞掉异常，界面只会看到「同源不可用」，
+    // 用户无法区分「账号里确实没有原片」和「本次刷新本身就失败了」。
+    let refreshError = "";
+    if (refresh) {
+      try {
+        await scanAccount(record.accountId);
+      } catch (error) {
+        refreshError = error?.message || String(error);
+      }
+    }
     const groups = groupsForAccount(record.accountId) || [];
     const result = sources.buildSources({ videoUrl: record.result.videoUrl, groups, parser });
+    if (strictOriginal) {
+      result.sources = result.sources.map(item => item.kind === sources.KIND.LANCHUAN ? item : { ...item, available: false, error: "已禁用播放版：只下载澜川同源原片", errorHint: "等待同源原片可用后重试" });
+      result.note = "仅下载澜川同源原片，不回退播放版；文件大小和视频轨道校验通过后才标记完成。";
+    }
+    if (refreshError) result.note = `${result.note}（本次刷新账号素材失败：${refreshError}，上面的结果可能不是最新的）`;
     return result;
   }
 
@@ -166,6 +182,7 @@ function createDownloader({
     resume = false,
     allowFallback = true,
   }) {
+    if (strictOriginal) allowFallback = false;
     const { record } = await requireRecord(projectId, attemptId);
     if (record.status !== "succeeded" || !record.result?.videoUrl) {
       throw new Error("只有生成成功且有结果地址的任务才能下载");
@@ -181,82 +198,88 @@ function createDownloader({
     /** 最终去向：done / paused / canceled / failed —— 决定分片是否保留 */
     let optionOutcome = "failed";
 
-    const resolved = await resolveSources({ projectId, attemptId, refresh: true });
-    const chosenId = sourceId || sources.defaultSourceId(resolved.sources);
-    let current = resolved.sources.find((s) => s.id === chosenId) || null;
-    if (!current || !current.available) {
-      const reason = current?.error || "没有可用的下载来源";
-      const hint = current?.errorHint || "";
-      const updated = await taskStore.update(projectId, attemptId, (r) => {
-        setDownload(r, DOWNLOAD_STATUS.FAILED, {
-          source: current?.kind || "",
-          sourceLabel: current?.label || "",
-          errorCode: "SOURCE_UNAVAILABLE",
-          message: reason,
-          hint,
-        });
-        return r;
-      });
-      running.delete(attemptId);
-      return { ok: false, error: reason, errorCode: "SOURCE_UNAVAILABLE", hint, record: updated };
-    }
-
-    const dir = await outputDirFor(projectId);
-    await fsp.mkdir(dir, { recursive: true });
-    partPath = partPathFor(path.join(dir, ".dbm-dl-" + attemptId));
-
-    const report = progressReporter(projectId, attemptId, { id: current.id, kind: current.kind, tag: current.tag });
-
-    const resumedBytes = resume ? await existingPartSize(partPath).catch(() => 0) : 0;
-    const started = await taskStore.update(projectId, attemptId, (r) => {
-      setDownload(r, DOWNLOAD_STATUS.RUNNING, {
-        source: current.kind,
-        sourceLabel: current.label,
-        url: current.requiresResolve ? "" : current.url,
-        urlSafe: current.urlSafe,
-        bytes: resumedBytes,
-        resumed: resumedBytes > 0,
-        startedAt: new Date(startedAt).toISOString(),
-        elapsedMs: 0,
-        message: current.requiresResolve ? "正在解析澜川同源原片地址…" : "正在下载…",
-      });
-      return r;
-    });
-    report({ phase: "start", received: resumedBytes, total: 0, force: true, resumed: resumedBytes > 0, message: started.download.message });
-
-    const session = sessionFor(record.accountId);
-    const headers = { Referer: "https://www.dola.com/", Accept: "video/*,application/octet-stream;q=0.9,*/*;q=0.8" };
-
-    /** 单来源下载（解析同源地址 → 传输 → 校验 → 落盘） */
-    const runSource = async (source, options = {}) => {
-      const useResume = options.resume !== undefined ? options.resume : resume;
-      let url = source.url;
-      if (source.requiresResolve) {
-        report({ phase: "resolve", force: true, message: "正在解析澜川同源原片地址…" });
-        url = await resolveFallback(source.fallbackApi, session, headers, controller.signal);
-        await taskStore.update(projectId, attemptId, (r) => {
-          setDownload(r, DOWNLOAD_STATUS.RUNNING, { url, message: "原片地址已解析，开始下载…" });
+    let report = progressReporter(projectId, attemptId, {});
+    try {
+      const resolved = await resolveSources({ projectId, attemptId, refresh: true });
+      controller.signal.throwIfAborted();
+      const chosenId = sourceId || (strictOriginal ? "lanchuan" : sources.defaultSourceId(resolved.sources));
+      let current = resolved.sources.find((s) => s.id === chosenId) || null;
+      if (!current || !current.available) {
+        const reason = current?.error || "没有可用的澜川同源原片，等待扫描后重试";
+        const hint = current?.errorHint || "";
+        const updated = await taskStore.update(projectId, attemptId, (r) => {
+          setDownload(r, DOWNLOAD_STATUS.FAILED, {
+            source: current?.kind || "",
+            sourceLabel: current?.label || "",
+            errorCode: "SOURCE_UNAVAILABLE",
+            message: reason,
+            hint,
+          });
           return r;
         });
+        return { ok: false, error: reason, errorCode: "SOURCE_UNAVAILABLE", hint, record: updated };
       }
-      const transferred = await transfer({
-        session,
-        url,
-        headers,
-        partPath,
-        resume: useResume,
-        signal: controller.signal,
-        onProgress: (p) => report({ phase: "download", received: p.received, total: p.total, resumed: p.resumed }),
-      });
-      report({ phase: "verify", received: transferred.received, total: transferred.total, force: true, message: "下载完成，正在校验文件完整性…" });
-      await taskStore.update(projectId, attemptId, (r) => {
-        setDownload(r, DOWNLOAD_STATUS.RUNNING, { bytes: transferred.received, expectedBytes: transferred.total, resumed: transferred.resumed });
+
+      const dir = await outputDirFor(projectId);
+      await fsp.mkdir(dir, { recursive: true });
+      partPath = partPathFor(path.join(dir, ".dbm-dl-" + attemptId));
+
+      report = progressReporter(projectId, attemptId, { id: current.id, kind: current.kind, tag: current.tag });
+
+      // 旧版本播放版的分片不能续接到同源原片。
+      if (strictOriginal && record.download?.source !== sources.KIND.LANCHUAN) {
+        await removePart(partPath).catch(() => {});
+        resume = false;
+      }
+      const resumedBytes = resume ? await existingPartSize(partPath).catch(() => 0) : 0;
+      const started = await taskStore.update(projectId, attemptId, (r) => {
+        setDownload(r, DOWNLOAD_STATUS.RUNNING, {
+          source: current.kind,
+          sourceLabel: current.label,
+          url: current.requiresResolve ? "" : current.url,
+          urlSafe: current.urlSafe,
+          bytes: resumedBytes,
+          resumed: resumedBytes > 0,
+          startedAt: new Date(startedAt).toISOString(),
+          elapsedMs: 0,
+          message: current.requiresResolve ? "正在解析澜川同源原片地址…" : "正在下载…",
+        });
         return r;
       });
-      return { url, transferred };
-    };
+      report({ phase: "start", received: resumedBytes, total: 0, force: true, resumed: resumedBytes > 0, message: started.download.message });
 
-    try {
+      const session = sessionFor(record.accountId);
+      const headers = { Referer: "https://www.dola.com/", Accept: "video/*,application/octet-stream;q=0.9,*/*;q=0.8" };
+
+      /** 单来源下载（解析同源地址 → 传输 → 校验 → 落盘） */
+      const runSource = async (source, options = {}) => {
+        const useResume = options.resume !== undefined ? options.resume : resume;
+        let url = source.url;
+        if (source.requiresResolve) {
+          report({ phase: "resolve", force: true, message: "正在解析澜川同源原片地址…" });
+          url = await resolveFallback(source.fallbackApi, session, headers, controller.signal);
+          await taskStore.update(projectId, attemptId, (r) => {
+            setDownload(r, DOWNLOAD_STATUS.RUNNING, { url, message: "原片地址已解析，开始下载…" });
+            return r;
+          });
+        }
+        const transferred = await transfer({
+          session,
+          url,
+          headers,
+          partPath,
+          resume: useResume,
+          signal: controller.signal,
+          onProgress: (p) => report({ phase: "download", received: p.received, total: p.total, resumed: p.resumed }),
+        });
+        report({ phase: "verify", received: transferred.received, total: transferred.total, force: true, message: "下载完成，正在校验文件完整性…" });
+        await taskStore.update(projectId, attemptId, (r) => {
+          setDownload(r, DOWNLOAD_STATUS.RUNNING, { bytes: transferred.received, expectedBytes: transferred.total, resumed: transferred.resumed });
+          return r;
+        });
+        return { url, transferred };
+      };
+
       let outcome = null;
       let lastError = null;
       // 换来源必须从头下：澜川同源与平台播放版的字节并不一致，
@@ -290,7 +313,47 @@ function createDownloader({
       if (!outcome) throw lastError || new Error("下载失败");
 
       const { url, transferred } = outcome;
-      const probeResult = probe ? await probe.inspect(partPath).catch(() => null) : null;
+      // 传输自称成功但分片文件不见了：旧实现直接让 fsp.stat 抛出原始错误（非受控、界面显示成
+      // 一个笼统异常），这里给出可定位的错误码与说明。
+      let actualBytes = 0;
+      try {
+        actualBytes = (await fsp.stat(partPath)).size;
+      } catch (error) {
+        throw Object.assign(
+          new Error(`传输已结束但分片文件不存在或无法读取，未能校验完整性：${error?.message || error}`),
+          { code: "PART_MISSING" }
+        );
+      }
+      if (!actualBytes) {
+        throw Object.assign(new Error("传输已结束但分片文件为空，未标记下载完成，请重试下载"), { code: "PART_MISSING" });
+      }
+      if (minVideoBytes && actualBytes <= minVideoBytes) {
+        await removePart(partPath);
+        throw Object.assign(new Error(`画质待核验：澜川同源文件仅 ${(actualBytes / 1024 / 1024).toFixed(2)} MB，未超过 15 MB；不标记下载完成，请稍后重新扫描原片。`), { code: "QUALITY_SIZE_LOW" });
+      }
+      // 探测失败要带上原因：旧实现一律降级为 null，界面只显示「无法完成视频轨道校验」，
+      // 既掩盖了真实损坏，也让用户无从判断是文件问题还是探测工具问题。
+      let probeError = "";
+      let probeResult = null;
+      if (probe) {
+        try {
+          probeResult = await probe.inspect(partPath);
+        } catch (error) {
+          probeError = error?.message || String(error);
+          probeResult = null;
+        }
+      }
+      controller.signal.throwIfAborted();
+      if (strictOriginal && (!probeResult || probeResult.status !== "ready" || !probeResult.width || !probeResult.height)) {
+        throw Object.assign(
+          new Error(
+            probeError
+              ? `画质待核验：视频轨道校验未能执行（${probeError}），不标记下载完成`
+              : "画质待核验：无法完成视频轨道校验，不标记下载完成"
+          ),
+          { code: "QUALITY_PROBE_FAILED" }
+        );
+      }
       if (probe && probeResult && (probeResult.status !== "ready" || !probeResult.width || !probeResult.height)) {
         throw Object.assign(new Error(probeResult.message || "文件已下载但无法解析出视频轨道，判定为损坏"), { code: "FILE_CORRUPT" });
       }
@@ -304,6 +367,9 @@ function createDownloader({
         sourceTag: current.tag,
       });
       const filePath = await uniquePath(dir, fileName);
+      controller.signal.throwIfAborted();
+      // 落盘进入提交阶段后，不再接受暂停，避免已保存文件和任务状态不一致。
+      running.get(attemptId).committing = true;
       await commitPart(partPath, filePath);
       partPath = "";
 
@@ -320,7 +386,13 @@ function createDownloader({
           resumed: transferred.resumed,
           elapsedMs: finishedAt - startedAt,
           errorCode: "",
-          message: "",
+          // 未做长度比对时如实写进备注（不当作通过），用户与后续核对都能看到
+          message: [
+            strictOriginal ? `澜川同源原片已校验：${(actualBytes / 1024 / 1024).toFixed(2)} MB · ${probeResult.width}×${probeResult.height}` : "",
+            transferred.lengthVerified === false ? transferred.lengthNote : "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
         });
         if (r.result) {
           r.result = { ...r.result, filePath, width: probeResult?.width || r.result.width, height: probeResult?.height || r.result.height, durationSeconds: probeResult?.duration || r.result.durationSeconds };
@@ -331,7 +403,7 @@ function createDownloader({
       optionOutcome = "done";
       return { ok: true, filePath, bytes: transferred.received, source: current.kind, record: updated };
     } catch (error) {
-      const code = errorCode(error);
+      const code = controller.signal.aborted ? "ABORT_ERR" : errorCode(error);
       if (code === "ABORT_ERR" && paused.has(attemptId)) {
         const kept = await existingPartSize(partPath).catch(() => 0);
         const updated = await taskStore.update(projectId, attemptId, (r) => {
@@ -371,6 +443,7 @@ function createDownloader({
   async function pause(projectId, attemptId) {
     const item = running.get(attemptId);
     if (!item) return { ok: false, reason: "该任务没有正在进行的下载" };
+    if (item.committing) return { ok: false, reason: "文件已校验，正在保存，请等待完成" };
     paused.set(attemptId, true);
     item.controller.abort();
     return { ok: true };
@@ -380,6 +453,7 @@ function createDownloader({
   async function cancel(projectId, attemptId) {
     const item = running.get(attemptId);
     if (!item) return { ok: false, reason: "该任务没有正在进行的下载" };
+    if (item.committing) return { ok: false, reason: "文件已校验，正在保存，请等待完成" };
     paused.delete(attemptId);
     item.controller.abort();
     return { ok: true };
@@ -393,7 +467,18 @@ function createDownloader({
     return { resumable: size > 0, bytes: size };
   }
 
-  return { download, pause, cancel, resumable, resolveSources, running };
+  /** 启动时修复上次退出留下的下载中状态，保留分片，等待明确继续。 */
+  async function recover(projectId) {
+    for (const task of await taskStore.list(projectId)) {
+      if (task.download?.status !== DOWNLOAD_STATUS.RUNNING || running.has(task.id)) continue;
+      await taskStore.update(projectId, task.id, record => {
+        if (record.download?.status !== DOWNLOAD_STATUS.RUNNING || running.has(task.id)) return false;
+        return setDownload(record, DOWNLOAD_STATUS.PAUSED, { message: "上次下载因软件退出而中断，可点击继续下载", errorCode: "" });
+      });
+    }
+  }
+
+  return { download, pause, cancel, resumable, resolveSources, recover, running };
 }
 
 /** 同源解析实现（延迟 require，避免离线测试时加载 electron） */

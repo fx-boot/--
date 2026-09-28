@@ -10,6 +10,7 @@ function requestHeaders(url,headers={}){
  return result;
 }
 function describe(error){const code=errorCode(error);
+ if(code==='QUALITY_SIZE_LOW'||code==='QUALITY_PROBE_FAILED')return error.message;
  if(code==='ABORT_ERR')return '已取消下载';
  if(code.startsWith('ORIGINAL_'))return '平台原片接口暂未返回可保存的原片（'+code+'），请重新打开视频并扫描；没有自动改下播放压缩版';
  if(code==='ERR_BLOCKED_BY_CLIENT')return '下载请求被客户端拦截（ERR_BLOCKED_BY_CLIENT），请保留此错误信息以检查请求策略';

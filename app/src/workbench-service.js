@@ -24,9 +24,11 @@ const {
   splitPrompts,
   syncRefsFromPrompt,
 } = require("./workbench-store");
+const { createProjectAssets } = require("./workbench-project-assets");
 const { createAssets, MAX_BYTES } = require("./workbench-assets");
 const { createTaskService } = require("./workbench-task-service");
-const { DOWNLOAD_LABEL, STATUS_LABEL } = require("./workbench-task-store");
+const { createLibrary } = require("./workbench-library");
+const { DOWNLOAD_LABEL, DOWNLOAD_STATUS, STATUS_LABEL, isActive } = require("./workbench-task-store");
 const { VIDEO_CAPABILITIES } = require("./video-capabilities");
 
 // 版本信息：源码内置 app/version.json；打包 app.asar 时 pack-app.cjs 会在包内副本上
@@ -141,7 +143,20 @@ function storageStatus() {
     ok = false;
     message = `数据目录不可写：${error.message}`;
   }
-  return { root, ok, message: state.lastError || message };
+  return {
+    root: root,
+    ok,
+    message: state.lastError || message,
+    // 索引损坏并被重建时的恢复记录；界面据此给出「已从磁盘恢复 N 个项目」的提示，
+    // 而不是让用户面对一个空列表自行猜测数据为何消失。
+    recovery: (() => {
+      try {
+        return store().recoveryInfo ? store().recoveryInfo() : null;
+      } catch {
+        return null;
+      }
+    })(),
+  };
 }
 
 function notify() {
@@ -179,14 +194,20 @@ async function requireProject(projectId) {
   if (!id) throw new Error("尚未选择项目");
   const project = await store().readProject(id);
   if (!project) throw new Error("项目不存在或已损坏");
-  state.projectId = project.id;
   return project;
 }
 
-async function save(project) {
-  const saved = await store().saveProject(project);
+async function mutateProject(projectId, mutation) {
+  const id = text(projectId) || state.projectId;
+  if (!id) throw new Error("尚未选择项目");
+  let result;
+  let returnsProject = false;
+  const saved = await store().updateProject(id, async (project) => {
+    result = await mutation(project);
+    returnsProject = result === project;
+  });
   notify();
-  return saved;
+  return returnsProject ? saved : result;
 }
 
 /** 参考图引用：命中「文本里出现 @图N」的位置与顺序，重建引用表 */
@@ -222,7 +243,7 @@ async function snapshot() {
   if (index.currentProjectId) {
     const raw = await store().readProject(index.currentProjectId);
     if (raw) {
-      project = normalizeProject(raw, raw.id);
+      project = await store().ensureComposeDraft(raw.id);
       state.projectId = project.id;
     }
   }
@@ -306,12 +327,23 @@ function unbindAsset(project, storyboardId, assetId) {
 function baseHandlers() {
   return {
     "workbench:snapshot": () => snapshot(),
+    "workbench:library": async (_e, operation, projectId, input) => {
+      const library = createLibrary({ store: store(), taskStore: tasks().taskStore, assets: assets() });
+      const result = await library.command(operation, projectId, input);
+      if (operation !== "media") notify();
+      return result;
+    },
     // 轻量版本通道：主窗口左下角固定展示版本号用，避免为此拉取整份 snapshot
     "workbench:version-info": () => appVersion(),
 
     // ── 项目 ───────────────────────────────────────────────
-    "workbench:project-create": async (_e, name) => {
-      const { index } = await store().createProject(text(name, 120));
+    "workbench:project-create": async (_e, name, options = {}) => {
+      const { index } = await store().createProject(text(name, 120), {
+        parentId: options.parentId,
+        // 分集序号由主进程串行分配：旧实现由渲染层先按现有名字算编号、再发创建请求，
+        // 快速连点两次会都算出「第 1 集」，产生两个同名分集（下拉里无法区分）。
+        episodeNumbering: Boolean(options.parentId),
+      });
       state.projectId = index.currentProjectId;
       notify();
       return { projectId: state.projectId };
@@ -327,115 +359,208 @@ function baseHandlers() {
       notify();
       return { ok: true };
     },
-    "workbench:project-delete": async (_e, projectId) => {
-      const index = await store().deleteProject(projectId);
-      if (state.projectId === projectId) state.projectId = index.currentProjectId || "";
+    "workbench:project-delete": async (_e, projectId, options = {}) => {
+      const svcStore = store();
+      const cascade = options?.cascade === true;
+      // 级联范围：自身 + 其下全部分集（与 store.deleteProject 的收敛规则一致，用于前置校验）
+      const index = await svcStore.readIndex();
+      const targets = new Set([String(projectId ?? "")]);
+      if (cascade) {
+        let grew = true;
+        while (grew) {
+          grew = false;
+          for (const p of index.projects) {
+            if (p.parentId && targets.has(p.parentId) && !targets.has(p.id)) {
+              targets.add(p.id);
+              grew = true;
+            }
+          }
+        }
+      }
+      // 活跃任务 / 未完成下载保护：旧实现直接 rm 整个项目目录（含 tasks.json 与下载分片），
+      // runner 随后会反复抛「任务记录不存在」，下载也会写盘失败。有这类记录一律拒绝删除。
+      const blockers = [];
+      for (const pid of targets) {
+        let list = [];
+        try {
+          list = await tasks().taskStore.list(pid);
+        } catch {
+          list = [];
+        }
+        const active = list.filter((t) => isActive(t.status));
+        if (active.length) {
+          blockers.push(`有 ${active.length} 条未结束的任务（如「${STATUS_LABEL[active[0].status] || active[0].status}」）`);
+        }
+        const busy = list.filter(
+          (t) => t.download?.status === DOWNLOAD_STATUS.RUNNING || t.download?.status === DOWNLOAD_STATUS.PAUSED
+        );
+        if (busy.length) {
+          blockers.push(`有 ${busy.length} 条任务的下载未完成（${DOWNLOAD_LABEL[busy[0].download.status] || busy[0].download.status}）`);
+        }
+      }
+      if (blockers.length) {
+        throw new Error(`无法删除：${blockers.join("；")}。请先取消或处理相关任务，再删除项目`);
+      }
+      const result = await svcStore.deleteProject(projectId, { cascade });
+      if (result.removed.includes(state.projectId)) state.projectId = result.index.currentProjectId || "";
       notify();
-      return { currentProjectId: state.projectId };
+      return {
+        currentProjectId: state.projectId,
+        removed: result.removed,
+        // 索引已摘除但目录未删净（文件被占用等）：界面提示用户，不影响数据一致性
+        cleanupFailed: result.cleanupFailed,
+      };
+    },
+    /**
+     * 复制项目/分集：草稿（提示词 / 参数 / 引用）与素材一起带走。
+     * 素材按「内容哈希」复制（assetId 由 sha256 派生），所以副本里的 @图引用与源项目
+     * 指向同一张图，不会出现「引用悬空、提交前校验报缺少本地文件」。
+     */
+    "workbench:project-duplicate": async (_e, projectId) => {
+      const svcStore = store();
+      const source = await svcStore.readProject(projectId);
+      if (!source) throw new Error("项目不存在或已损坏");
+      const parentId = text(source.parentId);
+      const name = `${text(source.name, 110) || "未命名项目"} 副本`;
+      const { project } = await svcStore.createProject(name, parentId ? { parentId } : {});
+      // 先把素材复制进副本，再决定哪些引用可以保留
+      const sourceAssets = await assets().list(projectId);
+      const assetResult = sourceAssets.length
+        ? await assets()
+            .importPaths(project.id, sourceAssets.map((asset) => path.join(svcStore.assetsDir(projectId), asset.fileName)))
+            .catch(() => ({ imported: [], reused: [], failed: sourceAssets.map((a) => ({ file: a.name })) }))
+        : { imported: [], reused: [], failed: [] };
+      const available = new Set((await assets().list(project.id)).map((asset) => asset.id));
+      const droppedRefs = [];
+      await svcStore.updateProject(project.id, (next) => {
+        next.defaults = normalizeDefaults(source.defaults);
+        next.storyboards = (source.storyboards || []).map((storyboard, index) => {
+          const refs = (storyboard.refs || []).filter((ref) => {
+            if (available.has(ref.assetId)) return true;
+            droppedRefs.push(ref.token);
+            return false;
+          });
+          // 引用被丢弃时同步删掉提示词里对应的 token，避免留下指不到图的 @图N
+          let prompt = String(storyboard.prompt || "");
+          for (const ref of storyboard.refs || []) {
+            if (available.has(ref.assetId)) continue;
+            prompt = prompt.replace(new RegExp(`${ref.token}\\s?`, "g"), "");
+          }
+          return { ...storyboard, id: "", order: index, prompt, refs };
+        });
+      });
+      notify();
+      return {
+        projectId: project.id,
+        name,
+        assets: { copied: assetResult.imported.length + assetResult.reused.length, failed: assetResult.failed.length },
+        droppedRefs,
+      };
     },
     "workbench:project-defaults": async (_e, projectId, defaults) => {
-      const project = await requireProject(projectId);
-      project.defaults = normalizeDefaults({ ...project.defaults, ...(defaults || {}) });
-      return save(project);
+      return mutateProject(projectId, async (project) => {
+        project.defaults = normalizeDefaults({ ...project.defaults, ...(defaults || {}) });
+        return project;
+      });
     },
 
     // ── 分镜 ───────────────────────────────────────────────
     "workbench:storyboard-add": async (_e, projectId, options) => {
-      const project = await requireProject(projectId);
-      const storyboard = await addStoryboard(project, options || {});
-      await save(project);
-      return { storyboard };
+      return mutateProject(projectId, async (project) => {
+        const storyboard = await addStoryboard(project, options || {});
+        return { storyboard };
+      });
     },
     "workbench:storyboard-update": async (_e, projectId, storyboardId, patch = {}) => {
-      const project = await requireProject(projectId);
-      const storyboard = project.storyboards.find((s) => s.id === storyboardId);
-      if (!storyboard) throw new Error("分镜不存在");
-      if (patch.name !== undefined) storyboard.name = text(patch.name, 120);
-      if (patch.prompt !== undefined) storyboard.prompt = text(patch.prompt);
-      if (patch.overrides !== undefined) {
-        storyboard.overrides = { ...storyboard.overrides, ...(patch.overrides || {}) };
-      }
-      if (patch.settings !== undefined) {
-        storyboard.settings = { ...storyboard.settings, ...(patch.settings || {}) };
-      }
-      const dropped = reconcileRefs(storyboard);
-      storyboard.updatedAt = new Date().toISOString();
-      await save(project);
-      return { storyboard, droppedTokens: dropped };
+      return mutateProject(projectId, async (project) => {
+        const storyboard = project.storyboards.find((s) => s.id === storyboardId);
+        if (!storyboard) throw new Error("分镜不存在");
+        if (patch.name !== undefined) storyboard.name = text(patch.name, 120);
+        if (patch.prompt !== undefined) storyboard.prompt = text(patch.prompt);
+        if (patch.overrides !== undefined) {
+          storyboard.overrides = { ...storyboard.overrides, ...(patch.overrides || {}) };
+        }
+        if (patch.settings !== undefined) {
+          storyboard.settings = { ...storyboard.settings, ...(patch.settings || {}) };
+        }
+        const dropped = reconcileRefs(storyboard);
+        storyboard.updatedAt = new Date().toISOString();
+        return { storyboard, droppedTokens: dropped };
+      });
     },
     "workbench:storyboard-duplicate": async (_e, projectId, storyboardId) => {
-      const project = await requireProject(projectId);
-      const at = project.storyboards.findIndex((s) => s.id === storyboardId);
-      if (at < 0) throw new Error("分镜不存在");
-      const source = project.storyboards[at];
-      const copy = normalizeStoryboard(
-        {
-          ...JSON.parse(JSON.stringify(source)),
-          id: newId("sb"),
-          name: `${source.name || "分镜"} 副本`,
-          updatedAt: new Date().toISOString(),
-        },
-        at + 1
-      );
-      project.storyboards.splice(at + 1, 0, copy);
-      project.storyboards.forEach((s, i) => {
-        s.order = i;
+      return mutateProject(projectId, async (project) => {
+        const at = project.storyboards.findIndex((s) => s.id === storyboardId);
+        if (at < 0) throw new Error("分镜不存在");
+        const source = project.storyboards[at];
+        const copy = normalizeStoryboard(
+          {
+            ...JSON.parse(JSON.stringify(source)),
+            id: newId("sb"),
+            name: `${source.name || "分镜"} 副本`,
+            updatedAt: new Date().toISOString(),
+          },
+          at + 1
+        );
+        project.storyboards.splice(at + 1, 0, copy);
+        project.storyboards.forEach((s, i) => {
+          s.order = i;
+        });
+        return { storyboard: copy };
       });
-      await save(project);
-      return { storyboard: copy };
     },
     "workbench:storyboard-delete": async (_e, projectId, storyboardId) => {
-      const project = await requireProject(projectId);
-      project.storyboards = project.storyboards.filter((s) => s.id !== storyboardId);
-      project.storyboards.forEach((s, i) => {
-        s.order = i;
+      return mutateProject(projectId, async (project) => {
+        project.storyboards = project.storyboards.filter((s) => s.id !== storyboardId);
+        project.storyboards.forEach((s, i) => {
+          s.order = i;
+        });
+        return { ok: true };
       });
-      await save(project);
-      return { ok: true };
     },
     "workbench:storyboard-reorder": async (_e, projectId, orderedIds) => {
-      const project = await requireProject(projectId);
-      const byId = new Map(project.storyboards.map((s) => [s.id, s]));
-      const ordered = [];
-      for (const id of orderedIds || []) {
-        const item = byId.get(text(id));
-        if (item && !ordered.includes(item)) ordered.push(item);
-      }
-      for (const item of project.storyboards) if (!ordered.includes(item)) ordered.push(item);
-      ordered.forEach((s, i) => {
-        s.order = i;
+      return mutateProject(projectId, async (project) => {
+        const byId = new Map(project.storyboards.map((s) => [s.id, s]));
+        const ordered = [];
+        for (const id of orderedIds || []) {
+          const item = byId.get(text(id));
+          if (item && !ordered.includes(item)) ordered.push(item);
+        }
+        for (const item of project.storyboards) if (!ordered.includes(item)) ordered.push(item);
+        ordered.forEach((s, i) => {
+          s.order = i;
+        });
+        project.storyboards = ordered;
+        return { order: project.storyboards.map((s) => s.id) };
       });
-      project.storyboards = ordered;
-      await save(project);
-      return { order: project.storyboards.map((s) => s.id) };
     },
     "workbench:storyboard-bind": async (_e, projectId, storyboardId, assetId, options) => {
-      const project = await requireProject(projectId);
-      const result = await bindAsset(project, storyboardId, assetId, options || {});
-      await save(project);
-      return result;
+      return mutateProject(projectId, async (project) => {
+        const result = await bindAsset(project, storyboardId, assetId, options || {});
+        return result;
+      });
     },
     "workbench:storyboard-unbind": async (_e, projectId, storyboardId, assetId) => {
-      const project = await requireProject(projectId);
-      const result = unbindAsset(project, storyboardId, assetId);
-      await save(project);
-      return result;
+      return mutateProject(projectId, async (project) => {
+        const result = unbindAsset(project, storyboardId, assetId);
+        return result;
+      });
     },
 
     // ── 批量粘贴 ───────────────────────────────────────────
     "workbench:prompt-split": (_e, rawText, mode) => splitPrompts(rawText, mode),
     "workbench:prompt-import": async (_e, projectId, items, mode) => {
-      const project = await requireProject(projectId);
-      const list = Array.isArray(items) && items.length ? items : splitPrompts(items, mode).items;
-      const created = [];
-      for (const item of list) {
-        const storyboard = await addStoryboard(project, {});
-        storyboard.name = text(item?.name, 120) || storyboard.name;
-        storyboard.prompt = text(item?.prompt);
-        created.push(storyboard);
-      }
-      await save(project);
-      return { created: created.length, ids: created.map((s) => s.id) };
+      return mutateProject(projectId, async (project) => {
+        const list = Array.isArray(items) && items.length ? items : splitPrompts(items, mode).items;
+        const created = [];
+        for (const item of list) {
+          const storyboard = await addStoryboard(project, {});
+          storyboard.name = text(item?.name, 120) || storyboard.name;
+          storyboard.prompt = text(item?.prompt);
+          created.push(storyboard);
+        }
+        return { created: created.length, ids: created.map((s) => s.id) };
+      });
     },
 
     // ── 素材 ───────────────────────────────────────────────
@@ -458,6 +583,12 @@ function baseHandlers() {
     "workbench:asset-import-buffers": async (_e, projectId, items) => {
       const project = await requireProject(projectId);
       return assets().importBuffers(project.id, Array.isArray(items) ? items : []);
+    },
+    "workbench:asset-family": (_e, projectId) => createProjectAssets({ store: store(), assets: assets() }).family(projectId),
+    "workbench:asset-reuse": async (_e, targetId, sourceId, assetIds) => {
+      const result = await createProjectAssets({ store: store(), assets: assets() }).reuse(targetId, sourceId, assetIds);
+      notify();
+      return result;
     },
     "workbench:asset-list": async (_e, projectId, options) => {
       const project = await requireProject(projectId);
@@ -487,31 +618,47 @@ function baseHandlers() {
      * - resolution 为 "unbind" 时才连带解除引用（并同步移除提示词里的 token）。
      */
     "workbench:asset-delete": async (_e, projectId, assetIds, resolution) => {
-      const project = await requireProject(projectId);
-      const usages = usagesOf(project, assetIds);
-      const referenced = Object.entries(usages).filter(([, list]) => list.length);
-      if (referenced.length && resolution !== "unbind") {
-        return { blocked: true, usages };
-      }
-      let unbound = 0;
-      if (referenced.length) {
+      const id = text(projectId) || state.projectId;
+      const result = await mutateProject(id, async (project) => {
+        const usages = usagesOf(project, assetIds);
+        const referenced = Object.entries(usages).filter(([, list]) => list.length);
+        if (referenced.length && resolution !== "unbind") return { blocked: true, usages };
+        let unbound = 0;
         for (const storyboard of project.storyboards) {
           for (const [assetId] of referenced) {
             if (unbindAsset(project, storyboard.id, assetId).removed) unbound++;
           }
         }
-        await save(project);
+        return { blocked: false, unbound, usages };
+      });
+      if (result.blocked) return result;
+      // 先确认解除引用已保存，再移除文件；保存失败时素材仍可用。
+      const removed = await assets().remove(id, assetIds);
+      // 收尾回扫：解除引用与删除文件之间仍有窗口，其它并发操作（例如刚插入 @图）可能又绑上
+      // 这批素材。这里在同一项目事务内再扫一遍并把指向已删素材的引用解掉（同步移除文本里的
+      // token），避免留下「引用指向不存在素材」的悬空状态。
+      let reswept = 0;
+      if (removed.length) {
+        const removedIds = removed.map((item) => item.id);
+        await mutateProject(id, async (project) => {
+          for (const storyboard of project.storyboards) {
+            for (const assetId of removedIds) {
+              if (unbindAsset(project, storyboard.id, assetId).removed) reswept++;
+            }
+          }
+          return { reswept };
+        });
       }
-      const removed = await assets().remove(project.id, assetIds);
       notify();
-      return { blocked: false, removed, unbound, usages };
+      return { ...result, removed, reswept };
     },
 
     // ── 界面状态（重启恢复上下文用） ────────────────────────
     "workbench:ui-state": async (_e, projectId, patch) => {
-      const project = await requireProject(projectId);
-      project.ui = { ...project.ui, ...(patch || {}) };
-      return save(project);
+      return mutateProject(projectId, async (project) => {
+        project.ui = { ...project.ui, ...(patch || {}) };
+        return project;
+      });
     },
   };
 }

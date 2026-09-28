@@ -12,7 +12,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { createTaskStore, isActive } = require("./workbench-task-store");
+const { createTaskStore, isActive, STATUS } = require("./workbench-task-store");
 const { createRunner, stepDetail } = require("./workbench-runner");
 const { createDownloader } = require("./workbench-download");
 const { createDolaDriver, PARTITION_PREFIX } = require("./workbench-dola-driver");
@@ -64,9 +64,24 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     for (const ref of refs || []) {
       const asset = byId.get(ref.assetId);
       if (!asset) continue;
+      const filePath = path.join(dir, asset.fileName);
+      // 必须核实文件真实存在：旧实现只做路径拼接，于是「catalog 有记录、磁盘文件已被
+      // 手工删除/移动」时 filePath 依然非空，validateParams 的「缺少本地文件」守卫
+      // 永不触发 → 任务照常入队，直到驱动上传阶段才失败（错误信息也难以定位）。
+      // 这里不命中就跳过，让 buildSegments 产出空 filePath，由平台校验层明确阻断。
+      try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile() || stat.size <= 0) {
+          log("asset-file-unusable", { projectId, assetId: asset.id, filePath, reason: "文件为空或不是普通文件" });
+          continue;
+        }
+      } catch (error) {
+        log("asset-file-missing", { projectId, assetId: asset.id, filePath, reason: error?.message || String(error) });
+        continue;
+      }
       map.set(ref.assetId, {
         name: asset.name,
-        filePath: path.join(dir, asset.fileName),
+        filePath,
         sha256: asset.sha256,
         width: asset.width,
         height: asset.height,
@@ -80,6 +95,32 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     return index.projects.map((p) => p.id);
   }
 
+  const downloadRetries = new Map();
+  let disposed = false;
+  function queueOriginalRetry(projectId, attemptId) {
+    if (disposed || downloadRetries.has(attemptId)) return;
+    const timer = setTimeout(() => {
+      downloadRetries.delete(attemptId);
+      void automaticDownload({projectId, attemptId}).catch(error => log("original-download-error", {message:error.message}));
+    }, 30000);
+    timer.unref?.();
+    downloadRetries.set(attemptId, timer);
+  }
+  async function automaticDownload({projectId, attemptId}) {
+    if (disposed || !(await autoDownloadEnabled(projectId))) return;
+    const record = (await taskStore.list(projectId)).find(task => task.id === attemptId);
+    if (!record || record.interruption?.stopped || record.status !== "succeeded" || ["done", "paused", "downloading"].includes(record.download?.status) || record.download?.errorCode === "CANCELED") return;
+    const result = await startDownload({projectId, attemptId, auto:true});
+    if (!result.ok && /^(SOURCE_UNAVAILABLE|ORIGINAL_)/.test(result.errorCode || "")) {
+      await taskStore.update(projectId, attemptId, task => {
+        task.download.message += "；30 秒后自动重新扫描同源原片，不会改下播放版";
+        return task;
+      });
+      queueOriginalRetry(projectId, attemptId);
+    }
+    onChanged();
+  }
+
   const target = "dola";
   const driver = createDolaDriver({ log });
   const runner = createRunner({
@@ -91,12 +132,8 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     listProjectIds,
     onChanged,
     log,
-    // 生成成功后的自动下载钩子：是否开始下载由项目设置决定（默认关），下载失败不回改生成状态
-    onResultReady: async ({ projectId, attemptId }) => {
-      const enabled = await autoDownloadEnabled(projectId);
-      if (!enabled) return;
-      await startDownload({ projectId, attemptId, auto: true });
-    },
+    // 生成成功后的自动下载钩子：是否开始下载由项目设置决定（默认开），下载失败不回改生成状态
+    onResultReady: automaticDownload,
   });
 
   // 下载链路：会话来自账号分区（与既有高清原片下载同一套），来源分组复用 HD 观察器
@@ -111,6 +148,8 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     groupsForAccount: (accountId) => hdService.groupsForAccount(accountId),
     scanAccount: (accountId) => hdService.scanAccount(accountId),
     probe,
+    strictOriginal: true,
+    minVideoBytes: 15 * 1024 * 1024,
     parser,
     onProgress: (payload) => pushDownloadProgress(payload),
   });
@@ -125,11 +164,11 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     }
   }
 
-  /** 项目设置里的「生成成功后自动下载」开关（默认关，不强制自动） */
+  /** 项目设置里的「生成成功后自动下载」开关（默认开，可手动关闭） */
   async function autoDownloadEnabled(projectId) {
     try {
       const project = await store.readProject(projectId);
-      return project?.settings?.autoDownload === true;
+      return !!project && project.settings?.autoDownload !== false;
     } catch {
       return false;
     }
@@ -155,8 +194,8 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
       accountName: account?.name || "",
       sourceId,
       resume,
-      // 自动下载时只认默认来源（同源优先），失败按同一套回退规则处理
-      allowFallback: true,
+      // 所有工作台下载强制同源原片，解析失败不降级。
+      allowFallback: false,
       auto,
     });
   }
@@ -242,7 +281,7 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
       model: storyboard.overrides?.model || defaults.model,
       duration: storyboard.overrides?.duration || defaults.duration,
       ratio: storyboard.overrides?.ratio || defaults.ratio,
-      removeWatermark: defaults.removeWatermark !== false,
+      removeWatermark: (storyboard.overrides?.removeWatermark ?? defaults.removeWatermark) !== false,
       prompt: storyboard.prompt,
     };
     const { buildPlan } = require("./workbench-platform");
@@ -336,6 +375,18 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
       },
 
       "workbench:tasks": (_e, projectId) => tasksFor(projectId),
+      /**
+       * 批量清理已完成任务（界面带二次确认）。
+       * 只清理终态中「生成成功且下载未在进行」的记录；活动任务、失败/待人工记录、
+       * 下载中或已暂停的记录全部保留（原因见 task-store.clear 的注释）。
+       */
+      "workbench:task-clear": async (_e, projectId, options = {}) => {
+        const result = await taskStore.clear(projectId, {
+          statuses: Array.isArray(options?.statuses) && options.statuses.length ? options.statuses : [STATUS.SUCCEEDED],
+        });
+        if (result.removed) onChanged();
+        return result;
+      },
       /** 分镜 × 账号的分配计划（纯逻辑，纯函数在 workbench-platform 里） */
       "workbench:task-assignments": (_e, storyboardIds, accountIds, mode) =>
         assignStoryboards({
@@ -347,6 +398,8 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
         await runner.execute(projectId, attemptId);
         return { ok: true };
       },
+      "workbench:task-interrupt": (_e, projectId, attemptId) => runner.interrupt(projectId, attemptId),
+      "workbench:task-resume-monitoring": (_e, projectId, attemptId) => runner.resumeMonitoring(projectId, attemptId),
       "workbench:task-cancel": (_e, projectId, attemptId) => runner.cancel(projectId, attemptId),
       "workbench:task-auto-retry-stop": (_e, projectId, attemptId) => runner.stopAutoRetry(projectId, attemptId),
       "workbench:task-retry": (_e, projectId, attemptId) => runner.retry(projectId, attemptId),
@@ -391,11 +444,8 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
       },
       /** 项目设置：生成成功后是否自动下载（默认关） */
       "workbench:auto-download": async (_e, projectId, enabled) => {
-        const raw = await store.readProject(projectId);
-        if (!raw) throw new Error("项目不存在");
-        const saved = await store.saveProject({
-          ...raw,
-          settings: { ...(raw.settings || {}), autoDownload: enabled === true },
+        const saved = await store.updateProject(projectId, (project) => {
+          project.settings = { ...(project.settings || {}), autoDownload: enabled === true };
         });
         onChanged();
         return { ok: true, enabled: saved.settings?.autoDownload === true };
@@ -420,11 +470,23 @@ function createTaskService({ store, assets, resolveUserDataDir, log = () => {}, 
     accountView,
     accountStatus,
     dispose: () => {
+      disposed = true;
+      for (const timer of downloadRetries.values()) clearTimeout(timer);
+      downloadRetries.clear();
       try {
         driver.dispose();
       } catch {}
     },
-    recover: () => runner.recover(),
+    recover: async () => {
+      for (const projectId of await listProjectIds()) await downloader.recover(projectId);
+      const result = await runner.recover();
+      for (const projectId of await listProjectIds()) {
+        for (const task of await taskStore.list(projectId)) {
+          if (task.status === "succeeded" && /^(SOURCE_UNAVAILABLE|ORIGINAL_)/.test(task.download?.errorCode || "")) queueOriginalRetry(projectId, task.id);
+        }
+      }
+      return result;
+    },
     status: () => runner.status(),
     tasksFor,
     previewPlan,
